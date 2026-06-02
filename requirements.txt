@@ -1,0 +1,14 @@
+openai>=1.50.0
+pydantic>=2.5.0
+pyyaml>=6.0
+numpy>=1.24
+faiss-cpu>=1.7.4
+sentence-transformers>=2.7.0
+pymupdf>=1.23.0
+python-pptx>=0.6.21
+tenacity>=8.2.0
+tqdm>=4.65.0
+rich>=13.0.0
+streamlit>=1.32.0
+pandas>=2.0.0
+reportlab>=4.0.0

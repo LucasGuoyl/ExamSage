@@ -1,0 +1,93 @@
+# ============================================================
+#  押题宝 Exam Predictor —— 配置模板
+#  复制本文件为 config.yaml 并填入你的 API key 后使用：
+#      cp config.example.yaml config.yaml
+#  （config.yaml 已被 .gitignore 排除，不会上传到 GitHub）
+#
+#  注意：Web UI（streamlit run app.py）在界面里填 key，无需本文件。
+#        本文件仅用于命令行模式（examples/run_university.py）。
+# ============================================================
+
+# ----- LLM 推理主脑（任何兼容 OpenAI 协议的服务均可）-----
+llm:
+  provider: deepseek                       # deepseek / openai / qwen / ...
+  base_url: https://api.deepseek.com/v1     # OpenAI: https://api.openai.com/v1
+  api_key: YOUR_API_KEY_HERE                # ← 在此填入你的 key
+  model: deepseek-chat                      # 中文/低成本推荐 deepseek-chat
+  temperature: 0.3
+  max_tokens: 2048
+  timeout: 60
+  max_retries: 3
+
+# ----- Embedding 模型 -----
+embedding:
+  backend: local                            # local（本地 BGE）或 api（OpenAI 接口）
+  model_name: BAAI/bge-large-zh-v1.5        # 中文 SOTA；英文课程用 bge-large-en-v1.5
+  device: cpu                               # cpu / cuda / mps
+  batch_size: 32
+
+# ----- 切块 -----
+chunking:
+  chunk_size: 800                           # 字符数（中文约 400-500 字）
+  chunk_overlap: 100
+  use_semantic_chunking: false
+
+# ----- C 段：真题↔课件 对齐 -----
+alignment:
+  top_k_chunks_per_question: 5
+  similarity_threshold: 0.55
+
+# ----- 少样本感知评分器 + 知识点过滤 -----
+scorer:
+  enable_llm_scoring: true                  # 关闭可省 API 费用，但少样本/新课程精度下降
+  course_context: ""                        # 课程描述（强烈建议填），如 "本科电力系统分析课程"
+  batch_size: 5                             # 每次 LLM 调用评分的 chunk 数
+  max_chunks_to_score: 80                   # 最多评分的 chunk 数（成本上限）
+  # 知识点过滤：剔除标题页 / 目录 / 课后回顾 / 背景 / 行政等非考点内容
+  min_chunk_chars: 60                       # 短于此字符数的 chunk 视为标题页，直接剔除
+  min_pedagogy_score: 0.30                  # LLM 教学价值低于此分的 chunk 剔除
+
+# ----- D 段：多信号自适应融合 -----
+fusion:
+  low_data_threshold: 10                    # 历年真题 < 此值时自动切换稀疏权重
+  weights:                                  # 真题充足时（以历史考频为主）
+    exam_frequency: 0.35
+    explicit_emphasis: 0.10
+    chunk_size: 0.05
+    tutorial_overlap: 0.15
+    syllabus_emphasis: 0.10
+    llm_pedagogy_score: 0.15
+    structural_signals: 0.10
+  sparse_weights:                           # 真题稀少时（以 LLM 教学先验为主）
+    exam_frequency: 0.10
+    explicit_emphasis: 0.08
+    chunk_size: 0.03
+    tutorial_overlap: 0.10
+    syllabus_emphasis: 0.14
+    llm_pedagogy_score: 0.45
+    structural_signals: 0.10
+  emphasis_keywords:
+    zh: ["重点", "考点", "考试", "必考", "重要", "记住", "经典", "高频"]
+    en: ["important", "remember", "exam", "key", "essential", "frequently asked"]
+  syllabus_verb_weights:
+    derive: 1.0
+    prove: 1.0
+    compute: 0.8
+    apply: 0.8
+    explain: 0.6
+    describe: 0.4
+    aware: 0.2
+
+# ----- E 段：知识点摘要 + 题目生成 -----
+generation:
+  top_k_knowledge_points: 10                # 在 top-K 知识点上生成押题
+  candidates_per_point: 5                   # 每个知识点生成几道候选题
+  few_shot_examples: 3                      # few-shot 引用几道真题做风格范例
+  rerank_keep_top_n: 2                      # 每个知识点最终保留 N 道题
+  summarise_batch_size: 4                   # 知识点摘要每批数量
+
+# ----- 输出 -----
+output:
+  dir: ./output
+  format: both                              # markdown / json / both（同时还会输出 PDF）
+  include_evidence: true
