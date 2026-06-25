@@ -74,6 +74,24 @@ Generate {n} diverse, high-quality candidate exam questions that test this
 knowledge point in the style of the past papers above. Output JSON only."""
 
 
+def _lang_directive(report_language: str | None) -> str:
+    """Return an output-language instruction appended to prompts.
+
+    'auto' (default) keeps the model matching the source material's language;
+    'en' / 'zh' force English / Simplified Chinese regardless of source.
+    """
+    lang = (report_language or "auto").lower()
+    if lang == "en":
+        return ("\n\nIMPORTANT: Write ALL output (questions, answers, titles, "
+                "descriptions) in English, regardless of the source language.")
+    if lang == "zh":
+        return ("\n\nIMPORTANT: Write ALL output (questions, answers, titles, "
+                "descriptions) in Simplified Chinese (简体中文), regardless of "
+                "the source language.")
+    return ("\n\nWrite your output in the SAME language as the source material "
+            "and past papers above.")
+
+
 def _format_few_shot(questions: list[ExamQuestion]) -> str:
     parts = []
     for i, q in enumerate(questions, 1):
@@ -136,6 +154,7 @@ def generate_for_knowledge_point(
     n_candidates: int = 5,
     temperature: float = 0.5,
     max_tokens: int = 2000,
+    report_language: str = "auto",
 ) -> list[GeneratedQuestion]:
     """Generate N candidate questions for one knowledge point."""
     kp_id = kp_chunks[0].metadata.get("kp_id", "kp") if kp_chunks else "kp"
@@ -149,7 +168,7 @@ def generate_for_knowledge_point(
         n=n_candidates,
     )
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": SYSTEM_PROMPT + _lang_directive(report_language)},
         {"role": "user", "content": user},
     ]
     try:
@@ -244,11 +263,14 @@ def _kp_block(idx: int, raw_title: str, chunks: list[Chunk]) -> str:
 
 
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=2, max=10))
-def _call_summarise(client, model: str, course_context: str, kp_blocks: str) -> list[dict]:
+def _call_summarise(
+    client, model: str, course_context: str, kp_blocks: str,
+    report_language: str = "auto",
+) -> list[dict]:
     resp = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": _SUMMARISE_SYSTEM},
+            {"role": "system", "content": _SUMMARISE_SYSTEM + _lang_directive(report_language)},
             {"role": "user",   "content": _SUMMARISE_USER.format(
                 course_context=course_context or "university-level course",
                 kp_blocks=kp_blocks,
@@ -273,6 +295,7 @@ def summarise_knowledge_points(
     chunk_by_id: dict,
     course_context: str = "",
     batch_size: int = 4,
+    report_language: str = "auto",
 ) -> None:
     """Enrich each KnowledgePointScore in-place with description and exam_directions.
 
@@ -290,7 +313,9 @@ def summarise_knowledge_points(
             for local_i, kp in enumerate(batch)
         )
         try:
-            results = _call_summarise(client, model, course_context, blocks_text)
+            results = _call_summarise(
+                client, model, course_context, blocks_text, report_language,
+            )
             id_map = {
                 r["id"]: r for r in results
                 if isinstance(r, dict) and "id" in r

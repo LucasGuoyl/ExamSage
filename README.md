@@ -1,211 +1,213 @@
-# 🎓 押题宝 · Exam Predictor
+# 🎓 ExamSage
 
-> 上传课件与历年真题 → AI 分析考点热度 → 自动生成押题练习与参考答案，一键导出 PDF。
+> Upload your slides and past papers → AI ranks the most likely exam topics → it auto-generates practice questions with answers, exportable to PDF in one click.
 
-一个**无需训练任何模型**的考试重点预测系统。它复用现成的大语言模型与开源语义嵌入模型，通过「检索对齐 + 多信号融合 + 生成重排」的流水线，从你的课程材料中预测**最可能考的知识点**，并为每个知识点生成配套练习题。
+A **training-free** exam-prediction system. It reuses off-the-shelf large language models and open-source embeddings, running a *retrieval → multi-signal fusion → generation* pipeline that predicts the **knowledge points most likely to be tested** from your course materials, and generates matching practice questions for each.
 
-核心设计目标：**少样本也能预测**（哪怕没有历年真题）、**跨课程通用**（换一门课只需改一行课程描述）。
-
----
-
-## ✨ 核心特性
-
-- 📥 **多格式输入**：课件支持 PDF / PPTX / Markdown，真题支持 JSON / PDF / Markdown。
-- 🔥 **考点热力图**：将历年真题语义对齐到课件片段，量化每个知识点的历史考察频率。
-- 🧠 **少样本友好**：内置 LLM 教学先验评分，真题稀少（甚至为 0）时自动接管，权重随数据量平滑切换。
-- 🌐 **跨课程通用**：评分不依赖特定学科数据，填一句课程描述即可适配电力、化学、计算机、经济等任意课程。
-- 🚫 **智能过滤**：规则 + LLM 双层识别并剔除标题页、目录、课后回顾、背景介绍、行政信息等非考点内容。
-- ✍️ **押题生成**：few-shot 模仿历年出题风格生成练习题，LLM-as-judge 排序择优。
-- 📄 **一键导出**：结构化报告支持 Markdown / JSON / **PDF**（中文 + 数学符号正常渲染，打印友好）。
-- 🖥️ **图形界面**：基于 Streamlit 的 Web UI，拖拽上传、点击运行、在线预览、直接下载。
+Core design goals: **works with few (or zero) past papers**, and **generalizes across courses** — switching subjects only takes a one-line course description.
 
 ---
 
-## 🛠️ 技术栈
+## ✨ Features
 
-| 类别 | 选型 | 用途 |
-|------|------|------|
-| 语言 | **Python 3.10+** | 全栈实现 |
-| Web UI | **Streamlit** | 文件上传 / 参数配置 / 结果展示 / 下载 |
-| 语义嵌入 | **sentence-transformers + BGE** | 将课件与真题编码为向量 |
-| 向量检索 | **FAISS** (CPU) | 余弦相似度近邻检索（真题↔课件对齐） |
-| 大模型调用 | **OpenAI SDK** | 兼容 DeepSeek / OpenAI / Qwen 等任意 OpenAI 协议服务 |
-| 数据建模 | **Pydantic v2** | 类型安全的数据模型与序列化 |
-| 文档解析 | **PyMuPDF**(PDF) · **python-pptx**(PPTX) | 提取课件文本 |
-| PDF 生成 | **ReportLab** | 从结构化报告渲染印刷级 PDF |
-| 健壮性 | **tenacity** | API 调用指数退避重试 |
-| 终端输出 | **rich** | CLI 进度与彩色日志 |
-
-### 使用的模型
-
-- **Embedding（语义嵌入）**：`BAAI/bge-large-zh-v1.5`（中文 SOTA，本地运行、免费、首次自动下载约 1.3 GB）。英文课程可换 `bge-large-en-v1.5`，也支持 OpenAI `text-embedding-3` 系列。
-- **LLM（推理主脑）**：默认 `deepseek-chat`（中文好、成本低）。可替换为任何 OpenAI 兼容模型（GPT-4o、Qwen 等）。**用于教学评分、知识点摘要、题目生成、答案排序四处。**
-
-> 💡 整个系统**不训练、不微调任何模型**，开箱即用。
+- 📥 **Many input formats** — slides as PDF / PPTX / Markdown; past papers as JSON / PDF / Markdown.
+- 🔥 **Exam heatmap** — semantically aligns past questions to slide passages to quantify each topic's historical exam frequency.
+- 🧠 **Few-shot friendly** — a built-in LLM pedagogical prior takes over when past papers are scarce (even zero); weights shift smoothly with data volume.
+- 🌐 **Cross-course** — scoring doesn't rely on subject-specific data; one line of course context adapts it to power systems, chemistry, CS, economics, anything.
+- 🚫 **Smart filtering** — rules + LLM jointly detect and drop title pages, agendas, recaps, background, and admin text that aren't real knowledge points.
+- ✍️ **Question generation** — few-shot mimics the style of past papers, then an LLM-as-judge ranks the candidates.
+- 📄 **One-click export** — Markdown / JSON / **PDF** (renders English, CJK, and math symbols; print-ready).
+- 🖥️ **Web UI** — a Streamlit app: drag-and-drop upload, click to run, preview online, download.
+- 🌍 **Output language control** — questions/answers default to the source material's language; force English or Chinese with one switch.
 
 ---
 
-## 🧩 系统架构与算法
+## 🛠️ Tech Stack
+
+| Area | Choice | Purpose |
+|------|--------|---------|
+| Language | **Python 3.10+** | Whole stack |
+| Web UI | **Streamlit** | Upload / configure / display / download |
+| Embeddings | **sentence-transformers + BGE** | Encode slides & questions into vectors |
+| Vector search | **FAISS** (CPU) | Cosine-similarity retrieval (question ↔ slide alignment) |
+| LLM | **OpenAI SDK** | Works with DeepSeek / OpenAI / Qwen / any OpenAI-compatible API |
+| Data models | **Pydantic v2** | Typed models & serialization |
+| Doc parsing | **PyMuPDF** (PDF) · **python-pptx** (PPTX) | Extract slide text |
+| PDF export | **ReportLab** | Render a print-ready PDF from the structured report |
+| Robustness | **tenacity** | Exponential-backoff retries on API calls |
+| CLI output | **rich** | Progress and colored logs |
+
+### Models used
+
+- **Embedding**: `BAAI/bge-large-zh-v1.5` (bilingual, runs locally, free, ~1.3 GB auto-download on first use). English-only courses can use `bge-large-en-v1.5`; OpenAI `text-embedding-3` is also supported.
+- **LLM**: default `deepseek-chat` (good, cheap). Swap in any OpenAI-compatible model (GPT-4o, Qwen, …). **Used in four places: pedagogy scoring, knowledge-point summarization, question generation, and answer reranking.**
+
+> 💡 The system **trains and fine-tunes nothing** — it works out of the box.
+
+---
+
+## 🧩 Architecture & Algorithms
 
 ```
-        课件(PDF/PPTX/MD) + 历年真题(JSON/PDF/MD) + 习题集/大纲(可选)
+        Slides (PDF/PPTX/MD) + Past papers (JSON/PDF/MD) + Tutorials/Syllabus (optional)
                                 │
                                 ▼
-   ┌─────────────────────── Stage 1 · 解析 (Ingest) ───────────────────────┐
-   │  PyMuPDF / python-pptx 提取文本  →  滑动窗口切块 (Chunk)                │
-   └────────────────────────────────────────────────────────────────────────┘
+   ┌──────────────────── Stage 1 · Ingest ──────────────────────┐
+   │  PyMuPDF / python-pptx extract text  →  sliding-window Chunks │
+   └──────────────────────────────────────────────────────────────┘
                                 │
         ┌───────────────────────┼───────────────────────┐
         ▼                       ▼                       ▼
  ┌──────────────┐      ┌─────────────────┐      ┌──────────────────┐
- │ Stage 2 · C段 │      │ Stage 2.5 · 评分 │      │ Stage 2.6 · 过滤  │
- │   对齐(Align) │      │  LLM 教学先验    │      │  剔除非考点内容    │
- │ 真题→课件检索 │      │  + 结构化规则    │      │ 标题/目录/背景/行政│
- │ FAISS 考频热图│      │（不依赖历史数据）│      │  规则 + LLM 双层   │
+ │ Stage 2 · C  │      │ Stage 2.5 · Score│      │ Stage 2.6 · Filter│
+ │   Align      │      │  LLM pedagogy    │      │  drop non-content │
+ │ Q→slide ret. │      │  + rule signals  │      │ titles/agenda/etc │
+ │ FAISS heatmap│      │ (no history dep) │      │  rules + LLM gate │
  └──────────────┘      └─────────────────┘      └──────────────────┘
         └───────────────────────┼───────────────────────┘
                                 ▼
-   ┌─────────────────────── Stage 3 · D段 · 融合 (Fuse) ───────────────────┐
-   │  多信号加权求和：考频 · 教学先验 · 结构信号 · 显式强调 ·               │
-   │  教学量 · tutorial 重叠 · 大纲强调                                      │
-   │  ★ 自适应权重：真题少→LLM先验主导(0.45)；真题多→历史考频主导(0.35)     │
-   │  贪心嵌入聚类 → 知识点 (Knowledge Point)                               │
-   └────────────────────────────────────────────────────────────────────────┘
+   ┌──────────────────── Stage 3 · D · Fuse ────────────────────┐
+   │  weighted sum of: exam_freq · pedagogy · structural ·        │
+   │  emphasis · teaching-time · tutorial-overlap · syllabus      │
+   │  ★ Adaptive weights: few papers → LLM prior leads (0.45);    │
+   │    many papers → historical frequency leads (0.35)           │
+   │  greedy embedding clustering → Knowledge Points              │
+   └──────────────────────────────────────────────────────────────┘
                                 │
-   ┌─────────────────── Stage 3.5 · 知识点摘要 (Summarise) ─────────────────┐
-   │  LLM 为每个知识点生成：精准标题 + 概念说明 + 3 条常考方向              │
-   └────────────────────────────────────────────────────────────────────────┘
+   ┌──────────────── Stage 3.5 · Summarise ─────────────────────┐
+   │  LLM writes per topic: clean title + concept + 3 exam angles │
+   └──────────────────────────────────────────────────────────────┘
                                 │
-   ┌─────────────────────── Stage 4 · E段 · 生成 (Generate) ───────────────┐
-   │  few-shot 模仿真题风格生成候选题  →  LLM-as-judge + 嵌入新颖度 重排    │
-   └────────────────────────────────────────────────────────────────────────┘
+   ┌──────────────────── Stage 4 · E · Generate ────────────────┐
+   │  few-shot questions in past-paper style → LLM-as-judge +     │
+   │  embedding-novelty rerank                                     │
+   └──────────────────────────────────────────────────────────────┘
                                 │
                                 ▼
-              📊 知识点热度排行 + 📝 押题练习 + 💡 参考答案
-                   导出为  report.md / predictions.json / report.pdf
+             📊 Topic ranking + 📝 Practice questions + 💡 Answers
+                  exported as  report.md / predictions.json / report.pdf
 ```
 
-### 关键算法
+### Key algorithms
 
-1. **语义检索对齐（C 段）**：所有 chunk 与真题用 BGE 编码后 L2 归一化，存入 FAISS `IndexFlatIP`（内积=余弦相似度）。每道真题检索 top-K 相似 chunk，按相似度 × 年份衰减权重累加，min-max 归一化得到**考频热力图**。
-2. **教学先验评分（Scorer）**：把 chunk 批量送入 LLM，让其以"出题人"视角从第一性原理判断每段内容的应试概率（定义/推导/应用/背景…），**完全不依赖本课历史数据**——这是少样本与跨课程能力的来源。另有零成本的规则信号（定义/定理/动作动词/强调词密度）。
-3. **非考点过滤（Filter）**：正则规则识别标题页、目录/agenda、课后回顾、参考文献、致谢、行政信息；再用 LLM 教学分阈值兜底。带安全回退（过滤后内容过少则自动恢复），避免误杀。
-4. **自适应多信号融合（D 段）**：7 路信号加权求和。权重随历年真题数量在「稀疏权重」与「正常权重」间**线性插值**——数据越少越倚重 LLM 先验，数据越多越倚重历史考频。
-5. **知识点聚合**：基于嵌入相似度的贪心聚类，把高度相似的 chunk 合并为知识点。
-6. **风格化生成与重排（E 段）**：few-shot 提供真题范例锚定出题风格生成候选题；再由 LLM-as-judge（风格匹配/质量/新颖度）结合嵌入新颖度综合打分，每个知识点择优保留。
-7. **离线评估**：内置 hold-out 评估器（按年份切分训练/测试），计算 **Top-K Coverage** 与 **MRR**，并与随机基线对比，用于校准融合权重。
+1. **Semantic alignment (Stage C)** — chunks and questions are BGE-encoded, L2-normalized, and indexed in a FAISS `IndexFlatIP` (inner product = cosine). Each past question retrieves its top-K similar chunks; contributions (similarity × recency weight) accumulate and min-max normalize into an **exam heatmap**.
+2. **Pedagogical prior (Scorer)** — chunks are batched to the LLM, which rates each one's exam probability from first principles (definition / derivation / application / background…), **without any course-specific history**. This is the source of the few-shot and cross-course ability. A zero-cost rule signal (definitions, theorems, action verbs, emphasis-keyword density) complements it.
+3. **Non-content filter** — regex rules catch title slides, agendas, recaps, references, acknowledgements, and admin text; an LLM-score threshold backs it up. A safety fallback reverts to no-filter if too much is dropped.
+4. **Adaptive fusion (Stage D)** — seven signals are weighted-summed; weights **linearly interpolate** between "sparse" and "normal" sets based on the number of past papers — less data leans on the LLM prior, more data leans on historical frequency.
+5. **Knowledge-point clustering** — greedy embedding-similarity clustering merges near-duplicate chunks into topics.
+6. **Styled generation & rerank (Stage E)** — few-shot past papers anchor the style; an LLM-as-judge (style / quality / novelty) combined with embedding novelty scores and keeps the best per topic.
+7. **Offline evaluation** — a built-in hold-out evaluator (split by year) reports **Top-K Coverage** and **MRR** against a random baseline, for tuning the fusion weights.
 
 ---
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 1. 安装依赖
+### 1. Install
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> 首次运行会自动下载 BGE 嵌入模型（约 1.3 GB），之后离线可用。
+> First run downloads the BGE embedding model (~1.3 GB); it's cached afterward.
 
-### 2. 配置 API Key
+### 2. Configure your API key
 
-支持任意 OpenAI 兼容服务（推荐 [DeepSeek](https://platform.deepseek.com)，成本低、中文好）。
+Works with any OpenAI-compatible service (we recommend [DeepSeek](https://platform.deepseek.com) — cheap and strong).
 
-- **Web UI 模式**：无需配置文件，直接在界面侧边栏填入 key。
-- **命令行模式**：复制模板后填入 key（`config.yaml` 已被 `.gitignore` 排除，不会泄露）：
+- **Web UI**: no config file — paste the key in the sidebar.
+- **CLI**: copy the template and fill in the key (`config.yaml` is git-ignored):
   ```bash
-  cp config.example.yaml config.yaml   # 然后编辑 config.yaml 填入 api_key
+  cp config.example.yaml config.yaml   # then edit config.yaml and set api_key
   ```
 
-### 3. 启动图形界面（推荐）
+### 3. Launch the Web UI (recommended)
 
 ```bash
 streamlit run app.py
 ```
 
-浏览器自动打开 **http://localhost:8501**。在界面中：
-填入 API Key 与课程名称 → 拖拽上传课件（和历年真题）→ 点击「🚀 开始分析」→ 查看排行/练习 → 下载 PDF。
+Opens **http://localhost:8501**. In the UI: enter your API key and course name → drag-and-drop slides (and past papers) → click **🚀 Run Analysis** → view the ranking/questions → download the PDF.
 
-### 4. 命令行模式
+### 4. CLI mode
 
 ```bash
-python examples/run_university.py --course <课程目录> --config config.yaml
+python examples/run_university.py --course <course_dir> --config config.yaml
 ```
 
-输出 `output/report.md`、`output/predictions.json`、`output/report.pdf`。
+Writes `output/report.md`, `output/predictions.json`, and `output/report.pdf`.
 
 ---
 
-## 📁 数据准备
+## 📁 Preparing Data
 
-按以下结构组织一门课程的材料（仅 `slides/` 为必需）：
+Organize one course like this (only `slides/` is required):
 
 ```
 my_course/
-├── slides/          # 课件（必需）  .pdf / .pptx / .md
-├── past_papers/     # 历年真题（可选，越多越准）  .json / .pdf / .md
-├── tutorials/       # 习题集（可选）
-└── syllabus.md      # 教学大纲（可选）
+├── slides/          # required   .pdf / .pptx / .md
+├── past_papers/     # optional (more is better)   .json / .pdf / .md
+├── tutorials/       # optional
+└── syllabus.md      # optional
 ```
 
-历年真题 JSON 推荐格式（Web UI 内可一键下载模板）：
+Recommended past-papers JSON format (downloadable as a template in the Web UI):
 
 ```json
 [
   {
     "id": "2023_q1",
     "year": 2023,
-    "text": "题目原文……",
+    "text": "Full question text…",
     "type": "computation",
-    "answer": "参考答案要点（可选）"
+    "answer": "Reference answer key points (optional)"
   }
 ]
 ```
 
 ---
 
-## 🗂️ 项目结构
+## 🗂️ Project Structure
 
 ```
-exam_predictor/
-├── app.py                  # Streamlit Web UI 入口
-├── config.example.yaml     # 配置模板（复制为 config.yaml 使用）
+ExamSage/
+├── app.py                  # Streamlit Web UI entry point
+├── config.example.yaml     # config template (copy to config.yaml)
 ├── requirements.txt
-├── exam_predictor/         # 核心引擎包
-│   ├── pipeline.py         # 端到端编排 + Markdown 报告
-│   ├── ingest.py           # PDF / PPTX / MD 解析
-│   ├── chunker.py          # 文本切块
-│   ├── embedder.py         # 本地 BGE / API 嵌入（可切换）
-│   ├── vector_store.py     # FAISS 向量库封装
-│   ├── aligner.py          # C 段：对齐 + 考频热力图
-│   ├── scorer.py           # 教学先验评分 + 非考点过滤
-│   ├── fusion.py           # D 段：多信号自适应融合
-│   ├── generator.py        # 知识点摘要 + E 段题目生成
-│   ├── reranker.py         # LLM-as-judge 重排
-│   ├── exporter.py         # PDF 导出（ReportLab）
-│   ├── evaluator.py        # hold-out 评估（Coverage / MRR）
-│   └── schema.py           # Pydantic 数据模型
+├── exam_predictor/         # core engine package
+│   ├── pipeline.py         # end-to-end orchestration + Markdown report
+│   ├── ingest.py           # PDF / PPTX / MD parsing
+│   ├── chunker.py          # text chunking
+│   ├── embedder.py         # local BGE / API embeddings (switchable)
+│   ├── vector_store.py     # FAISS wrapper
+│   ├── aligner.py          # Stage C: alignment + exam heatmap
+│   ├── scorer.py           # pedagogical prior + non-content filter
+│   ├── fusion.py           # Stage D: adaptive multi-signal fusion
+│   ├── generator.py        # knowledge-point summary + Stage E generation
+│   ├── reranker.py         # LLM-as-judge rerank
+│   ├── exporter.py         # PDF export (ReportLab)
+│   ├── evaluator.py        # hold-out evaluation (Coverage / MRR)
+│   └── schema.py           # Pydantic data models
 ├── examples/
-│   ├── run_university.py   # 单课程预测
-│   └── run_gaokao.py       # 高考场景 hold-out 评估
+│   ├── run_university.py   # single-course prediction
+│   └── run_gaokao.py       # hold-out evaluation
 └── tests/
-    └── test_basic.py       # 冒烟测试
+    └── test_basic.py       # smoke tests
 ```
 
 ---
 
-## 🔒 安全说明
+## 🔒 Security
 
-- `config.yaml`、`config_en.yaml`、`.env` 等含密钥的文件已在 `.gitignore` 中排除，**不会被提交**。
-- 提交前请用 `git status` 确认没有 key 文件被追踪。
-- **切勿**将真实 API key 写入会被提交的文件或源码。
-
----
-
-## 📜 许可证
-
-本项目基于 [MIT License](LICENSE) 开源。使用前请将 `LICENSE` 文件中的 `<YOUR NAME>` 替换为你的名字。
+- Key-bearing files (`config.yaml`, `.env`, …) are git-ignored and **never committed**.
+- Run `git status` before committing to confirm no key file is tracked.
+- **Never** put a real API key in a committed file or in source.
 
 ---
 
-*本工具的预测与生成内容仅供复习参考，请以课堂教材与教师说明为准。*
+## 📜 License
+
+Released under the [MIT License](LICENSE).
+
+---
+
+*Predictions and generated content are for study reference only — always defer to your course materials and instructor.*

@@ -81,18 +81,18 @@ def _esc(text: str) -> str:
 
 
 def _diff_label(d: float | None) -> str:
-    if d is None:    return "未知"
-    if d < 0.35:     return "基础"
-    if d < 0.55:     return "中等"
-    if d < 0.75:     return "进阶"
-    return "挑战"
+    if d is None:    return "Unknown"
+    if d < 0.35:     return "Basic"
+    if d < 0.55:     return "Medium"
+    if d < 0.75:     return "Advanced"
+    return "Challenge"
 
 
 def _importance_label(score: float) -> str:
-    if score >= 0.6:  return "极高"
-    if score >= 0.45: return "高"
-    if score >= 0.30: return "中"
-    return "低"
+    if score >= 0.6:  return "Very High"
+    if score >= 0.45: return "High"
+    if score >= 0.30: return "Medium"
+    return "Low"
 
 
 def _styles(font: str) -> dict[str, ParagraphStyle]:
@@ -163,20 +163,20 @@ def report_to_pdf_bytes(report: PredictionReport) -> bytes:
         buf, pagesize=A4,
         leftMargin=1.8 * cm, rightMargin=1.8 * cm,
         topMargin=1.6 * cm, bottomMargin=1.6 * cm,
-        title=f"{report.course_name} 考试重点预测报告",
+        title=f"{report.course_name} — Exam Focus Prediction Report",
     )
     usable_w = doc.width
     flow: list = []
 
-    # —— 封面 ——
-    flow.append(Paragraph("考试重点预测报告", st["title"]))
+    # —— Cover ——
+    flow.append(Paragraph("Exam Focus Prediction Report", st["title"]))
     flow.append(Paragraph(_esc(report.course_name), st["subtitle"]))
 
     info = [
-        [Paragraph("分析课件块数", st["cell"]), Paragraph(str(report.n_chunks), st["cell"]),
-         Paragraph("参考历年真题", st["cell"]), Paragraph(f"{report.n_past_questions} 道", st["cell"])],
-        [Paragraph("预测置信度", st["cell"]), Paragraph(f"{report.overall_confidence:.0%}", st["cell"]),
-         Paragraph("知识点数", st["cell"]), Paragraph(str(len(report.predictions)), st["cell"])],
+        [Paragraph("Chunks analyzed", st["cell"]), Paragraph(str(report.n_chunks), st["cell"]),
+         Paragraph("Past papers", st["cell"]), Paragraph(str(report.n_past_questions), st["cell"])],
+        [Paragraph("Confidence", st["cell"]), Paragraph(f"{report.overall_confidence:.0%}", st["cell"]),
+         Paragraph("Knowledge points", st["cell"]), Paragraph(str(len(report.predictions)), st["cell"])],
     ]
     info_tbl = Table(info, colWidths=[usable_w * 0.25] * 4)
     info_tbl.setStyle(TableStyle([
@@ -196,12 +196,12 @@ def report_to_pdf_bytes(report: PredictionReport) -> bytes:
     flow.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#cccccc"),
                            spaceBefore=8, spaceAfter=10))
 
-    # —— 一、总览表 ——
-    flow.append(Paragraph("一、核心知识点总览", st["h2"]))
+    # —— 1. Overview table ——
+    flow.append(Paragraph("1. Core Knowledge Points Overview", st["h2"]))
     header = [
-        Paragraph("排名", st["cellb"]), Paragraph("知识点", st["cellb"]),
-        Paragraph("重要度", st["cellb"]), Paragraph("命中真题", st["cellb"]),
-        Paragraph("概述", st["cellb"]),
+        Paragraph("Rank", st["cellb"]), Paragraph("Knowledge Point", st["cellb"]),
+        Paragraph("Importance", st["cellb"]), Paragraph("Past hits", st["cellb"]),
+        Paragraph("Summary", st["cellb"]),
     ]
     rows = [header]
     for i, p in enumerate(report.predictions, 1):
@@ -212,7 +212,7 @@ def report_to_pdf_bytes(report: PredictionReport) -> bytes:
             Paragraph(str(i), st["cell"]),
             Paragraph(_esc(p.title), st["cell"]),
             Paragraph(f"{p.score:.2f} ({_importance_label(p.score)})", st["cell"]),
-            Paragraph(f"{hits} 题", st["cell"]),
+            Paragraph(str(hits), st["cell"]),
             Paragraph(_esc(snippet), st["cell"]),
         ])
     overview = Table(
@@ -233,51 +233,52 @@ def report_to_pdf_bytes(report: PredictionReport) -> bytes:
     flow.append(overview)
     flow.append(Spacer(1, 10))
 
-    # —— 二、知识点详解 ——
-    flow.append(Paragraph("二、知识点详解与押题", st["h2"]))
+    # —— 2. Per-topic detail ——
+    flow.append(Paragraph("2. Knowledge Points in Detail & Predicted Questions", st["h2"]))
     flow.append(Paragraph(
-        "每节依次包含：概念说明 → 常考方向 → 练习题（附参考答案）。", st["meta"]))
+        "Each section: concept → common exam angles → practice questions (with answers).",
+        st["meta"]))
 
     by_kp: dict[str, list[GeneratedQuestion]] = {}
     for q in report.generated_questions:
         by_kp.setdefault(q.knowledge_point_id, []).append(q)
 
-    CN = "一二三四五六七八九十"
     for i, p in enumerate(report.predictions, 1):
         qs   = by_kp.get(p.knowledge_point_id, [])
-        cn   = CN[i - 1] if i <= len(CN) else str(i)
         hits = p.features.evidence.get("total_questions_matched", 0)
+        regime = ("Few-shot" if p.features.evidence.get("weight_regime") == "sparse"
+                  else "Normal")
 
-        # 节标题（蓝底白字）
-        flow.append(Paragraph(f"第{cn}考点：{_esc(p.title)}", st["kp"]))
+        # Section title (white text on blue)
+        flow.append(Paragraph(f"Topic #{i}: {_esc(p.title)}", st["kp"]))
         flow.append(Paragraph(
-            f"重要度 {p.score:.2f}（{_importance_label(p.score)}）　|　"
-            f"历年命中 {hits} 题　|　"
-            f"权重模式 {'少样本' if p.features.evidence.get('weight_regime') == 'sparse' else '正常'}",
+            f"Importance {p.score:.2f} ({_importance_label(p.score)})　|　"
+            f"Past-paper hits {hits}　|　"
+            f"Weight mode {regime}",
             st["meta"],
         ))
 
         if p.description:
-            flow.append(Paragraph("概念说明", st["label"]))
+            flow.append(Paragraph("Concept", st["label"]))
             flow.append(Paragraph(_esc(p.description), st["body"]))
 
         if p.exam_directions:
-            flow.append(Paragraph("常考方向", st["label"]))
+            flow.append(Paragraph("Common Exam Angles", st["label"]))
             for j, d in enumerate(p.exam_directions, 1):
                 flow.append(Paragraph(f"{j}. {_esc(d)}", st["body"]))
 
         if qs:
-            flow.append(Paragraph("练习题", st["label"]))
+            flow.append(Paragraph("Practice Questions", st["label"]))
             for q_i, q in enumerate(qs, 1):
                 qtype = f" · {q.question_type}" if q.question_type else ""
                 flow.append(Paragraph(
-                    f"第 {q_i} 题　[{_diff_label(q.estimated_difficulty)}{qtype}]",
+                    f"Question {q_i}　[{_diff_label(q.estimated_difficulty)}{qtype}]",
                     st["qhead"],
                 ))
                 flow.append(Paragraph(_esc(q.text), st["q"]))
                 if q.answer_sketch:
                     ans = Paragraph(
-                        "<b>参考答案要点：</b>" + _esc(q.answer_sketch), st["ans"])
+                        "<b>Reference Answer (key points): </b>" + _esc(q.answer_sketch), st["ans"])
                     ans_tbl = Table([[ans]], colWidths=[usable_w])
                     ans_tbl.setStyle(TableStyle([
                         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f5f5f0")),
@@ -290,14 +291,15 @@ def report_to_pdf_bytes(report: PredictionReport) -> bytes:
                     flow.append(ans_tbl)
                     flow.append(Spacer(1, 4))
         else:
-            flow.append(Paragraph("（本知识点暂无生成练习题）", st["meta"]))
+            flow.append(Paragraph("(No practice questions generated for this topic.)", st["meta"]))
 
         flow.append(HRFlowable(width="100%", thickness=0.5,
                                color=colors.HexColor("#dddddd"),
                                spaceBefore=8, spaceAfter=8))
 
     flow.append(Paragraph(
-        "本报告由 押题宝 Exam Predictor 自动生成，仅供参考，请以课堂教材及教师说明为准。",
+        "Generated by ExamSage — for reference only; "
+        "always defer to your course materials and instructor.",
         st["foot"],
     ))
 

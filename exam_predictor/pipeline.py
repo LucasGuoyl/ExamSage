@@ -255,12 +255,14 @@ class ExamPredictor:
         # ---- Stage 3.5: Summarise knowledge points ----
         console.print("[bold]3.5. Summarising knowledge points with LLM...[/bold]")
         gen_cfg = self.config.get("generation", {})
+        report_lang = gen_cfg.get("report_language", "auto")
         summarise_knowledge_points(
             self.llm, self.llm_model,
             kps=scored_kps[: gen_cfg.get("top_k_knowledge_points", 10)],
             chunk_by_id=chunk_by_id,
             course_context=course_context or ctx,
             batch_size=gen_cfg.get("summarise_batch_size", 4),
+            report_language=report_lang,
         )
 
         # ---- Stage 4: Generate (Route E) ----
@@ -286,6 +288,7 @@ class ExamPredictor:
                 n_candidates=n_candidates,
                 temperature=self.config["llm"].get("temperature", 0.5),
                 max_tokens=self.config["llm"].get("max_tokens", 2048),
+                report_language=report_lang,
             )
             if not candidates:
                 continue
@@ -338,62 +341,6 @@ class ExamPredictor:
         except Exception as exc:  # noqa: BLE001
             console.print(f"[yellow]PDF export skipped: {exc}[/yellow]")
 
-    @staticmethod
-    def _format_txt_report(r: PredictionReport) -> str:
-        sep  = "=" * 60
-        thin = "-" * 60
-
-        lines = [
-            sep,
-            f"考试预测报告: {r.course_name}",
-            sep,
-            f"课件 chunks  : {r.n_chunks}",
-            f"往年真题     : {r.n_past_questions}",
-            f"综合置信度   : {r.overall_confidence:.2f}",
-            "",
-        ]
-
-        if r.warnings:
-            lines += ["[警告]"]
-            lines += [f"  ! {w}" for w in r.warnings]
-            lines += [""]
-
-        lines += [thin, "知识点优先级 (Top 30)", thin, ""]
-        for i, p in enumerate(r.predictions, 1):
-            f = p.features
-            title = p.title[:80].strip()
-            lines += [
-                f"{i:2d}. {title}",
-                f"    综合得分: {p.score:.3f}  置信度: {p.confidence:.2f}  命中真题: {f.evidence.get('total_questions_matched', 0)}",
-                f"    考频: {f.exam_frequency:.2f}  显式强调: {f.explicit_emphasis:.2f}  "
-                f"教学量: {f.chunk_size:.2f}  tutorial重叠: {f.tutorial_overlap:.2f}  大纲: {f.syllabus_emphasis:.2f}",
-                "",
-            ]
-
-        lines += [thin, "生成的练习题", thin, ""]
-
-        by_kp: dict[str, list[GeneratedQuestion]] = {}
-        for q in r.generated_questions:
-            by_kp.setdefault(q.knowledge_point_id, []).append(q)
-        kp_titles = {p.knowledge_point_id: p.title for p in r.predictions}
-
-        for kp_id, qs in by_kp.items():
-            title = kp_titles.get(kp_id, kp_id)[:80].strip()
-            lines += [f"[ {title} ]", ""]
-            for idx, q in enumerate(qs, 1):
-                diff_str  = f"{q.estimated_difficulty:.2f}" if q.estimated_difficulty is not None else "?"
-                score_str = f"{q.overall_score:.2f}"        if q.overall_score         is not None else "?"
-                lines += [
-                    f"Q{idx} (难度: {diff_str}  得分: {score_str})",
-                    q.text,
-                    "",
-                ]
-                if q.answer_sketch:
-                    lines += ["参考答案:", q.answer_sketch, ""]
-            lines += [thin, ""]
-
-        return "\n".join(lines)
-
     # ── Markdown report helpers ──────────────────────────────────────────
 
     @staticmethod
@@ -434,12 +381,12 @@ class ExamPredictor:
         if diff is None:
             return ""
         if diff < 0.35:
-            return "基础"
+            return "Basic"
         if diff < 0.55:
-            return "中等"
+            return "Medium"
         if diff < 0.75:
-            return "进阶"
-        return "挑战"
+            return "Advanced"
+        return "Challenge"
 
     @staticmethod
     def _format_markdown_report(r: PredictionReport) -> str:
@@ -454,16 +401,16 @@ class ExamPredictor:
 
         lines: list[str] = []
 
-        # ── 封面 ────────────────────────────────────────────────────────
+        # ── Cover ───────────────────────────────────────────────────────
         lines += [
-            "# 🎓 考试重点预测报告",
+            "# 🎓 Exam Focus Prediction Report",
             f"## {r.course_name}",
             "",
             "| | |",
             "|---|---|",
-            f"| 📄 分析课件块数 | **{r.n_chunks}** |",
-            f"| 📚 参考历年真题 | **{r.n_past_questions}** 道 |",
-            f"| 🎯 预测置信度   | **{r.overall_confidence:.0%}** |",
+            f"| 📄 Course chunks analyzed | **{r.n_chunks}** |",
+            f"| 📚 Past papers referenced | **{r.n_past_questions}** |",
+            f"| 🎯 Prediction confidence  | **{r.overall_confidence:.0%}** |",
             "",
         ]
         if r.warnings:
@@ -472,11 +419,11 @@ class ExamPredictor:
             lines += [""]
         lines += ["---", ""]
 
-        # ── 一、总览表 ────────────────────────────────────────────────────
+        # ── 1. Overview table ───────────────────────────────────────────
         lines += [
-            "## 一、核心知识点总览",
+            "## 1. Core Knowledge Points Overview",
             "",
-            "| 排名 | 知识点 | 重要度 | 概述 |",
+            "| Rank | Knowledge Point | Importance | Summary |",
             "|:---:|--------|:------:|------|",
         ]
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -488,15 +435,15 @@ class ExamPredictor:
             desc = p.description or ""
             snippet = (desc[:55] + "…") if len(desc) > 55 else desc
             lines.append(
-                f"| {m} | **{p.title}** | `{bar}` {p.score:.2f} · {hits}题 | {snippet} |"
+                f"| {m} | **{p.title}** | `{bar}` {p.score:.2f} · {hits} hits | {snippet} |"
             )
         lines += ["", "---", ""]
 
-        # ── 二、知识点详解与押题 ───────────────────────────────────────────
+        # ── 2. Per-topic detail + predicted questions ───────────────────
         lines += [
-            "## 二、知识点详解与押题",
+            "## 2. Knowledge Points in Detail & Predicted Questions",
             "",
-            "每节依次包含：概念说明 → 常考方向 → 练习题（附参考答案）。",
+            "Each section: concept summary → common exam angles → practice questions (with answers).",
             "",
         ]
 
@@ -505,44 +452,44 @@ class ExamPredictor:
             by_kp.setdefault(q.knowledge_point_id, []).append(q)
 
         kp_rank_map = {p.knowledge_point_id: i for i, p in enumerate(r.predictions, 1)}
-        MEDAL_HDR   = {1: "🥇 第一考点", 2: "🥈 第二考点", 3: "🥉 第三考点"}
-        CN          = "一二三四五六七八九十"
+        MEDAL_HDR   = {1: "🥇 Top Topic", 2: "🥈 2nd Topic", 3: "🥉 3rd Topic"}
 
         for i, p in enumerate(r.predictions, 1):
             qs   = by_kp.get(p.knowledge_point_id, [])
-            cn   = CN[i - 1] if i <= len(CN) else str(i)
-            hdr  = MEDAL_HDR.get(i, f"第{cn}考点")
+            hdr  = MEDAL_HDR.get(i, f"Topic #{i}")
             hits = p.features.evidence.get("total_questions_matched", 0)
+            regime = ("Few-shot" if p.features.evidence.get("weight_regime") == "sparse"
+                      else "Normal")
 
-            # ── 节标题 ──────────────────────────────────────────────────
+            # ── Section title ──────────────────────────────────────────
             lines += [
-                f"### {hdr}：{p.title}",
+                f"### {hdr}: {p.title}",
                 "",
-                f"**重要度** `{_bar(p.score)}` {p.score:.2f} &emsp; "
-                f"**历年命中** {hits} 题 &emsp; "
-                f"**权重模式** {'少样本' if p.features.evidence.get('weight_regime') == 'sparse' else '正常'}",
+                f"**Importance** `{_bar(p.score)}` {p.score:.2f} &emsp; "
+                f"**Past-paper hits** {hits} &emsp; "
+                f"**Weight mode** {regime}",
                 "",
             ]
 
-            # ── 概念描述 ─────────────────────────────────────────────────
+            # ── Concept description ────────────────────────────────────
             if p.description:
                 lines += [
-                    "**📖 概念说明**",
+                    "**📖 Concept**",
                     "",
                     p.description,
                     "",
                 ]
 
-            # ── 常考方向 ─────────────────────────────────────────────────
+            # ── Common exam angles ─────────────────────────────────────
             if p.exam_directions:
-                lines += ["**📌 常考方向**", ""]
+                lines += ["**📌 Common Exam Angles**", ""]
                 for j, d in enumerate(p.exam_directions, 1):
                     lines.append(f"{j}. {d}")
                 lines += [""]
 
-            # ── 练习题 ───────────────────────────────────────────────────
+            # ── Practice questions ─────────────────────────────────────
             if qs:
-                lines += ["**🖊️ 练习题**", ""]
+                lines += ["**🖊️ Practice Questions**", ""]
                 for q_i, q in enumerate(qs, 1):
                     d      = q.estimated_difficulty
                     stars  = _stars(d)
@@ -550,23 +497,24 @@ class ExamPredictor:
                     qtype  = f"  ·  {q.question_type}" if q.question_type else ""
 
                     lines += [
-                        f"**第 {q_i} 题**　{stars}　{label}{qtype}",
+                        f"**Question {q_i}**　{stars}　{label}{qtype}",
                         "",
                         q.text,
                         "",
                     ]
                     if q.answer_sketch:
-                        lines += ["**💡 参考答案要点**", ""]
+                        lines += ["**💡 Reference Answer (key points)**", ""]
                         # blockquote — renders in all Markdown viewers and PDF
                         for al in q.answer_sketch.strip().splitlines():
                             lines.append(f"> {al}" if al.strip() else ">")
                         lines += [""]
             else:
-                lines += ["*（本知识点暂无生成练习题）*", ""]
+                lines += ["*(No practice questions generated for this topic.)*", ""]
 
             lines += ["---", ""]
 
         lines += [
-            "*📌 本报告由 押题宝 Exam Predictor 自动生成，仅供参考，请以课堂教材及教师说明为准。*",
+            "*📌 Generated by ExamSage — for reference only; "
+            "always defer to your course materials and instructor.*",
         ]
         return "\n".join(lines)

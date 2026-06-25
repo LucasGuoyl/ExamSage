@@ -1,9 +1,9 @@
-"""押题宝 · Exam Predictor — Streamlit Web UI
+"""ExamSage — Streamlit Web UI
 
-启动方式:
+Run with:
     streamlit run app.py
 
-首次运行会自动下载 BGE Embedding 模型 (~1.3 GB)，后续运行无需重新下载。
+The first run downloads the BGE embedding model (~1.3 GB); later runs reuse it.
 """
 
 from __future__ import annotations
@@ -16,12 +16,12 @@ from pathlib import Path
 
 import streamlit as st
 
-# ── 确保 exam_predictor 包可以被导入 ──────────────────────────────────────────
+# ── Make the exam_predictor package importable ───────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 
-# ── 页面配置（必须在所有其他 st 调用之前）────────────────────────────────────
+# ── Page config (must precede every other st call) ───────────────────────────
 st.set_page_config(
-    page_title="押题宝 · Exam Predictor",
+    page_title="ExamSage · Exam Predictor",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -36,11 +36,11 @@ st.markdown("""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 工具函数
+# Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def save_uploads(files, dest: Path) -> None:
-    """把 Streamlit 上传的文件对象写入磁盘。"""
+    """Write Streamlit uploaded-file objects to disk."""
     dest.mkdir(parents=True, exist_ok=True)
     for f in files:
         (dest / f.name).write_bytes(f.getvalue())
@@ -56,8 +56,9 @@ def build_config(
     keep_top: int,
     enable_llm_scoring: bool,
     filter_noise: bool = True,
+    report_language: str = "auto",
 ) -> dict:
-    """从 UI 参数构建 pipeline config 字典（无需 config.yaml）。"""
+    """Build a pipeline config dict from UI inputs (no config.yaml needed)."""
     return {
         "llm": {
             "base_url": base_url,
@@ -79,7 +80,7 @@ def build_config(
             "course_context": course_context,
             "batch_size": 5,
             "max_chunks_to_score": 80,
-            # 智能过滤：开启时剔除标题/目录/背景/行政内容；关闭时保留全部
+            # Smart filter: drop title/agenda/background/admin content when on
             "min_chunk_chars": 60 if filter_noise else 0,
             "min_pedagogy_score": 0.30 if filter_noise else 0.0,
         },
@@ -113,6 +114,7 @@ def build_config(
             "candidates_per_point": n_candidates,
             "few_shot_examples": 3,
             "rerank_keep_top_n": keep_top,
+            "report_language": report_language,
         },
     }
 
@@ -131,78 +133,90 @@ def diff_stars(d: float | None) -> str:
 
 def diff_label(d: float | None) -> str:
     if d is None:     return ""
-    if d < 0.35:      return "基础"
-    if d < 0.55:      return "中等"
-    if d < 0.75:      return "进阶"
-    return "挑战"
+    if d < 0.35:      return "Basic"
+    if d < 0.55:      return "Medium"
+    if d < 0.75:      return "Advanced"
+    return "Challenge"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 侧边栏：配置区
+# Sidebar: configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.title("⚙️ 配置")
+    st.title("⚙️ Settings")
 
-    # —— API 设置
-    st.subheader("🔑 API 设置")
+    # —— API
+    st.subheader("🔑 API")
     api_key = st.text_input(
         "API Key *",
         type="password",
         placeholder="sk-...",
-        help="支持 DeepSeek / OpenAI / 任何兼容 OpenAI 格式的服务",
+        help="Works with DeepSeek / OpenAI / any OpenAI-compatible service",
     )
     base_url = st.text_input(
         "API Base URL",
         value="https://api.deepseek.com/v1",
         help="DeepSeek: https://api.deepseek.com/v1\nOpenAI: https://api.openai.com/v1",
     )
-    llm_model = st.text_input("模型名称", value="deepseek-chat")
+    llm_model = st.text_input("Model name", value="deepseek-chat")
 
     st.divider()
 
-    # —— 课程信息
-    st.subheader("📖 课程信息")
+    # —— Course info
+    st.subheader("📖 Course")
     course_name = st.text_input(
-        "课程名称 *",
-        placeholder="例：电力系统分析",
+        "Course name *",
+        placeholder="e.g. Power Systems Analysis",
     )
     course_ctx = st.text_area(
-        "课程描述（可选）",
-        placeholder="例：本科电力系统课程，重点考牛顿-拉夫逊潮流计算和经济调度推导",
+        "Course description (optional)",
+        placeholder="e.g. Undergraduate power systems course; emphasis on "
+                    "Newton-Raphson power flow and economic dispatch derivations",
         height=90,
-        help="描述越具体，LLM 教学评分越准确，跨课程效果越好",
+        help="A specific description improves the LLM's pedagogical scoring and cross-course accuracy",
     )
 
     st.divider()
 
-    # —— 高级参数
-    st.subheader("🔧 高级参数")
-    top_k        = st.slider("预测 Top-K 知识点", 3, 20, 10)
-    n_candidates = st.slider("候选题数 / 知识点",  2,  8,  5)
-    keep_top_n   = st.slider("最终保留 / 知识点",  1,  4,  2)
+    # —— Advanced
+    st.subheader("🔧 Advanced")
+    top_k        = st.slider("Top-K knowledge points", 3, 20, 10)
+    n_candidates = st.slider("Candidates / point",      2,  8,  5)
+    keep_top_n   = st.slider("Keep / point",            1,  4,  2)
+
+    lang_choice = st.selectbox(
+        "Report language",
+        options=["Auto (match materials)", "English", "Chinese"],
+        index=0,
+        help="Auto generates questions/answers in the source material's language. "
+             "Force English/Chinese to override.",
+    )
+    report_language = {"Auto (match materials)": "auto",
+                       "English": "en", "Chinese": "zh"}[lang_choice]
+
     enable_llm_scoring = st.checkbox(
-        "启用 LLM 教学评分",
+        "Enable LLM pedagogy scoring",
         value=True,
-        help="少样本/新课程场景下大幅提升准确度；每次多消耗少量 API 额度",
+        help="Greatly improves accuracy on few-shot / new courses; uses a little extra API quota",
     )
     filter_noise = st.checkbox(
-        "智能过滤非考点内容",
+        "Smart-filter non-exam content",
         value=True,
-        help="剔除标题页、目录、课程回顾、背景介绍、行政信息等，"
-             "避免它们被误判为知识点",
+        help="Drops title pages, agendas, recaps, background, and admin text so "
+             "they aren't mistaken for knowledge points",
     )
 
     st.divider()
 
-    # 运行按钮放在侧边栏最底部，始终可见
+    # Run button pinned to the bottom of the sidebar, always visible
     _can_run_sidebar = bool(api_key and course_name)
     if not _can_run_sidebar:
-        _miss = [l for l, ok in [("API Key", api_key), ("课程名称", course_name)] if not ok]
-        st.caption(f"⚠️ 还需填写：{'、'.join(_miss)}")
+        _miss = [l for l, ok in [("API Key", api_key), ("Course name", course_name)] if not ok]
+        st.caption(f"⚠️ Still needed: {', '.join(_miss)}")
 
     run_sidebar_btn = st.button(
-        "🚀  开始分析",
+        "🚀  Run Analysis",
         type="primary",
         disabled=not _can_run_sidebar,
         use_container_width=True,
@@ -210,88 +224,88 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("押题宝 v0.2 · [GitHub](https://github.com/your-repo/exam-predictor)")
+    st.caption("ExamSage v0.2 · [GitHub](https://github.com/LucasGuoyl/ExamSage)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 主区域
+# Main area
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.title("🎓 押题宝 · 考试预测系统")
-st.caption("上传课件和历年真题 → AI 分析考点热度 → 自动生成押题练习")
+st.title("🎓 ExamSage · Exam Predictor")
+st.caption("Upload slides and past papers → AI ranks exam topics → auto-generates practice questions")
 
-# ── 文件上传区 ────────────────────────────────────────────────────────────────
+# ── Upload area ──────────────────────────────────────────────────────────────
 col_l, col_r = st.columns(2, gap="large")
 
 with col_l:
-    st.subheader("📄 课件材料（必填）")
+    st.subheader("📄 Course materials (required)")
     slides_files = st.file_uploader(
-        "支持 **PDF / PPTX / Markdown**，可同时上传多个",
+        "Supports **PDF / PPTX / Markdown**, multiple files allowed",
         type=["pdf", "pptx", "md"],
         accept_multiple_files=True,
         key="slides",
     )
     if slides_files:
         total_kb = sum(f.size for f in slides_files) // 1024
-        st.success(f"✅ 已选择 **{len(slides_files)}** 个文件 · 共 {total_kb} KB")
-        with st.expander(f"查看文件列表（{len(slides_files)} 个）"):
+        st.success(f"✅ {len(slides_files)} file(s) selected · {total_kb} KB total")
+        with st.expander(f"View file list ({len(slides_files)})"):
             for f in slides_files:
                 st.caption(f"· `{f.name}`  {f.size // 1024} KB")
 
 with col_r:
-    st.subheader("📚 历年真题（可选，越多越准）")
+    st.subheader("📚 Past papers (optional — more is better)")
     papers_files = st.file_uploader(
-        "支持 **JSON / PDF / Markdown**，可同时上传多个",
+        "Supports **JSON / PDF / Markdown**, multiple files allowed",
         type=["json", "pdf", "md"],
         accept_multiple_files=True,
         key="papers",
     )
     if papers_files:
-        st.success(f"✅ 已选择 **{len(papers_files)}** 个文件")
-        with st.expander(f"查看文件列表（{len(papers_files)} 个）"):
+        st.success(f"✅ {len(papers_files)} file(s) selected")
+        with st.expander(f"View file list ({len(papers_files)})"):
             for f in papers_files:
                 st.caption(f"· `{f.name}`")
 
-    # JSON 模板下载
+    # JSON template download
     TEMPLATE = [
         {
             "id": "2023_q1",
             "year": 2023,
-            "text": "在此填写题目原文（必填）",
+            "text": "Put the full question text here (required)",
             "type": "computation",
-            "answer": "参考答案要点（可选）",
+            "answer": "Reference answer key points (optional)",
         },
         {
             "id": "2022_q1",
             "year": 2022,
-            "text": "在此填写题目原文",
+            "text": "Put the full question text here",
             "type": "derivation",
         },
     ]
     st.download_button(
-        "📥 下载历年真题 JSON 模板",
+        "📥 Download past-papers JSON template",
         data=json.dumps(TEMPLATE, ensure_ascii=False, indent=2),
         file_name="questions_template.json",
         mime="application/json",
         use_container_width=True,
     )
 
-# 可选材料
-with st.expander("➕ 习题集 & 教学大纲（可选，提升准确度）"):
+# Optional materials
+with st.expander("➕ Tutorials & syllabus (optional — improves accuracy)"):
     c1, c2 = st.columns(2)
     with c1:
-        st.caption("**习题集 / Tutorial**（PDF 或 Markdown）")
+        st.caption("**Tutorials / problem sets** (PDF or Markdown)")
         tut_files = st.file_uploader(
-            "习题集",
+            "Tutorials",
             type=["pdf", "md"],
             accept_multiple_files=True,
             key="tutorials",
             label_visibility="collapsed",
         )
     with c2:
-        st.caption("**教学大纲**（.md 或 .txt）")
+        st.caption("**Syllabus** (.md or .txt)")
         syl_file = st.file_uploader(
-            "大纲",
+            "Syllabus",
             type=["md", "txt"],
             key="syllabus",
             label_visibility="collapsed",
@@ -299,35 +313,35 @@ with st.expander("➕ 习题集 & 教学大纲（可选，提升准确度）"):
 
 st.divider()
 
-# ── 运行按钮 & 校验提示 ───────────────────────────────────────────────────────
+# ── Run button & validation ──────────────────────────────────────────────────
 can_run = bool(api_key and slides_files and course_name)
 
 if not can_run:
     missing = [label for label, ok in [
-        ("左侧 API Key", api_key),
-        ("左侧课程名称", course_name),
-        ("课件材料",     slides_files),
+        ("API Key (sidebar)", api_key),
+        ("Course name (sidebar)", course_name),
+        ("Course materials",     slides_files),
     ] if not ok]
-    st.warning("⚠️ 还需要填写/上传：" + "、".join(missing))
+    st.warning("⚠️ Still need: " + ", ".join(missing))
 
-# 主区域按钮（页面中央）
+# Main-area button (page center)
 run_btn = st.button(
-    "🚀  开始分析",
+    "🚀  Run Analysis",
     type="primary",
     disabled=not can_run,
     use_container_width=True,
     key="run_main",
 )
 
-# 侧边栏按钮也可触发（二者任一点击即可）
+# Either button can trigger the run
 run_btn = run_btn or (run_sidebar_btn and can_run)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 执行 Pipeline
+# Run the pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if run_btn:
-    # 清除上次结果
+    # Clear previous results
     for key in ("report", "md", "pdf", "run_course"):
         st.session_state.pop(key, None)
 
@@ -343,12 +357,13 @@ if run_btn:
         keep_top=keep_top_n,
         enable_llm_scoring=enable_llm_scoring,
         filter_noise=filter_noise,
+        report_language=report_language,
     )
 
     with tempfile.TemporaryDirectory() as tmp:
         course_dir = Path(tmp) / "course"
 
-        # 写入上传的文件
+        # Write uploaded files
         save_uploads(slides_files, course_dir / "slides")
         if papers_files:
             save_uploads(papers_files, course_dir / "past_papers")
@@ -357,17 +372,17 @@ if run_btn:
         if syl_file:
             (course_dir / "syllabus.md").write_bytes(syl_file.getvalue())
 
-        # 运行 pipeline，用 st.status 显示进度
-        with st.status("🔄  正在运行预测引擎…", expanded=True) as status:
+        # Run the pipeline with a live status panel
+        with st.status("🔄  Running the prediction engine…", expanded=True) as status:
             try:
-                st.write("**Step 1 / 2** ⚙️  加载 Embedding 模型…")
-                st.caption("首次运行需下载 BGE 模型 (~1.3 GB)，已下载的课程秒开。")
+                st.write("**Step 1 / 2** ⚙️  Loading the embedding model…")
+                st.caption("First run downloads the BGE model (~1.3 GB); cached afterwards.")
                 predictor = ExamPredictor(cfg)
 
-                st.write("**Step 2 / 2** 🚀  运行四阶段预测（约 1–3 分钟）…")
+                st.write("**Step 2 / 2** 🚀  Running the prediction stages (~1–3 min)…")
                 st.caption(
-                    "Stage 1 解析课件 → Stage 2 对齐真题 → "
-                    "Stage 2.5 LLM 教学评分 → Stage 3 融合 → Stage 4 生成押题"
+                    "Stage 1 parse → Stage 2 align → Stage 2.5 LLM scoring → "
+                    "Stage 3 fuse → Stage 4 generate"
                 )
                 report = predictor.predict(
                     course_dir,
@@ -376,31 +391,31 @@ if run_btn:
                 )
                 md = ExamPredictor._format_markdown_report(report)
 
-                # 生成 PDF（一次性，缓存进 session_state）
+                # Build the PDF once and cache in session_state
                 pdf_bytes = None
                 try:
                     from exam_predictor.exporter import report_to_pdf_bytes
                     pdf_bytes = report_to_pdf_bytes(report)
                 except Exception as pdf_exc:  # noqa: BLE001
-                    st.warning(f"PDF 生成失败（仍可下载 Markdown/JSON）：{pdf_exc}")
+                    st.warning(f"PDF generation failed (Markdown/JSON still available): {pdf_exc}")
 
-                # 存入 session_state 供展示用
+                # Stash for display
                 st.session_state["report"]     = report
                 st.session_state["md"]         = md
                 st.session_state["pdf"]        = pdf_bytes
                 st.session_state["run_course"] = course_name
 
-                status.update(label="✅  预测完成！", state="complete", expanded=False)
+                status.update(label="✅  Done!", state="complete", expanded=False)
 
             except Exception as exc:
-                status.update(label="❌  运行失败", state="error")
-                st.error(f"错误：{exc}")
-                with st.expander("🐛 详细错误信息"):
+                status.update(label="❌  Run failed", state="error")
+                st.error(f"Error: {exc}")
+                with st.expander("🐛 Full traceback"):
                     st.code(traceback.format_exc())
                 st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 展示结果
+# Show results
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if "report" in st.session_state:
@@ -409,43 +424,43 @@ if "report" in st.session_state:
 
     report = st.session_state["report"]
     md     = st.session_state["md"]
-    name   = st.session_state.get("run_course", "课程")
+    name   = st.session_state.get("run_course", "course")
 
     st.success(
-        f"🎉  已分析 **{report.n_chunks}** 个课件块 · "
-        f"参考 **{report.n_past_questions}** 道历年真题 · "
-        f"生成 **{len(report.generated_questions)}** 道练习题 · "
-        f"综合置信度 **{report.overall_confidence:.0%}**"
+        f"🎉  Analyzed **{report.n_chunks}** chunks · "
+        f"referenced **{report.n_past_questions}** past papers · "
+        f"generated **{len(report.generated_questions)}** practice questions · "
+        f"overall confidence **{report.overall_confidence:.0%}**"
     )
 
-    # 警告提示
+    # Warnings
     for w in report.warnings:
         st.warning(w)
 
     tab_rank, tab_qs, tab_dl = st.tabs([
-        "📊 知识点热度排行",
-        "📝 押题练习",
-        "📥 下载报告",
+        "📊 Topic Ranking",
+        "📝 Practice Questions",
+        "📥 Download",
     ])
 
-    # ── Tab 1：知识点排行表 ──────────────────────────────────────────────────
+    # ── Tab 1: ranking table ─────────────────────────────────────────────────
     with tab_rank:
-        st.markdown("#### 综合热度排行（热度越高 = 历年考察频率越高）")
+        st.markdown("#### Importance ranking (higher = more frequently examined)")
 
         medals = {1: "🥇", 2: "🥈", 3: "🥉"}
         rows = []
         for i, p in enumerate(report.predictions, 1):
             f = p.features
             rows.append({
-                "排名":     medals.get(i, str(i)),
-                "知识点":   EP._clean_kp_title(p.title),
-                "热度":     f"{heat_bar(p.score)}  {p.score:.2f}",
-                "LLM评分":  f"{f.llm_pedagogy_score:.2f}",
-                "结构信号": f"{f.structural_signals:.2f}",
-                "命中真题": f.evidence.get("total_questions_matched", 0),
-                "数据模式": (
-                    "📉 少样本" if f.evidence.get("weight_regime") == "sparse"
-                    else "📈 正常"
+                "Rank":       medals.get(i, str(i)),
+                "Knowledge Point": EP._clean_kp_title(p.title),
+                "Importance": f"{heat_bar(p.score)}  {p.score:.2f}",
+                "LLM score":  f"{f.llm_pedagogy_score:.2f}",
+                "Structural": f"{f.structural_signals:.2f}",
+                "Past hits":  f.evidence.get("total_questions_matched", 0),
+                "Data mode": (
+                    "📉 Few-shot" if f.evidence.get("weight_regime") == "sparse"
+                    else "📈 Normal"
                 ),
             })
 
@@ -455,22 +470,24 @@ if "report" in st.session_state:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "知识点": st.column_config.TextColumn(width="large"),
-                "热度":   st.column_config.TextColumn(width="medium"),
+                "Knowledge Point": st.column_config.TextColumn(width="large"),
+                "Importance":      st.column_config.TextColumn(width="medium"),
             },
         )
 
         st.caption(
-            "💡 **数据模式**：历年真题 < 10 道时自动切换为「少样本」模式，"
-            "LLM 教学评分权重上升至 45%，以补偿历史数据不足。"
+            "💡 **Data mode**: with fewer than 10 past papers the system switches to "
+            "**Few-shot** mode — the LLM pedagogy score's weight rises to 45% to "
+            "compensate for sparse history."
         )
 
-    # ── Tab 2：押题练习 ──────────────────────────────────────────────────────
+    # ── Tab 2: practice questions ────────────────────────────────────────────
     with tab_qs:
         if not report.generated_questions:
             st.info(
-                "暂无生成的练习题。\n\n"
-                "可能原因：API 余额不足 · Top-K 设置过大 · 课件内容过短。"
+                "No practice questions were generated.\n\n"
+                "Possible causes: insufficient API balance · Top-K set too high · "
+                "course materials too short."
             )
         else:
             kp_title_map = {
@@ -482,72 +499,70 @@ if "report" in st.session_state:
                 for i, p in enumerate(report.predictions, 1)
             }
 
-            # 按知识点分组
+            # Group by knowledge point
             by_kp: dict = {}
             for q in report.generated_questions:
                 by_kp.setdefault(q.knowledge_point_id, []).append(q)
 
             ordered_kps = sorted(by_kp, key=lambda k: kp_rank_map.get(k, 999))
-            CN = "一二三四五六七八九十"
 
-            for sec_i, kp_id in enumerate(ordered_kps):
+            for sec_i, kp_id in enumerate(ordered_kps, 1):
                 qs    = by_kp[kp_id]
                 title = kp_title_map.get(kp_id, kp_id)
                 rank  = kp_rank_map.get(kp_id, "?")
-                cn    = CN[sec_i] if sec_i < len(CN) else str(sec_i + 1)
 
-                st.markdown(f"### {cn}、{title}")
-                st.caption(f"热度排名第 {rank} 位 · {len(qs)} 道练习题")
+                st.markdown(f"### {sec_i}. {title}")
+                st.caption(f"Importance rank #{rank} · {len(qs)} practice question(s)")
 
                 for q_i, q in enumerate(qs, 1):
                     d      = q.estimated_difficulty
                     stars  = diff_stars(d)
                     label  = diff_label(d)
                     qtype  = f"  ·  {q.question_type}" if q.question_type else ""
-                    header = f"第 {q_i} 题　{stars}　{label}{qtype}"
+                    header = f"Question {q_i}　{stars}　{label}{qtype}"
 
-                    # 第一道题默认展开
-                    with st.expander(header, expanded=(q_i == 1 and sec_i == 0)):
+                    # Expand the very first question by default
+                    with st.expander(header, expanded=(q_i == 1 and sec_i == 1)):
                         st.markdown(q.text)
                         if q.answer_sketch:
-                            st.info(f"💡 **参考答案要点**\n\n{q.answer_sketch}")
+                            st.info(f"💡 **Reference answer (key points)**\n\n{q.answer_sketch}")
 
-    # ── Tab 3：下载报告 ──────────────────────────────────────────────────────
+    # ── Tab 3: download ──────────────────────────────────────────────────────
     with tab_dl:
         pdf_bytes = st.session_state.get("pdf")
 
-        st.markdown("#### 选择下载格式")
+        st.markdown("#### Choose a download format")
         dl_col1, dl_col2, dl_col3 = st.columns(3)
 
         with dl_col1:
             if pdf_bytes:
                 st.download_button(
-                    "📕  下载 PDF 报告（推荐）",
+                    "📕  Download PDF (recommended)",
                     data=pdf_bytes,
-                    file_name=f"{name}_押题报告.pdf",
+                    file_name=f"{name}_exam_prediction.pdf",
                     mime="application/pdf",
                     use_container_width=True,
                     type="primary",
                 )
             else:
                 st.button(
-                    "📕  PDF 生成失败",
+                    "📕  PDF generation failed",
                     disabled=True,
                     use_container_width=True,
                 )
 
         with dl_col2:
             st.download_button(
-                "📝  下载 Markdown",
+                "📝  Download Markdown",
                 data=md.encode("utf-8"),
-                file_name=f"{name}_押题报告.md",
+                file_name=f"{name}_exam_prediction.md",
                 mime="text/markdown",
                 use_container_width=True,
             )
 
         with dl_col3:
             st.download_button(
-                "🗂️  下载 JSON 数据",
+                "🗂️  Download JSON",
                 data=json.dumps(
                     report.model_dump(), ensure_ascii=False, indent=2
                 ).encode("utf-8"),
@@ -557,10 +572,10 @@ if "report" in st.session_state:
             )
 
         st.caption(
-            "💡 **PDF** 适合打印复习与分享；**Markdown** 适合二次编辑；"
-            "**JSON** 含全部结构化数据，便于程序处理。"
+            "💡 **PDF** is best for printing and sharing; **Markdown** for further editing; "
+            "**JSON** holds all structured data for programmatic use."
         )
 
         st.divider()
-        st.caption("📄 报告预览")
+        st.caption("📄 Report preview")
         st.markdown(md)

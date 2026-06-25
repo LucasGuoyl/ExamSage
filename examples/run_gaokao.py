@@ -6,7 +6,7 @@ and we measure top-K coverage and MRR.
 
 Expected directory layout:
     data_samples/gaokao_math/
-        slides/                  (textbook / 教材 / 复习资料)
+        slides/                  (textbook / lecture notes / revision material)
         past_papers/
             gaokao_2010.json
             gaokao_2011.json
