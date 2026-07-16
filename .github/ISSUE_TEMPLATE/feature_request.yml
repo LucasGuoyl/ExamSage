@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest an improvement to the learning or agent workflow.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Student problem
+      description: What is hard today, and who experiences it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed experience
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Privacy, security, cost, and academic-integrity impact
+    validations:
+      required: true

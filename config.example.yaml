@@ -1,57 +1,43 @@
-# ============================================================
-#  ExamSage —— configuration template
-#  Copy this file to config.yaml and fill in your API key:
-#      cp config.example.yaml config.yaml
-#  (config.yaml is git-ignored, so it never leaks to GitHub)
-#
-#  Note: the Web UI (streamlit run app.py) takes the key in the
-#        sidebar, so this file is only needed for the CLI
-#        (examples/run_university.py).
-# ============================================================
+# ExamSage CLI configuration example.
+# The recommended web app asks for these values in the browser and does not
+# persist the API key. Never commit a real key.
 
-# ----- LLM brain (any OpenAI-compatible service works) -----
 llm:
-  provider: deepseek                        # deepseek / openai / qwen / ...
-  base_url: https://api.deepseek.com/v1      # OpenAI: https://api.openai.com/v1
-  api_key: YOUR_API_KEY_HERE                 # <- put your key here
-  model: deepseek-chat                       # cheap & good; or gpt-4o-mini, etc.
+  provider: openai             # openai | gemini | custom (experimental)
+  api_key: YOUR_API_KEY_HERE
+  approved_max_usd: 10.00
+  # Most users should keep automatic routing. Optional overrides:
+  # fast_model: gpt-5.6-luna
+  # balanced_model: gpt-5.6-terra
+  # reasoning_model: gpt-5.6
+  # embedding_model: text-embedding-3-small
+  # base_url: https://example.com/v1  # custom only
   temperature: 0.3
-  max_tokens: 2048
-  timeout: 60
-  max_retries: 3
+  max_tokens: 4096
 
-# ----- Embedding model -----
 embedding:
-  backend: local                            # local (BGE) or api (OpenAI-compatible)
-  model_name: BAAI/bge-large-zh-v1.5         # bilingual SOTA; English-only: bge-large-en-v1.5
-  device: cpu                               # cpu / cuda / mps
-  batch_size: 32
+  backend: provider            # cloud-only; no local AI model
+  batch_size: 96
 
-# ----- Chunking -----
 chunking:
-  chunk_size: 800                           # characters per chunk
-  chunk_overlap: 100
-  use_semantic_chunking: false
+  chunk_size: 900
+  chunk_overlap: 120
 
-# ----- Stage C: align past papers <-> course material -----
 alignment:
   top_k_chunks_per_question: 5
-  similarity_threshold: 0.55
+  similarity_threshold: 0.52
 
-# ----- Few-shot-aware scorer + knowledge-point filter -----
 scorer:
-  enable_llm_scoring: true                  # disable to save API cost (lower accuracy on sparse data)
-  course_context: ""                        # course description (recommended), e.g. "undergraduate Power Systems"
-  batch_size: 5                             # chunks per LLM scoring call
-  max_chunks_to_score: 80                   # cost cap
-  # Filter: drop title slides / agendas / recaps / references / admin text
-  min_chunk_chars: 60                       # chunks shorter than this are treated as title slides and dropped
-  min_pedagogy_score: 0.30                  # chunks the LLM rates below this are dropped
+  enable_llm_scoring: true
+  course_context: ""
+  batch_size: 5
+  max_chunks_to_score: 120
+  min_chunk_chars: 50
+  min_pedagogy_score: 0.28
 
-# ----- Stage D: adaptive multi-signal fusion -----
 fusion:
-  low_data_threshold: 10                    # below this many past papers, switch to sparse weights
-  weights:                                  # when past papers are plentiful (trust historical frequency)
+  low_data_threshold: 10
+  weights:
     exam_frequency: 0.35
     explicit_emphasis: 0.10
     chunk_size: 0.05
@@ -59,7 +45,7 @@ fusion:
     syllabus_emphasis: 0.10
     llm_pedagogy_score: 0.15
     structural_signals: 0.10
-  sparse_weights:                           # when past papers are scarce (trust the LLM prior)
+  sparse_weights:
     exam_frequency: 0.10
     explicit_emphasis: 0.08
     chunk_size: 0.03
@@ -67,7 +53,7 @@ fusion:
     syllabus_emphasis: 0.14
     llm_pedagogy_score: 0.45
     structural_signals: 0.10
-  emphasis_keywords:                        # bilingual emphasis cues (kept for cross-language support)
+  emphasis_keywords:
     zh: ["重点", "考点", "考试", "必考", "重要", "记住", "经典", "高频"]
     en: ["important", "remember", "exam", "key", "essential", "frequently asked"]
   syllabus_verb_weights:
@@ -79,17 +65,12 @@ fusion:
     describe: 0.4
     aware: 0.2
 
-# ----- Stage E: knowledge-point summary + question generation -----
 generation:
-  top_k_knowledge_points: 10                # generate on the top-K knowledge points
-  candidates_per_point: 5                   # candidate questions per knowledge point
-  few_shot_examples: 3                      # past papers used as style anchors
-  rerank_keep_top_n: 2                      # questions kept per knowledge point after rerank
-  summarise_batch_size: 4                   # knowledge points per summarisation call
-  report_language: auto                     # auto (match source) | en | zh
+  all_knowledge_points: true
+  few_shot_examples: 3
+  question_batch_size: 3
+  summarise_batch_size: 4
+  report_language: auto       # auto | en | zh
 
-# ----- Output -----
-output:
-  dir: ./output
-  format: both                              # markdown / json / both (PDF is always also written)
-  include_evidence: true
+research:
+  max_queries: 6

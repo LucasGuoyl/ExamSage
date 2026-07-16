@@ -1,213 +1,190 @@
-# 🎓 ExamSage
+# ExamSage
 
-> Upload your slides and past papers → AI ranks the most likely exam topics → it auto-generates practice questions with answers, exportable to PDF in one click.
+**A local, privacy-conscious agent that turns university course materials into a chapter map, evidence-aware exam focus ranking, adaptive practice bank, worked solutions, and an ongoing tutor.**
 
-A **training-free** exam-prediction system. It reuses off-the-shelf large language models and open-source embeddings, running a *retrieval → multi-signal fusion → generation* pipeline that predicts the **knowledge points most likely to be tested** from your course materials, and generates matching practice questions for each.
+ExamSage is designed for undergraduate courses across mathematics, physics, chemistry, biology, engineering, humanities, business, law, languages, and interdisciplinary subjects. It supports multilingual course material and global academic sources.
 
-Core design goals: **works with few (or zero) past papers**, and **generalizes across courses** — switching subjects only takes a one-line course description.
+> ExamSage predicts **revision priorities**, not actual exam questions. A ranking is uncertain evidence—not a promise that a topic will appear.
 
----
+## What makes it useful
 
-## ✨ Features
+- Drop in PDFs, slides, Word documents, spreadsheets, scans, handwriting, images, Markdown, HTML, JSON, webpages, or a ZIP.
+- Describe the exam and your goal in normal language.
+- Review a cost estimate and approve a hard spending limit before any AI task starts.
+- Receive a hierarchical chapter tree, knowledge summaries, prerequisites, focus scores, confidence labels, and supporting evidence.
+- Get **6–24 questions per knowledge point**, adjusted by importance and similar past-question density.
+- Every generated question includes a worked answer, suggested total marks, and marks for each step or knowledge point.
+- When the uploaded evidence is sparse, ExamSage uses the selected provider's native web search and shows citations.
+- Continue asking questions in the same course conversation until the explanation is satisfactory.
+- Export the result as PDF, Markdown, or structured JSON.
 
-- 📥 **Many input formats** — slides as PDF / PPTX / Markdown; past papers as JSON / PDF / Markdown.
-- 🔥 **Exam heatmap** — semantically aligns past questions to slide passages to quantify each topic's historical exam frequency.
-- 🧠 **Few-shot friendly** — a built-in LLM pedagogical prior takes over when past papers are scarce (even zero); weights shift smoothly with data volume.
-- 🌐 **Cross-course** — scoring doesn't rely on subject-specific data; one line of course context adapts it to power systems, chemistry, CS, economics, anything.
-- 🚫 **Smart filtering** — rules + LLM jointly detect and drop title pages, agendas, recaps, background, and admin text that aren't real knowledge points.
-- ✍️ **Question generation** — few-shot mimics the style of past papers, then an LLM-as-judge ranks the candidates.
-- 📄 **One-click export** — Markdown / JSON / **PDF** (renders English, CJK, and math symbols; print-ready).
-- 🖥️ **Web UI** — a Streamlit app: drag-and-drop upload, click to run, preview online, download.
-- 🌍 **Output language control** — questions/answers default to the source material's language; force English or Chinese with one switch.
+## Start in three steps
 
----
+### Windows
 
-## 🛠️ Tech Stack
+1. Install [Python 3.11 or 3.12](https://www.python.org/downloads/).
+2. Download or clone this repository.
+3. Double-click `launch_windows.bat`.
 
-| Area | Choice | Purpose |
-|------|--------|---------|
-| Language | **Python 3.10+** | Whole stack |
-| Web UI | **Streamlit** | Upload / configure / display / download |
-| Embeddings | **sentence-transformers + BGE** | Encode slides & questions into vectors |
-| Vector search | **FAISS** (CPU) | Cosine-similarity retrieval (question ↔ slide alignment) |
-| LLM | **OpenAI SDK** | Works with DeepSeek / OpenAI / Qwen / any OpenAI-compatible API |
-| Data models | **Pydantic v2** | Typed models & serialization |
-| Doc parsing | **PyMuPDF** (PDF) · **python-pptx** (PPTX) | Extract slide text |
-| PDF export | **ReportLab** | Render a print-ready PDF from the structured report |
-| Robustness | **tenacity** | Exponential-backoff retries on API calls |
-| CLI output | **rich** | Progress and colored logs |
+### macOS
 
-### Models used
+1. Install [Python 3.11 or 3.12](https://www.python.org/downloads/).
+2. Download or clone this repository.
+3. Control-click `launch_macos.command`, choose **Open**, and accept the first-run warning.
 
-- **Embedding**: `BAAI/bge-large-zh-v1.5` (bilingual, runs locally, free, ~1.3 GB auto-download on first use). English-only courses can use `bge-large-en-v1.5`; OpenAI `text-embedding-3` is also supported.
-- **LLM**: default `deepseek-chat` (good, cheap). Swap in any OpenAI-compatible model (GPT-4o, Qwen, …). **Used in four places: pedagogy scoring, knowledge-point summarization, question generation, and answer reranking.**
+The launcher creates an isolated environment, installs dependencies, and opens `localhost` in the browser. In the page, choose OpenAI or Google Gemini and enter **one API key**. The key stays in that browser session.
 
-> 💡 The system **trains and fine-tunes nothing** — it works out of the box.
-
----
-
-## 🧩 Architecture & Algorithms
-
-```
-        Slides (PDF/PPTX/MD) + Past papers (JSON/PDF/MD) + Tutorials/Syllabus (optional)
-                                │
-                                ▼
-   ┌──────────────────── Stage 1 · Ingest ──────────────────────┐
-   │  PyMuPDF / python-pptx extract text  →  sliding-window Chunks │
-   └──────────────────────────────────────────────────────────────┘
-                                │
-        ┌───────────────────────┼───────────────────────┐
-        ▼                       ▼                       ▼
- ┌──────────────┐      ┌─────────────────┐      ┌──────────────────┐
- │ Stage 2 · C  │      │ Stage 2.5 · Score│      │ Stage 2.6 · Filter│
- │   Align      │      │  LLM pedagogy    │      │  drop non-content │
- │ Q→slide ret. │      │  + rule signals  │      │ titles/agenda/etc │
- │ FAISS heatmap│      │ (no history dep) │      │  rules + LLM gate │
- └──────────────┘      └─────────────────┘      └──────────────────┘
-        └───────────────────────┼───────────────────────┘
-                                ▼
-   ┌──────────────────── Stage 3 · D · Fuse ────────────────────┐
-   │  weighted sum of: exam_freq · pedagogy · structural ·        │
-   │  emphasis · teaching-time · tutorial-overlap · syllabus      │
-   │  ★ Adaptive weights: few papers → LLM prior leads (0.45);    │
-   │    many papers → historical frequency leads (0.35)           │
-   │  greedy embedding clustering → Knowledge Points              │
-   └──────────────────────────────────────────────────────────────┘
-                                │
-   ┌──────────────── Stage 3.5 · Summarise ─────────────────────┐
-   │  LLM writes per topic: clean title + concept + 3 exam angles │
-   └──────────────────────────────────────────────────────────────┘
-                                │
-   ┌──────────────────── Stage 4 · E · Generate ────────────────┐
-   │  few-shot questions in past-paper style → LLM-as-judge +     │
-   │  embedding-novelty rerank                                     │
-   └──────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-             📊 Topic ranking + 📝 Practice questions + 💡 Answers
-                  exported as  report.md / predictions.json / report.pdf
-```
-
-### Key algorithms
-
-1. **Semantic alignment (Stage C)** — chunks and questions are BGE-encoded, L2-normalized, and indexed in a FAISS `IndexFlatIP` (inner product = cosine). Each past question retrieves its top-K similar chunks; contributions (similarity × recency weight) accumulate and min-max normalize into an **exam heatmap**.
-2. **Pedagogical prior (Scorer)** — chunks are batched to the LLM, which rates each one's exam probability from first principles (definition / derivation / application / background…), **without any course-specific history**. This is the source of the few-shot and cross-course ability. A zero-cost rule signal (definitions, theorems, action verbs, emphasis-keyword density) complements it.
-3. **Non-content filter** — regex rules catch title slides, agendas, recaps, references, acknowledgements, and admin text; an LLM-score threshold backs it up. A safety fallback reverts to no-filter if too much is dropped.
-4. **Adaptive fusion (Stage D)** — seven signals are weighted-summed; weights **linearly interpolate** between "sparse" and "normal" sets based on the number of past papers — less data leans on the LLM prior, more data leans on historical frequency.
-5. **Knowledge-point clustering** — greedy embedding-similarity clustering merges near-duplicate chunks into topics.
-6. **Styled generation & rerank (Stage E)** — few-shot past papers anchor the style; an LLM-as-judge (style / quality / novelty) combined with embedding novelty scores and keeps the best per topic.
-7. **Offline evaluation** — a built-in hold-out evaluator (split by year) reports **Top-K Coverage** and **MRR** against a random baseline, for tuning the fusion weights.
-
----
-
-## 🚀 Quick Start
-
-### 1. Install
+Manual launch:
 
 ```bash
-pip install -r requirements.txt
-```
-
-> First run downloads the BGE embedding model (~1.3 GB); it's cached afterward.
-
-### 2. Configure your API key
-
-Works with any OpenAI-compatible service (we recommend [DeepSeek](https://platform.deepseek.com) — cheap and strong).
-
-- **Web UI**: no config file — paste the key in the sidebar.
-- **CLI**: copy the template and fill in the key (`config.yaml` is git-ignored):
-  ```bash
-  cp config.example.yaml config.yaml   # then edit config.yaml and set api_key
-  ```
-
-### 3. Launch the Web UI (recommended)
-
-```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS: source .venv/bin/activate
+python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Opens **http://localhost:8501**. In the UI: enter your API key and course name → drag-and-drop slides (and past papers) → click **🚀 Run Analysis** → view the ranking/questions → download the PDF.
+## Provider choice
 
-### 4. CLI mode
+| Choice | One key | Files & images | Embeddings | Native web search | Status |
+|---|:---:|:---:|:---:|:---:|---|
+| OpenAI | Yes | Yes | Yes | Yes | First-class |
+| Google Gemini | Yes | Yes | Yes | Yes | First-class |
+| OpenAI-compatible URL | Yes | Provider-dependent | Usually | Provider-dependent | Experimental |
+
+ExamSage automatically routes bulk extraction to a cost-sensitive model, ordinary synthesis to a balanced model, and difficult reasoning/review to a stronger model—all under the selected provider and key. Advanced users can override model IDs in the UI.
+
+This is how someone can avoid OpenAI pricing without making setup complicated: select **Google Gemini**, paste a Gemini key, and keep the rest of the workflow unchanged. Additional first-class providers should only be added when they can cover chat, multimodal files, embeddings, grounded search, citations, and privacy controls with one credential.
+
+## What “OCR” means
+
+OCR stands for **Optical Character Recognition**. A normal PDF often already contains selectable text; a scan or phone photo contains only pixels. OCR turns those pixels—printed words, labels, and sometimes handwriting—into text the agent can search and reason over.
+
+ExamSage does not install a local OCR or AI model. It sends the image or scanned page directly from the user's device to the chosen multimodal provider. The provider reads the text and also explains diagrams, formulas, tables, and charts. For `.docx`, `.pptx`, and `.xlsx`, ExamSage additionally extracts embedded images and submits them because some provider document parsers otherwise see only the text layer.
+
+## The agent workflow
+
+```mermaid
+flowchart LR
+    A["Upload + natural-language goal"] --> B["Local safety validation"]
+    B --> C["Selected provider: OCR + document understanding"]
+    C --> D["Local normalized course workspace"]
+    D --> E["Cloud embeddings + evidence alignment"]
+    E --> F["Focus ranking + confidence"]
+    F --> G{"Evidence sparse?"}
+    G -- Yes --> H["Provider-native web search + citations"]
+    G -- No --> I["Course report"]
+    H --> I
+    I --> J["Chapter tree + 6–24 questions/topic + worked rubrics"]
+    J --> K["Persistent local tutor conversation"]
+```
+
+In agent terminology:
+
+- The **model** is the reasoning engine supplied by OpenAI or Gemini.
+- **Tools** are actions the model can use, such as file vision, embeddings, or web search.
+- **Memory** is the local course report and chat history.
+- The **orchestrator** is the Python code that decides which tool runs next, enforces the budget, and labels evidence.
+- **Grounding** means tying claims to uploaded material or cited public sources instead of relying only on model memory.
+
+ExamSage is an agent because it follows a conditional multi-step workflow, uses tools, maintains course state, and can continue acting in response to student questions. It is not just a single prompt.
+
+## Scoring and question allocation
+
+The relative focus score combines:
+
+- similarity to uploaded past questions;
+- explicit instructor emphasis;
+- tutorial/problem-set overlap;
+- syllabus verbs and weighting;
+- structural signals such as definitions, theorems, proofs, applications, and comparisons;
+- a provider-model pedagogical prior, weighted more heavily when past exams are scarce.
+
+Confidence is reported separately. External university sources can clarify a topic and seed original practice variants, but **never count as proof of what the user's instructor will test**.
+
+Practice allocation is deterministic after scoring:
+
+- every detected knowledge point receives at least 6 questions;
+- high-priority topics receive more;
+- topics with more similar past questions receive more;
+- the cap is 24 per knowledge point;
+- external variants are visibly labelled and preserve source links.
+
+## Privacy and safety model
+
+ExamSage has no developer-operated backend. The browser UI runs on the user's own computer.
+
+- Raw files travel directly to the selected provider over its official SDK.
+- No local AI model is downloaded or executed.
+- Deterministic local operations—validation, safe ZIP extraction, chunking, SQLite storage, and export—do not infer content.
+- API keys are kept in Streamlit session memory and are never written to the course database, report, manifest, logs, or backup.
+- OpenAI requests use `store: false` where the Responses API supports it.
+- Gemini uploads are deleted on a best-effort basis immediately after analysis.
+- ZIP traversal, symlinks, extreme compression ratios, unsupported executable content, private-network URLs, and common prompt-injection phrases are blocked or flagged.
+- There is no telemetry. Streamlit usage reporting is disabled.
+- Courses and conversations live under `~/.examsage` unless `EXAMSAGE_DATA_DIR` is set.
+- The UI can delete a local course. `backup_windows.bat` and `backup_macos.command` create a local ZIP that excludes transient intake files and keys.
+
+The provider still receives uploaded content and applies its own retention, abuse-monitoring, regional, and account policies. Users must review those policies before sending confidential, regulated, copyrighted, or third-party personal data. See [PRIVACY.md](PRIVACY.md) and [SECURITY.md](SECURITY.md).
+
+## Supported inputs
+
+| Category | Formats |
+|---|---|
+| Documents | PDF, DOC/DOCX, PPT/PPTX |
+| Data | XLS/XLSX, CSV, TSV, JSON, YAML |
+| Text/web | MD, TXT, HTML, HTTPS webpages via grounded research |
+| Images | PNG, JPEG, WebP, GIF, BMP, TIFF; printed scans and handwriting |
+| Bundles | ZIP with safe extraction |
+
+The local course workspace is limited to 1 GB. A provider may impose a lower per-request file limit; large PDFs are split into safe page batches. Audio and video are intentionally out of scope for the first release.
+
+## Cost controls
+
+Before a build, ExamSage shows a broad USD range broken down into:
+
+1. file/image understanding;
+2. knowledge analysis and report construction;
+3. questions, worked answers, and rubrics;
+4. optional grounded web searches.
+
+The estimate is not an invoice. Visual page density, model output length, retries, regional taxes, provider free tiers, and price changes can affect the actual charge. A run stops before its conservative in-memory ledger would cross the approved ceiling. The provider console remains the source of truth.
+
+## Development
 
 ```bash
-python examples/run_university.py --course <course_dir> --config config.yaml
+python -m pip install -r requirements-dev.txt
+pytest
+ruff check exam_predictor tests app.py
 ```
 
-Writes `output/report.md`, `output/predictions.json`, and `output/report.pdf`.
+Key modules:
 
----
-
-## 📁 Preparing Data
-
-Organize one course like this (only `slides/` is required):
-
-```
-my_course/
-├── slides/          # required   .pdf / .pptx / .md
-├── past_papers/     # optional (more is better)   .json / .pdf / .md
-├── tutorials/       # optional
-└── syllabus.md      # optional
+```text
+exam_predictor/
+├── agent.py            # end-to-end decisions, web fallback, tree, tutor
+├── providers.py        # OpenAI/Gemini/custom adapters and budget ledger
+├── cloud_analyzer.py   # multimodal OCR/document normalization
+├── security.py         # upload, ZIP, URL and injection boundaries
+├── pipeline.py         # alignment, scoring, generation and report
+├── state.py            # local course/chat persistence; no keys
+└── exporter.py         # PDF export
 ```
 
-Recommended past-papers JSON format (downloadable as a template in the Web UI):
+Contributions are welcome. Good first additions include provider contract tests, richer humanities question types, accessibility work, evaluation datasets with clear licenses, and installer signing. Read [CONTRIBUTING.md](CONTRIBUTING.md).
 
-```json
-[
-  {
-    "id": "2023_q1",
-    "year": 2023,
-    "text": "Full question text…",
-    "type": "computation",
-    "answer": "Reference answer key points (optional)"
-  }
-]
-```
+## Current status
 
----
+ExamSage is an alpha-quality open-source project. It needs broader real-course evaluation before anyone should rely on its ranking quality. Known limitations:
 
-## 🗂️ Project Structure
+- “exam likelihood” is relative and cannot be calibrated as a literal probability without a suitable evaluation dataset;
+- provider file and search behavior can change;
+- handwriting accuracy varies with image quality;
+- custom compatible endpoints cannot yet guarantee the full multimodal/search/privacy contract;
+- Windows and macOS launchers are not code-signed.
 
-```
-ExamSage/
-├── app.py                  # Streamlit Web UI entry point
-├── config.example.yaml     # config template (copy to config.yaml)
-├── requirements.txt
-├── exam_predictor/         # core engine package
-│   ├── pipeline.py         # end-to-end orchestration + Markdown report
-│   ├── ingest.py           # PDF / PPTX / MD parsing
-│   ├── chunker.py          # text chunking
-│   ├── embedder.py         # local BGE / API embeddings (switchable)
-│   ├── vector_store.py     # FAISS wrapper
-│   ├── aligner.py          # Stage C: alignment + exam heatmap
-│   ├── scorer.py           # pedagogical prior + non-content filter
-│   ├── fusion.py           # Stage D: adaptive multi-signal fusion
-│   ├── generator.py        # knowledge-point summary + Stage E generation
-│   ├── reranker.py         # LLM-as-judge rerank
-│   ├── exporter.py         # PDF export (ReportLab)
-│   ├── evaluator.py        # hold-out evaluation (Coverage / MRR)
-│   └── schema.py           # Pydantic data models
-├── examples/
-│   ├── run_university.py   # single-course prediction
-│   └── run_gaokao.py       # hold-out evaluation
-└── tests/
-    └── test_basic.py       # smoke tests
-```
+If this direction is useful, a GitHub star helps more students and contributors discover the project.
 
----
+## License
 
-## 🔒 Security
-
-- Key-bearing files (`config.yaml`, `.env`, …) are git-ignored and **never committed**.
-- Run `git status` before committing to confirm no key file is tracked.
-- **Never** put a real API key in a committed file or in source.
-
----
-
-## 📜 License
-
-Released under the [MIT License](LICENSE).
-
----
-
-*Predictions and generated content are for study reference only — always defer to your course materials and instructor.*
+[MIT](LICENSE). Uploaded materials, generated reports, and third-party web sources retain their respective rights. Do not republish complete copyrighted exam papers without permission.

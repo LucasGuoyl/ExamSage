@@ -81,17 +81,24 @@ def _esc(text: str) -> str:
 
 
 def _diff_label(d: float | None) -> str:
-    if d is None:    return "Unknown"
-    if d < 0.35:     return "Basic"
-    if d < 0.55:     return "Medium"
-    if d < 0.75:     return "Advanced"
+    if d is None:
+        return "Unknown"
+    if d < 0.35:
+        return "Basic"
+    if d < 0.55:
+        return "Medium"
+    if d < 0.75:
+        return "Advanced"
     return "Challenge"
 
 
 def _importance_label(score: float) -> str:
-    if score >= 0.6:  return "Very High"
-    if score >= 0.45: return "High"
-    if score >= 0.30: return "Medium"
+    if score >= 0.6:
+        return "Very High"
+    if score >= 0.45:
+        return "High"
+    if score >= 0.30:
+        return "Medium"
     return "Low"
 
 
@@ -276,6 +283,8 @@ def report_to_pdf_bytes(report: PredictionReport) -> bytes:
                     st["qhead"],
                 ))
                 flow.append(Paragraph(_esc(q.text), st["q"]))
+                if q.suggested_marks:
+                    flow.append(Paragraph(f"Suggested marks: {q.suggested_marks}", st["meta"]))
                 if q.answer_sketch:
                     ans = Paragraph(
                         "<b>Reference Answer (key points): </b>" + _esc(q.answer_sketch), st["ans"])
@@ -289,6 +298,30 @@ def report_to_pdf_bytes(report: PredictionReport) -> bytes:
                         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
                     ]))
                     flow.append(ans_tbl)
+                    flow.append(Spacer(1, 4))
+                if q.marking_scheme:
+                    rubric_rows = [[
+                        Paragraph("Step / knowledge point", st["cellb"]),
+                        Paragraph("Marks", st["cellb"]),
+                        Paragraph("Explanation", st["cellb"]),
+                    ]]
+                    for criterion in q.marking_scheme:
+                        rubric_rows.append([
+                            Paragraph(_esc(criterion.criterion), st["cell"]),
+                            Paragraph(str(criterion.marks), st["cell"]),
+                            Paragraph(_esc(criterion.explanation or ""), st["cell"]),
+                        ])
+                    rubric = Table(
+                        rubric_rows,
+                        colWidths=[usable_w * 0.45, usable_w * 0.10, usable_w * 0.45],
+                        repeatRows=1,
+                    )
+                    rubric.setStyle(TableStyle([
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a6099")),
+                        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#dddddd")),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ]))
+                    flow.append(rubric)
                     flow.append(Spacer(1, 4))
         else:
             flow.append(Paragraph("(No practice questions generated for this topic.)", st["meta"]))

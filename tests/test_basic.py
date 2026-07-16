@@ -14,9 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 def test_imports():
     """All modules should import cleanly."""
-    from exam_predictor import schema, ingest, chunker, embedder
-    from exam_predictor import vector_store, aligner, fusion
-    from exam_predictor import generator, reranker, evaluator, pipeline
+    import importlib
+
+    modules = [
+        "schema", "ingest", "chunker", "embedder", "vector_store", "aligner",
+        "fusion", "generator", "reranker", "evaluator", "pipeline", "providers",
+        "security", "cloud_analyzer", "agent", "state", "budget",
+    ]
+    for module in modules:
+        importlib.import_module(f"exam_predictor.{module}")
 
 
 def test_schema_roundtrip():

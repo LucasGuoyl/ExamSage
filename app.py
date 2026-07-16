@@ -1,108 +1,79 @@
-"""ExamSage — Streamlit Web UI
+"""ExamSage local web application.
 
-Run with:
-    streamlit run app.py
-
-The first run downloads the BGE embedding model (~1.3 GB); later runs reuse it.
+Run with: streamlit run app.py
 """
 
 from __future__ import annotations
 
 import json
-import sys
-import tempfile
-import traceback
+import os
+import shutil
+import uuid
 from pathlib import Path
 
 import streamlit as st
 
-# ── Make the exam_predictor package importable ───────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent))
-
-# ── Page config (must precede every other st call) ───────────────────────────
-st.set_page_config(
-    page_title="ExamSage · Exam Predictor",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded",
+from exam_predictor.agent import ExamSageAgent
+from exam_predictor.budget import estimate_run_cost
+from exam_predictor.exporter import report_to_pdf_bytes
+from exam_predictor.pipeline import ExamPredictor
+from exam_predictor.providers import BudgetExceeded, ProviderError, create_provider
+from exam_predictor.schema import KnowledgeTreeNode, PredictionReport
+from exam_predictor.security import (
+    UploadSecurityError,
+    redact_secrets,
+    safe_filename,
+    validate_public_https_url,
 )
-
-st.markdown("""
-<style>
-.main .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
-.stTabs [role="tab"]   { font-size: 1rem; padding: .4rem 1.2rem; }
-</style>
-""", unsafe_allow_html=True)
+from exam_predictor.state import CourseStore
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def save_uploads(files, dest: Path) -> None:
-    """Write Streamlit uploaded-file objects to disk."""
-    dest.mkdir(parents=True, exist_ok=True)
-    for f in files:
-        (dest / f.name).write_bytes(f.getvalue())
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("EXAMSAGE_DATA_DIR", Path.home() / ".examsage"))
+INTAKE_DIR = DATA_DIR / "intake"
+COURSE_STORE = CourseStore(DATA_DIR)
 
 
-def build_config(
-    api_key: str,
-    base_url: str,
-    model: str,
-    course_context: str,
-    top_k: int,
-    n_candidates: int,
-    keep_top: int,
-    enable_llm_scoring: bool,
-    filter_noise: bool = True,
-    report_language: str = "auto",
-) -> dict:
-    """Build a pipeline config dict from UI inputs (no config.yaml needed)."""
+def default_config(provider_name: str, api_key: str, approved_max: float, **advanced) -> dict:
+    llm = {
+        "provider": provider_name,
+        "api_key": api_key,
+        "approved_max_usd": approved_max,
+        "temperature": 0.3,
+        "max_tokens": 4096,
+    }
+    for key in ("base_url", "fast_model", "balanced_model", "reasoning_model", "embedding_model"):
+        if advanced.get(key):
+            llm[key] = advanced[key]
     return {
-        "llm": {
-            "base_url": base_url,
-            "api_key": api_key,
-            "model": model,
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "timeout": 60,
-            "max_retries": 2,
-        },
-        "embedding": {
-            "backend": "local",
-            "model_name": "BAAI/bge-large-zh-v1.5",
-            "device": "cpu",
-            "batch_size": 32,
-        },
+        "llm": llm,
+        "embedding": {"backend": "provider", "batch_size": 96},
+        "chunking": {"chunk_size": 900, "chunk_overlap": 120},
+        "alignment": {"top_k_chunks_per_question": 5, "similarity_threshold": 0.52},
         "scorer": {
-            "enable_llm_scoring": enable_llm_scoring,
-            "course_context": course_context,
+            "enable_llm_scoring": True,
             "batch_size": 5,
-            "max_chunks_to_score": 80,
-            # Smart filter: drop title/agenda/background/admin content when on
-            "min_chunk_chars": 60 if filter_noise else 0,
-            "min_pedagogy_score": 0.30 if filter_noise else 0.0,
+            "max_chunks_to_score": 120,
+            "min_chunk_chars": 50,
+            "min_pedagogy_score": 0.28,
         },
-        "chunking": {"chunk_size": 800, "chunk_overlap": 100},
-        "alignment": {"top_k_chunks_per_question": 5, "similarity_threshold": 0.55},
         "fusion": {
             "low_data_threshold": 10,
             "weights": {
                 "exam_frequency": 0.35, "explicit_emphasis": 0.10,
-                "chunk_size": 0.05,    "tutorial_overlap": 0.15,
+                "chunk_size": 0.05, "tutorial_overlap": 0.15,
                 "syllabus_emphasis": 0.10, "llm_pedagogy_score": 0.15,
                 "structural_signals": 0.10,
             },
             "sparse_weights": {
                 "exam_frequency": 0.10, "explicit_emphasis": 0.08,
-                "chunk_size": 0.03,    "tutorial_overlap": 0.10,
+                "chunk_size": 0.03, "tutorial_overlap": 0.10,
                 "syllabus_emphasis": 0.14, "llm_pedagogy_score": 0.45,
                 "structural_signals": 0.10,
             },
             "emphasis_keywords": {
                 "zh": ["重点", "考点", "考试", "必考", "重要", "记住", "经典", "高频"],
-                "en": ["important", "remember", "exam", "key", "essential"],
+                "en": ["important", "remember", "exam", "key", "essential", "frequently asked"],
             },
             "syllabus_verb_weights": {
                 "derive": 1.0, "prove": 1.0, "compute": 0.8, "apply": 0.8,
@@ -110,472 +81,426 @@ def build_config(
             },
         },
         "generation": {
-            "top_k_knowledge_points": top_k,
-            "candidates_per_point": n_candidates,
+            "all_knowledge_points": True,
+            "top_k_knowledge_points": 12,
             "few_shot_examples": 3,
-            "rerank_keep_top_n": keep_top,
-            "report_language": report_language,
+            "question_batch_size": 3,
+            "summarise_batch_size": 4,
+            "report_language": advanced.get("report_language", "auto"),
         },
+        "research": {"max_queries": int(advanced.get("max_queries", 6))},
     }
 
 
-def heat_bar(v: float, w: int = 8) -> str:
-    n = round(max(0.0, min(v, 1.0)) * w)
-    return "█" * n + "░" * (w - n)
+def likelihood_band(score: float) -> str:
+    if score >= 0.80:
+        return "Very high"
+    if score >= 0.60:
+        return "High"
+    if score >= 0.40:
+        return "Medium"
+    return "Lower"
 
 
-def diff_stars(d: float | None) -> str:
-    if d is None:
-        return "☆☆☆☆☆"
-    n = round(max(0.0, min(d, 1.0)) * 5)
-    return "★" * n + "☆" * (5 - n)
+def confidence_band(score: float) -> str:
+    if score >= 0.75:
+        return "Strong"
+    if score >= 0.50:
+        return "Moderate"
+    return "Limited"
 
 
-def diff_label(d: float | None) -> str:
-    if d is None:     return ""
-    if d < 0.35:      return "Basic"
-    if d < 0.55:      return "Medium"
-    if d < 0.75:      return "Advanced"
-    return "Challenge"
+def save_uploads(uploaded_files) -> list[Path]:
+    session_id = st.session_state.setdefault("intake_id", uuid.uuid4().hex)
+    destination = INTAKE_DIR / session_id
+    destination.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for index, upload in enumerate(uploaded_files):
+        name = safe_filename(upload.name)
+        target = destination / f"{index:03d}_{name}"
+        target.write_bytes(upload.getvalue())
+        paths.append(target)
+    return paths
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Sidebar: configuration
-# ═══════════════════════════════════════════════════════════════════════════════
+def render_tree(nodes: list[KnowledgeTreeNode], depth: int = 0) -> None:
+    for node in nodes:
+        label = f"{'↳ ' * depth}{node.title}"
+        with st.expander(label, expanded=depth == 0):
+            if node.summary:
+                st.write(node.summary)
+            if node.knowledge_point_ids:
+                st.caption("Knowledge points: " + ", ".join(node.knowledge_point_ids))
+            if node.prerequisites:
+                st.caption("Prerequisites: " + ", ".join(node.prerequisites))
+            if node.children:
+                render_tree(node.children, depth + 1)
 
-with st.sidebar:
-    st.title("⚙️ Settings")
 
-    # —— API
-    st.subheader("🔑 API")
-    api_key = st.text_input(
-        "API Key *",
-        type="password",
-        placeholder="sk-...",
-        help="Works with DeepSeek / OpenAI / any OpenAI-compatible service",
-    )
-    base_url = st.text_input(
-        "API Base URL",
-        value="https://api.deepseek.com/v1",
-        help="DeepSeek: https://api.deepseek.com/v1\nOpenAI: https://api.openai.com/v1",
-    )
-    llm_model = st.text_input("Model name", value="deepseek-chat")
+def report_markdown(report: PredictionReport) -> str:
+    return ExamPredictor._format_markdown_report(report)
 
+
+def render_report(report: PredictionReport, course_id: str | None) -> None:
     st.divider()
-
-    # —— Course info
-    st.subheader("📖 Course")
-    course_name = st.text_input(
-        "Course name *",
-        placeholder="e.g. Power Systems Analysis",
+    st.header(report.course_name)
+    a, b, c, d = st.columns(4)
+    a.metric("Knowledge points", len(report.predictions))
+    b.metric("Past questions found", report.n_past_questions)
+    c.metric("Overall confidence", f"{report.overall_confidence:.0%}")
+    d.metric("Practice questions", len(report.generated_questions))
+    st.caption(
+        "Likelihood is a relative study-priority score, not the probability that a question is guaranteed to appear."
     )
-    course_ctx = st.text_area(
-        "Course description (optional)",
-        placeholder="e.g. Undergraduate power systems course; emphasis on "
-                    "Newton-Raphson power flow and economic dispatch derivations",
-        height=90,
-        help="A specific description improves the LLM's pedagogical scoring and cross-course accuracy",
-    )
+    for warning in dict.fromkeys(report.warnings):
+        st.warning(warning)
 
-    st.divider()
-
-    # —— Advanced
-    st.subheader("🔧 Advanced")
-    top_k        = st.slider("Top-K knowledge points", 3, 20, 10)
-    n_candidates = st.slider("Candidates / point",      2,  8,  5)
-    keep_top_n   = st.slider("Keep / point",            1,  4,  2)
-
-    lang_choice = st.selectbox(
-        "Report language",
-        options=["Auto (match materials)", "English", "Chinese"],
-        index=0,
-        help="Auto generates questions/answers in the source material's language. "
-             "Force English/Chinese to override.",
-    )
-    report_language = {"Auto (match materials)": "auto",
-                       "English": "en", "Chinese": "zh"}[lang_choice]
-
-    enable_llm_scoring = st.checkbox(
-        "Enable LLM pedagogy scoring",
-        value=True,
-        help="Greatly improves accuracy on few-shot / new courses; uses a little extra API quota",
-    )
-    filter_noise = st.checkbox(
-        "Smart-filter non-exam content",
-        value=True,
-        help="Drops title pages, agendas, recaps, background, and admin text so "
-             "they aren't mistaken for knowledge points",
-    )
-
-    st.divider()
-
-    # Run button pinned to the bottom of the sidebar, always visible
-    _can_run_sidebar = bool(api_key and course_name)
-    if not _can_run_sidebar:
-        _miss = [l for l, ok in [("API Key", api_key), ("Course name", course_name)] if not ok]
-        st.caption(f"⚠️ Still needed: {', '.join(_miss)}")
-
-    run_sidebar_btn = st.button(
-        "🚀  Run Analysis",
-        type="primary",
-        disabled=not _can_run_sidebar,
-        use_container_width=True,
-        key="run_sidebar",
-    )
-
-    st.divider()
-    st.caption("ExamSage v0.2 · [GitHub](https://github.com/LucasGuoyl/ExamSage)")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Main area
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.title("🎓 ExamSage · Exam Predictor")
-st.caption("Upload slides and past papers → AI ranks exam topics → auto-generates practice questions")
-
-# ── Upload area ──────────────────────────────────────────────────────────────
-col_l, col_r = st.columns(2, gap="large")
-
-with col_l:
-    st.subheader("📄 Course materials (required)")
-    slides_files = st.file_uploader(
-        "Supports **PDF / PPTX / Markdown**, multiple files allowed",
-        type=["pdf", "pptx", "md"],
-        accept_multiple_files=True,
-        key="slides",
-    )
-    if slides_files:
-        total_kb = sum(f.size for f in slides_files) // 1024
-        st.success(f"✅ {len(slides_files)} file(s) selected · {total_kb} KB total")
-        with st.expander(f"View file list ({len(slides_files)})"):
-            for f in slides_files:
-                st.caption(f"· `{f.name}`  {f.size // 1024} KB")
-
-with col_r:
-    st.subheader("📚 Past papers (optional — more is better)")
-    papers_files = st.file_uploader(
-        "Supports **JSON / PDF / Markdown**, multiple files allowed",
-        type=["json", "pdf", "md"],
-        accept_multiple_files=True,
-        key="papers",
-    )
-    if papers_files:
-        st.success(f"✅ {len(papers_files)} file(s) selected")
-        with st.expander(f"View file list ({len(papers_files)})"):
-            for f in papers_files:
-                st.caption(f"· `{f.name}`")
-
-    # JSON template download
-    TEMPLATE = [
-        {
-            "id": "2023_q1",
-            "year": 2023,
-            "text": "Put the full question text here (required)",
-            "type": "computation",
-            "answer": "Reference answer key points (optional)",
-        },
-        {
-            "id": "2022_q1",
-            "year": 2022,
-            "text": "Put the full question text here",
-            "type": "derivation",
-        },
-    ]
-    st.download_button(
-        "📥 Download past-papers JSON template",
-        data=json.dumps(TEMPLATE, ensure_ascii=False, indent=2),
-        file_name="questions_template.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-# Optional materials
-with st.expander("➕ Tutorials & syllabus (optional — improves accuracy)"):
-    c1, c2 = st.columns(2)
-    with c1:
-        st.caption("**Tutorials / problem sets** (PDF or Markdown)")
-        tut_files = st.file_uploader(
-            "Tutorials",
-            type=["pdf", "md"],
-            accept_multiple_files=True,
-            key="tutorials",
-            label_visibility="collapsed",
-        )
-    with c2:
-        st.caption("**Syllabus** (.md or .txt)")
-        syl_file = st.file_uploader(
-            "Syllabus",
-            type=["md", "txt"],
-            key="syllabus",
-            label_visibility="collapsed",
-        )
-
-st.divider()
-
-# ── Run button & validation ──────────────────────────────────────────────────
-can_run = bool(api_key and slides_files and course_name)
-
-if not can_run:
-    missing = [label for label, ok in [
-        ("API Key (sidebar)", api_key),
-        ("Course name (sidebar)", course_name),
-        ("Course materials",     slides_files),
-    ] if not ok]
-    st.warning("⚠️ Still need: " + ", ".join(missing))
-
-# Main-area button (page center)
-run_btn = st.button(
-    "🚀  Run Analysis",
-    type="primary",
-    disabled=not can_run,
-    use_container_width=True,
-    key="run_main",
-)
-
-# Either button can trigger the run
-run_btn = run_btn or (run_sidebar_btn and can_run)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Run the pipeline
-# ═══════════════════════════════════════════════════════════════════════════════
-
-if run_btn:
-    # Clear previous results
-    for key in ("report", "md", "pdf", "run_course"):
-        st.session_state.pop(key, None)
-
-    from exam_predictor.pipeline import ExamPredictor
-
-    cfg = build_config(
-        api_key=api_key,
-        base_url=base_url,
-        model=llm_model,
-        course_context=course_ctx,
-        top_k=top_k,
-        n_candidates=n_candidates,
-        keep_top=keep_top_n,
-        enable_llm_scoring=enable_llm_scoring,
-        filter_noise=filter_noise,
-        report_language=report_language,
-    )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        course_dir = Path(tmp) / "course"
-
-        # Write uploaded files
-        save_uploads(slides_files, course_dir / "slides")
-        if papers_files:
-            save_uploads(papers_files, course_dir / "past_papers")
-        if tut_files:
-            save_uploads(tut_files, course_dir / "tutorials")
-        if syl_file:
-            (course_dir / "syllabus.md").write_bytes(syl_file.getvalue())
-
-        # Run the pipeline with a live status panel
-        with st.status("🔄  Running the prediction engine…", expanded=True) as status:
-            try:
-                st.write("**Step 1 / 2** ⚙️  Loading the embedding model…")
-                st.caption("First run downloads the BGE model (~1.3 GB); cached afterwards.")
-                predictor = ExamPredictor(cfg)
-
-                st.write("**Step 2 / 2** 🚀  Running the prediction stages (~1–3 min)…")
-                st.caption(
-                    "Stage 1 parse → Stage 2 align → Stage 2.5 LLM scoring → "
-                    "Stage 3 fuse → Stage 4 generate"
-                )
-                report = predictor.predict(
-                    course_dir,
-                    course_name=course_name,
-                    course_context=course_ctx or None,
-                )
-                md = ExamPredictor._format_markdown_report(report)
-
-                # Build the PDF once and cache in session_state
-                pdf_bytes = None
-                try:
-                    from exam_predictor.exporter import report_to_pdf_bytes
-                    pdf_bytes = report_to_pdf_bytes(report)
-                except Exception as pdf_exc:  # noqa: BLE001
-                    st.warning(f"PDF generation failed (Markdown/JSON still available): {pdf_exc}")
-
-                # Stash for display
-                st.session_state["report"]     = report
-                st.session_state["md"]         = md
-                st.session_state["pdf"]        = pdf_bytes
-                st.session_state["run_course"] = course_name
-
-                status.update(label="✅  Done!", state="complete", expanded=False)
-
-            except Exception as exc:
-                status.update(label="❌  Run failed", state="error")
-                st.error(f"Error: {exc}")
-                with st.expander("🐛 Full traceback"):
-                    st.code(traceback.format_exc())
-                st.stop()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Show results
-# ═══════════════════════════════════════════════════════════════════════════════
-
-if "report" in st.session_state:
-    import pandas as pd
-    from exam_predictor.pipeline import ExamPredictor as EP
-
-    report = st.session_state["report"]
-    md     = st.session_state["md"]
-    name   = st.session_state.get("run_course", "course")
-
-    st.success(
-        f"🎉  Analyzed **{report.n_chunks}** chunks · "
-        f"referenced **{report.n_past_questions}** past papers · "
-        f"generated **{len(report.generated_questions)}** practice questions · "
-        f"overall confidence **{report.overall_confidence:.0%}**"
-    )
-
-    # Warnings
-    for w in report.warnings:
-        st.warning(w)
-
-    tab_rank, tab_qs, tab_dl = st.tabs([
-        "📊 Topic Ranking",
-        "📝 Practice Questions",
-        "📥 Download",
+    tabs = st.tabs([
+        "Focus map", "Chapter tree", "Practice", "Study guide",
+        "Web evidence", "Ask ExamSage", "Export",
     ])
 
-    # ── Tab 1: ranking table ─────────────────────────────────────────────────
-    with tab_rank:
-        st.markdown("#### Importance ranking (higher = more frequently examined)")
-
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    with tabs[0]:
         rows = []
-        for i, p in enumerate(report.predictions, 1):
-            f = p.features
+        for index, point in enumerate(report.predictions, 1):
             rows.append({
-                "Rank":       medals.get(i, str(i)),
-                "Knowledge Point": EP._clean_kp_title(p.title),
-                "Importance": f"{heat_bar(p.score)}  {p.score:.2f}",
-                "LLM score":  f"{f.llm_pedagogy_score:.2f}",
-                "Structural": f"{f.structural_signals:.2f}",
-                "Past hits":  f.evidence.get("total_questions_matched", 0),
-                "Data mode": (
-                    "📉 Few-shot" if f.evidence.get("weight_regime") == "sparse"
-                    else "📈 Normal"
-                ),
+                "Rank": index,
+                "Knowledge point": point.title,
+                "Likelihood": likelihood_band(point.score),
+                "Relative score": round(point.score * 100),
+                "Confidence": confidence_band(point.confidence),
+                "Similar past questions": point.features.evidence.get("total_questions_matched", 0),
+                "Why it matters": point.description or point.representative_text,
             })
-
-        df = pd.DataFrame(rows)
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Knowledge Point": st.column_config.TextColumn(width="large"),
-                "Importance":      st.column_config.TextColumn(width="medium"),
-            },
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.info(
+            "How to read this: a high score with limited confidence means ‘revise this early, but treat the ranking cautiously’."
         )
 
-        st.caption(
-            "💡 **Data mode**: with fewer than 10 past papers the system switches to "
-            "**Few-shot** mode — the LLM pedagogy score's weight rises to 45% to "
-            "compensate for sparse history."
-        )
-
-    # ── Tab 2: practice questions ────────────────────────────────────────────
-    with tab_qs:
-        if not report.generated_questions:
-            st.info(
-                "No practice questions were generated.\n\n"
-                "Possible causes: insufficient API balance · Top-K set too high · "
-                "course materials too short."
-            )
+    with tabs[1]:
+        if report.knowledge_tree:
+            render_tree(report.knowledge_tree)
         else:
-            kp_title_map = {
-                p.knowledge_point_id: EP._clean_kp_title(p.title)
-                for p in report.predictions
-            }
-            kp_rank_map = {
-                p.knowledge_point_id: i
-                for i, p in enumerate(report.predictions, 1)
-            }
+            st.info("No chapter tree is available for this saved report.")
 
-            # Group by knowledge point
-            by_kp: dict = {}
-            for q in report.generated_questions:
-                by_kp.setdefault(q.knowledge_point_id, []).append(q)
-
-            ordered_kps = sorted(by_kp, key=lambda k: kp_rank_map.get(k, 999))
-
-            for sec_i, kp_id in enumerate(ordered_kps, 1):
-                qs    = by_kp[kp_id]
-                title = kp_title_map.get(kp_id, kp_id)
-                rank  = kp_rank_map.get(kp_id, "?")
-
-                st.markdown(f"### {sec_i}. {title}")
-                st.caption(f"Importance rank #{rank} · {len(qs)} practice question(s)")
-
-                for q_i, q in enumerate(qs, 1):
-                    d      = q.estimated_difficulty
-                    stars  = diff_stars(d)
-                    label  = diff_label(d)
-                    qtype  = f"  ·  {q.question_type}" if q.question_type else ""
-                    header = f"Question {q_i}　{stars}　{label}{qtype}"
-
-                    # Expand the very first question by default
-                    with st.expander(header, expanded=(q_i == 1 and sec_i == 1)):
-                        st.markdown(q.text)
-                        if q.answer_sketch:
-                            st.info(f"💡 **Reference answer (key points)**\n\n{q.answer_sketch}")
-
-    # ── Tab 3: download ──────────────────────────────────────────────────────
-    with tab_dl:
-        pdf_bytes = st.session_state.get("pdf")
-
-        st.markdown("#### Choose a download format")
-        dl_col1, dl_col2, dl_col3 = st.columns(3)
-
-        with dl_col1:
-            if pdf_bytes:
-                st.download_button(
-                    "📕  Download PDF (recommended)",
-                    data=pdf_bytes,
-                    file_name=f"{name}_exam_prediction.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                    type="primary",
+    with tabs[2]:
+        by_kp: dict[str, list] = {}
+        for question in report.generated_questions:
+            by_kp.setdefault(question.knowledge_point_id, []).append(question)
+        for point in report.predictions:
+            questions = by_kp.get(point.knowledge_point_id, [])
+            if not questions:
+                continue
+            with st.expander(f"{point.title} · {len(questions)} questions"):
+                st.caption(
+                    f"Study priority: {likelihood_band(point.score)} · confidence: {confidence_band(point.confidence)}"
                 )
-            else:
-                st.button(
-                    "📕  PDF generation failed",
-                    disabled=True,
-                    use_container_width=True,
-                )
+                for index, question in enumerate(questions, 1):
+                    marks = f" · {question.suggested_marks} marks" if question.suggested_marks else ""
+                    st.markdown(f"#### Question {index}{marks}")
+                    st.write(question.text)
+                    if question.question_type:
+                        st.caption(
+                            f"{question.question_type} · difficulty {question.estimated_difficulty or 0.5:.0%} · {question.source_kind}"
+                        )
+                    with st.expander("Worked answer and marking scheme"):
+                        st.markdown(question.answer_sketch or "No worked answer was returned.")
+                        if question.marking_scheme:
+                            st.table([
+                                {
+                                    "Step / knowledge point": item.criterion,
+                                    "Marks": item.marks,
+                                    "How marks are earned": item.explanation or "",
+                                }
+                                for item in question.marking_scheme
+                            ])
+                        if question.source_reference:
+                            st.caption("Grounding/style reference: " + question.source_reference)
 
-        with dl_col2:
-            st.download_button(
-                "📝  Download Markdown",
-                data=md.encode("utf-8"),
-                file_name=f"{name}_exam_prediction.md",
-                mime="text/markdown",
-                use_container_width=True,
+    with tabs[3]:
+        if report.study_guide:
+            st.markdown(report.study_guide)
+        else:
+            st.info("No study guide is available for this saved report.")
+
+    with tabs[4]:
+        if not report.web_evidence:
+            st.success("Uploaded evidence was sufficient; no supplementary web research was needed.")
+        for evidence in report.web_evidence:
+            point = next(
+                (item for item in report.predictions if item.knowledge_point_id == evidence.knowledge_point_id),
+                None,
             )
+            with st.expander(point.title if point else evidence.query):
+                st.write(evidence.summary)
+                st.caption(evidence.limitations[0] if evidence.limitations else "Supporting evidence only.")
+                for citation in evidence.citations:
+                    st.markdown(f"- [{citation.title}]({citation.url})")
 
-        with dl_col3:
-            st.download_button(
-                "🗂️  Download JSON",
-                data=json.dumps(
-                    report.model_dump(), ensure_ascii=False, indent=2
-                ).encode("utf-8"),
-                file_name=f"{name}_predictions.json",
-                mime="application/json",
-                use_container_width=True,
-            )
+    with tabs[5]:
+        if not course_id:
+            st.info("Run or load a course to continue the conversation.")
+        else:
+            for message in COURSE_STORE.messages(course_id):
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+            question = st.chat_input("Ask for an explanation, a new example, or a web-backed answer…")
+            if question:
+                api_key = st.session_state.get("active_api_key", "")
+                provider_cfg = st.session_state.get("active_provider_config")
+                if not api_key or not provider_cfg:
+                    st.error("Enter your API key above to continue chatting. It is not stored in the course database.")
+                else:
+                    with st.chat_message("user"):
+                        st.write(question)
+                    try:
+                        cfg = dict(provider_cfg)
+                        cfg["api_key"] = api_key
+                        provider = create_provider(cfg)
+                        agent = ExamSageAgent(
+                            provider,
+                            st.session_state["active_config"],
+                            DATA_DIR,
+                        )
+                        with st.chat_message("assistant"):
+                            with st.spinner("Thinking…"):
+                                answer = agent.chat(course_id, question)
+                            st.markdown(answer)
+                    except Exception as exc:  # user-facing boundary; keys are never included
+                        message = redact_secrets(f"{type(exc).__name__}: {exc}")
+                        st.error(f"The provider could not answer: {message}")
 
-        st.caption(
-            "💡 **PDF** is best for printing and sharing; **Markdown** for further editing; "
-            "**JSON** holds all structured data for programmatic use."
+    with tabs[6]:
+        json_bytes = json.dumps(report.model_dump(), ensure_ascii=False, indent=2).encode("utf-8")
+        markdown_bytes = report_markdown(report).encode("utf-8")
+        st.download_button("Download JSON", json_bytes, "examsage-report.json", "application/json")
+        st.download_button("Download Markdown", markdown_bytes, "examsage-report.md", "text/markdown")
+        try:
+            pdf_bytes = report_to_pdf_bytes(report)
+            st.download_button("Download PDF", pdf_bytes, "examsage-report.pdf", "application/pdf")
+        except Exception as exc:
+            st.warning(f"PDF export is unavailable: {exc}")
+
+
+st.set_page_config(page_title="ExamSage", page_icon="🎓", layout="wide")
+st.title("🎓 ExamSage")
+st.subheader("Turn course materials into a structured, evidence-aware revision agent")
+st.caption("Local app · your API key · no ExamSage server · no telemetry")
+
+with st.sidebar:
+    st.header("Saved courses")
+    courses = COURSE_STORE.list_courses()
+    if courses:
+        selected = st.selectbox(
+            "Open a previous course",
+            options=[None] + [item["id"] for item in courses],
+            format_func=lambda value: "Choose…" if value is None else next(
+                item["name"] for item in courses if item["id"] == value
+            ),
         )
+        if selected and st.button("Open course", use_container_width=True):
+            saved = COURSE_STORE.get_course(selected)
+            st.session_state["course_id"] = selected
+            st.session_state["report"] = PredictionReport.model_validate(saved["report"])
+            st.rerun()
+    st.divider()
+    st.markdown("**Privacy controls**")
+    st.caption("Keys live in this browser session only. Reports and chat are stored locally on this computer.")
+    if st.session_state.get("course_id") and st.button("Delete this local course"):
+        course_id = st.session_state["course_id"]
+        path = COURSE_STORE.delete_course(course_id)
+        if path:
+            resolved_data = DATA_DIR.resolve()
+            resolved_path = path.resolve()
+            if resolved_path != resolved_data and resolved_data in resolved_path.parents:
+                shutil.rmtree(resolved_path, ignore_errors=True)
+        st.session_state.pop("course_id", None)
+        st.session_state.pop("report", None)
+        st.rerun()
 
-        st.divider()
-        st.caption("📄 Report preview")
-        st.markdown(md)
+st.markdown("### 1. Connect one AI provider")
+provider_label = st.radio(
+    "Provider",
+    ["OpenAI", "Google Gemini", "Custom OpenAI-compatible (experimental)"],
+    horizontal=True,
+)
+provider_name = {
+    "OpenAI": "openai",
+    "Google Gemini": "gemini",
+    "Custom OpenAI-compatible (experimental)": "custom",
+}[provider_label]
+api_key = st.text_input(
+    "API key",
+    type="password",
+    help="Used directly from this local app to the selected provider. ExamSage does not log or store it.",
+)
+st.session_state["active_api_key"] = api_key
+
+advanced_values = {}
+with st.expander("Advanced provider settings"):
+    if provider_name == "custom":
+        st.warning(
+            "Custom endpoints vary. Native file vision, cited web search and no-retention controls are not guaranteed; "
+            "the full agent workflow therefore requires OpenAI or Gemini."
+        )
+        advanced_values["base_url"] = st.text_input("Base URL", placeholder="https://provider.example/v1")
+    advanced_values["fast_model"] = st.text_input("Fast model override (optional)")
+    advanced_values["balanced_model"] = st.text_input("Balanced model override (optional)")
+    advanced_values["reasoning_model"] = st.text_input("Reasoning model override (optional)")
+    advanced_values["embedding_model"] = st.text_input("Embedding model override (optional)")
+    advanced_values["report_language"] = st.selectbox(
+        "Report language", ["auto", "en", "zh"], format_func=lambda x: {
+            "auto": "Match source material", "en": "English", "zh": "Simplified Chinese"
+        }[x],
+    )
+    advanced_values["max_queries"] = st.slider("Maximum web research queries", 0, 12, 6)
+
+# Keep enough non-secret connection metadata to chat with newly opened saved courses.
+st.session_state["active_provider_config"] = {
+    "provider": provider_name,
+    "base_url": advanced_values.get("base_url", ""),
+    "fast_model": advanced_values.get("fast_model", ""),
+    "balanced_model": advanced_values.get("balanced_model", ""),
+    "reasoning_model": advanced_values.get("reasoning_model", ""),
+    "embedding_model": advanced_values.get("embedding_model", ""),
+    "approved_max_usd": 25.0,
+}
+st.session_state["active_config"] = default_config(
+    provider_name, api_key, 25.0, **advanced_values
+)
+
+st.markdown("### 2. Upload a course and describe what you need")
+uploads = st.file_uploader(
+    "Course files",
+    type=[
+        "pdf", "ppt", "pptx", "doc", "docx", "xls", "xlsx", "csv", "tsv",
+        "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff",
+        "md", "markdown", "txt", "html", "htm", "json", "yaml", "yml", "zip",
+    ],
+    accept_multiple_files=True,
+    help="Up to 1 GB per course. Audio and video are intentionally not supported yet.",
+)
+source_urls_text = st.text_area(
+    "Public HTTPS course webpages (optional, one per line)",
+    placeholder="https://university.example.edu/course/syllabus",
+    height=80,
+)
+source_urls = [line.strip() for line in source_urls_text.splitlines() if line.strip()]
+request = st.text_area(
+    "Your goal",
+    placeholder=(
+        "Example: I have a final in three weeks. Build the chapter tree, prioritize likely calculation and proof "
+        "questions, and give me a detailed practice plan."
+    ),
+    height=110,
+)
+course_name = st.text_input("Course name (optional — ExamSage can infer it)")
+
+if st.button(
+    "Estimate cost",
+    type="primary",
+    disabled=(not uploads and not source_urls) or not request.strip(),
+):
+    try:
+        source_urls = [validate_public_https_url(url) for url in source_urls]
+        paths = save_uploads(uploads)
+        estimate = estimate_run_cost(
+            provider_name,
+            paths,
+            knowledge_points=12,
+            practice_questions_per_point=12,
+            web_queries=int(advanced_values["max_queries"]) + len(source_urls),
+        )
+        st.session_state["upload_paths"] = [str(path) for path in paths]
+        st.session_state["estimate"] = estimate
+        st.session_state["estimate_request"] = request
+        st.session_state["estimate_urls"] = source_urls
+        st.session_state["estimate_provider"] = provider_name
+        st.session_state["estimate_uploads"] = [
+            (upload.name, upload.size) for upload in uploads
+        ]
+    except Exception as exc:
+        st.error(f"Could not prepare the estimate: {exc}")
+
+estimate = st.session_state.get("estimate")
+if estimate:
+    st.markdown("### 3. Review the estimate and approve a limit")
+    st.metric("Estimated provider cost", f"${estimate.estimated_min:.2f} – ${estimate.estimated_max:.2f} USD")
+    st.table([
+        {
+            "Planned work": item.label,
+            "Estimated range": f"${item.estimated_min:.2f} – ${item.estimated_max:.2f}",
+            "Assumptions": "; ".join(item.assumptions),
+        }
+        for item in estimate.breakdown
+    ])
+    for assumption in estimate.assumptions:
+        st.caption("• " + assumption)
+    approved_max = st.number_input(
+        "Hard run limit (USD)",
+        min_value=0.01,
+        value=max(0.01, float(estimate.estimated_max)),
+        step=0.25,
+    )
+    confirmed = st.checkbox(
+        "I understand this is an estimate and authorize ExamSage to start, up to the limit above."
+    )
+
+    if st.button("Build my ExamSage agent", type="primary", disabled=not confirmed):
+        if not api_key.strip():
+            st.error("Enter the selected provider's API key first.")
+        elif provider_name == "custom":
+            st.error("The full multimodal + web-search build currently requires OpenAI or Google Gemini.")
+        elif provider_name != st.session_state.get("estimate_provider"):
+            st.error("Your provider changed after the estimate. Estimate again before starting.")
+        elif request != st.session_state.get("estimate_request"):
+            st.error("Your request changed after the estimate. Estimate again before starting.")
+        elif source_urls != st.session_state.get("estimate_urls", []):
+            st.error("Your webpage list changed after the estimate. Estimate again before starting.")
+        elif [(upload.name, upload.size) for upload in uploads] != st.session_state.get("estimate_uploads", []):
+            st.error("Your uploaded files changed after the estimate. Estimate again before starting.")
+        else:
+            try:
+                config = default_config(
+                    provider_name,
+                    api_key,
+                    float(approved_max),
+                    **advanced_values,
+                )
+                provider = create_provider(config["llm"])
+                agent = ExamSageAgent(provider, config, DATA_DIR)
+                st.session_state["active_config"] = config
+                st.session_state["active_provider_config"] = {
+                    key: value for key, value in config["llm"].items() if key != "api_key"
+                }
+                with st.status("Building your course agent…", expanded=True) as status:
+                    st.write("Validating files and sending them directly to your selected provider…")
+                    st.write("Reading text, scans, handwriting, formulas, tables and embedded visuals…")
+                    course_id, report, normalization = agent.build_course(
+                        st.session_state["upload_paths"],
+                        request,
+                        course_name=course_name.strip() or None,
+                        source_urls=source_urls,
+                    )
+                    st.write("Building the chapter tree, focus ranking, practice set and study guide…")
+                    if report.web_evidence:
+                        st.write("Course evidence was sparse, so cited web research was added…")
+                    status.update(label="Your ExamSage agent is ready", state="complete")
+                st.session_state["course_id"] = course_id
+                st.session_state["report"] = report
+                intake = INTAKE_DIR / st.session_state.get("intake_id", "")
+                if intake.exists() and INTAKE_DIR.resolve() in intake.resolve().parents:
+                    shutil.rmtree(intake, ignore_errors=True)
+            except (BudgetExceeded, UploadSecurityError, ProviderError, ValueError) as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                message = redact_secrets(f"{type(exc).__name__}: {exc}")
+                st.error(f"The build stopped safely: {message}")
+
+if st.session_state.get("report"):
+    render_report(st.session_state["report"], st.session_state.get("course_id"))
+
+st.divider()
+st.caption(
+    "ExamSage predicts study priorities, not actual exam questions. Always follow your instructor, syllabus and academic-integrity rules."
+)

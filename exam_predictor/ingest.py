@@ -10,10 +10,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Iterable
 
-import fitz                              # PyMuPDF
 from pptx import Presentation            # python-pptx
+from pypdf import PdfReader
 
 
 # ---------------------------------------------------------------------------
@@ -22,19 +21,18 @@ from pptx import Presentation            # python-pptx
 def ingest_pdf(path: str | Path) -> list[tuple[str, dict]]:
     """Extract text from a PDF, one entry per page."""
     path = Path(path)
-    doc = fitz.open(path)
+    doc = PdfReader(str(path))
     out: list[tuple[str, dict]] = []
-    for page_idx, page in enumerate(doc):
-        text = page.get_text("text").strip()
+    for page_idx, page in enumerate(doc.pages):
+        text = (page.extract_text() or "").strip()
         if not text:
             continue
         out.append((text, {
             "source": path.name,
             "type": "pdf",
             "page": page_idx + 1,
-            "total_pages": len(doc),
+            "total_pages": len(doc.pages),
         }))
-    doc.close()
     return out
 
 

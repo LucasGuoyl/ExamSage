@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "examsage"
+version = "0.3.0"
+description = "A privacy-conscious, web-grounded university exam revision agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = {text = "MIT"}
+authors = [{name = "ExamSage contributors"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "openai>=2.0.0,<3",
+  "google-genai>=1.0.0,<2",
+  "pydantic>=2.8,<3",
+  "pyyaml>=6.0,<7",
+  "numpy>=1.26,<3",
+  "tenacity>=8.2,<10",
+  "rich>=13,<15",
+  "pypdf>=6.0,<7",
+  "python-pptx>=1.0,<2",
+  "streamlit>=1.40,<2",
+  "pandas>=2.2,<3",
+  "reportlab>=4.2,<5",
+]
+
+[tool.setuptools.packages.find]
+include = ["exam_predictor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110

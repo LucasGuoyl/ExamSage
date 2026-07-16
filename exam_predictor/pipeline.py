@@ -17,12 +17,10 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from openai import OpenAI
 from rich.console import Console
 from rich.progress import track
 
 from .aligner import (
-    AlignmentResult,
     aggregate_chunks_to_knowledge_points,
     align_questions_to_chunks,
 )
@@ -30,7 +28,7 @@ from .chunker import chunk_units, questions_from_records
 from .embedder import build_embedder
 from .fusion import confidence_from_data, fuse
 from .generator import generate_for_knowledge_point, sample_style_examples, summarise_knowledge_points
-from .ingest import discover_past_papers, ingest_directory, ingest_markdown
+from .ingest import discover_past_papers, ingest_directory
 from .scorer import (
     extract_structural_signals,
     is_low_value_chunk,
@@ -40,7 +38,6 @@ from .reranker import rerank
 from .schema import (
     Chunk,
     ChunkFeatures,
-    ExamQuestion,
     GeneratedQuestion,
     KnowledgePointScore,
     PredictionReport,
@@ -54,17 +51,29 @@ console = Console()
 class ExamPredictor:
     """Top-level orchestrator. Stateless across runs."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, provider=None):
         self.config = config
-        self.embedder = build_embedder(config)
         llm_cfg = config["llm"]
-        self.llm = OpenAI(
-            api_key=llm_cfg["api_key"],
-            base_url=llm_cfg.get("base_url"),
-            timeout=llm_cfg.get("timeout", 60),
-            max_retries=llm_cfg.get("max_retries", 3),
+        if provider is None:
+            from .providers import create_provider
+            provider = create_provider(llm_cfg)
+        self.provider = provider
+        self.embedder = build_embedder(config, provider=provider)
+        self.llm = provider.chat_client
+        self.llm_model = provider.models.balanced
+        self.fast_model = provider.models.fast
+        self.reasoning_model = provider.models.reasoning
+
+    @staticmethod
+    def _practice_target(kp: KnowledgePointScore) -> int:
+        """Allocate 6-24 exercises from importance and similar-question density."""
+        hits = int(kp.features.evidence.get("total_questions_matched", 0) or 0)
+        importance_bonus = (
+            10 if kp.score >= 0.80 else
+            7 if kp.score >= 0.60 else
+            4 if kp.score >= 0.40 else 0
         )
-        self.llm_model = llm_cfg["model"]
+        return min(24, max(6, 6 + importance_bonus + min(8, hits * 2)))
 
     # ---------- public API ----------
     @classmethod
@@ -148,7 +157,7 @@ class ExamPredictor:
             llm_scores = score_chunks_pedagogically(
                 chunks,
                 client=self.llm,
-                model=self.llm_model,
+                model=self.fast_model,
                 course_context=ctx,
                 batch_size=score_batch,
                 max_chunks=max_to_score,
@@ -256,9 +265,14 @@ class ExamPredictor:
         console.print("[bold]3.5. Summarising knowledge points with LLM...[/bold]")
         gen_cfg = self.config.get("generation", {})
         report_lang = gen_cfg.get("report_language", "auto")
+        summary_kps = (
+            scored_kps
+            if gen_cfg.get("all_knowledge_points", True)
+            else scored_kps[: gen_cfg.get("top_k_knowledge_points", 10)]
+        )
         summarise_knowledge_points(
-            self.llm, self.llm_model,
-            kps=scored_kps[: gen_cfg.get("top_k_knowledge_points", 10)],
+            self.llm, self.reasoning_model,
+            kps=summary_kps,
             chunk_by_id=chunk_by_id,
             course_context=course_context or ctx,
             batch_size=gen_cfg.get("summarise_batch_size", 4),
@@ -267,10 +281,12 @@ class ExamPredictor:
 
         # ---- Stage 4: Generate (Route E) ----
         console.print("[bold]4. Generating candidate questions...[/bold]")
-        top_kps = scored_kps[: gen_cfg.get("top_k_knowledge_points", 10)]
-        n_candidates = gen_cfg.get("candidates_per_point", 5)
+        if gen_cfg.get("all_knowledge_points", True):
+            top_kps = scored_kps
+        else:
+            top_kps = scored_kps[: gen_cfg.get("top_k_knowledge_points", 10)]
         n_few_shot = gen_cfg.get("few_shot_examples", 3)
-        keep_top = gen_cfg.get("rerank_keep_top_n", 2)
+        generation_batch_size = max(1, min(6, gen_cfg.get("question_batch_size", 3)))
 
         all_questions: list[GeneratedQuestion] = []
         for kp in track(top_kps, description="generating"):
@@ -280,26 +296,46 @@ class ExamPredictor:
             for c in kp_chunks:
                 c.metadata["kp_id"] = kp.knowledge_point_id
 
-            candidates = generate_for_knowledge_point(
-                self.llm, self.llm_model,
-                kp_title=kp.title,
-                kp_chunks=kp_chunks,
-                style_examples=style_examples,
-                n_candidates=n_candidates,
-                temperature=self.config["llm"].get("temperature", 0.5),
-                max_tokens=self.config["llm"].get("max_tokens", 2048),
-                report_language=report_lang,
-            )
+            target = self._practice_target(kp)
+            candidates: list[GeneratedQuestion] = []
+            attempts = 0
+            while len(candidates) < target and attempts < target * 2:
+                requested = min(generation_batch_size, target - len(candidates))
+                batch = generate_for_knowledge_point(
+                    self.llm, self.reasoning_model,
+                    kp_title=kp.title,
+                    kp_chunks=kp_chunks,
+                    style_examples=style_examples,
+                    n_candidates=requested,
+                    temperature=self.config["llm"].get("temperature", 0.5),
+                    max_tokens=max(4096, self.config["llm"].get("max_tokens", 4096)),
+                    report_language=report_lang,
+                    avoid_questions=[item.text for item in candidates],
+                )
+                attempts += requested
+                seen = {re.sub(r"\W+", "", item.text).lower() for item in candidates}
+                for item in batch:
+                    fingerprint = re.sub(r"\W+", "", item.text).lower()
+                    if fingerprint and fingerprint not in seen:
+                        candidates.append(item)
+                        seen.add(fingerprint)
             if not candidates:
+                warnings.append(f"No complete worked questions could be generated for '{kp.title}'.")
                 continue
             top = rerank(
-                self.llm, self.llm_model,
+                self.llm, self.fast_model,
                 candidates=candidates,
                 past_questions=past_questions,
                 embedder=self.embedder,
-                keep_top_n=keep_top,
+                keep_top_n=target,
+                use_llm_judge=len(candidates) <= 6,
             )
             all_questions.extend(top)
+            if len(top) < target:
+                warnings.append(
+                    f"'{kp.title}' received {len(top)} of {target} planned practice questions "
+                    "because incomplete or duplicate model output was rejected."
+                )
 
         # ---- Build report ----
         overall_conf = confidence_from_data(len(past_questions), len(chunks))
@@ -307,7 +343,7 @@ class ExamPredictor:
             course_name=course_name,
             n_chunks=len(chunks),
             n_past_questions=len(past_questions),
-            predictions=scored_kps[:30],
+            predictions=scored_kps,
             generated_questions=all_questions,
             overall_confidence=overall_conf,
             warnings=warnings,
@@ -451,7 +487,6 @@ class ExamPredictor:
         for q in r.generated_questions:
             by_kp.setdefault(q.knowledge_point_id, []).append(q)
 
-        kp_rank_map = {p.knowledge_point_id: i for i, p in enumerate(r.predictions, 1)}
         MEDAL_HDR   = {1: "🥇 Top Topic", 2: "🥈 2nd Topic", 3: "🥉 3rd Topic"}
 
         for i, p in enumerate(r.predictions, 1):
@@ -502,12 +537,27 @@ class ExamPredictor:
                         q.text,
                         "",
                     ]
+                    if q.suggested_marks:
+                        lines += [f"**Suggested marks:** {q.suggested_marks}", ""]
                     if q.answer_sketch:
                         lines += ["**💡 Reference Answer (key points)**", ""]
                         # blockquote — renders in all Markdown viewers and PDF
                         for al in q.answer_sketch.strip().splitlines():
                             lines.append(f"> {al}" if al.strip() else ">")
                         lines += [""]
+                    if q.marking_scheme:
+                        lines += [
+                            "**Suggested marking scheme**", "",
+                            "| Step / knowledge point | Marks | Explanation |",
+                            "|---|:---:|---|",
+                        ]
+                        for criterion in q.marking_scheme:
+                            explanation = (criterion.explanation or "").replace("|", "\\|")
+                            name = criterion.criterion.replace("|", "\\|")
+                            lines.append(f"| {name} | {criterion.marks} | {explanation} |")
+                        lines += [""]
+                    if q.source_reference:
+                        lines += [f"*Grounding/style reference: {q.source_reference}*", ""]
             else:
                 lines += ["*(No practice questions generated for this topic.)*", ""]
 

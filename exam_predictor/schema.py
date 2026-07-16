@@ -10,6 +10,7 @@ Plus auxiliary models for features, generated questions, and final reports.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -84,10 +85,77 @@ class GeneratedQuestion(BaseModel):
     answer_sketch: Optional[str] = None
     question_type: Optional[str] = None
     estimated_difficulty: Optional[float] = None
+    suggested_marks: Optional[int] = None
+    marking_scheme: list["MarkingCriterion"] = Field(default_factory=list)
+    source_kind: str = "generated"          # uploaded | external | generated_variant
+    source_reference: Optional[str] = None
     # rerank scores:
     style_match_score: Optional[float] = None
     novelty_score: Optional[float] = None
     overall_score: Optional[float] = None
+
+
+class MarkingCriterion(BaseModel):
+    """One transparent step in a suggested marking rubric."""
+
+    criterion: str
+    marks: int = Field(ge=0)
+    explanation: Optional[str] = None
+
+
+class SourceCitation(BaseModel):
+    """A public source consulted by the research tool."""
+
+    title: str
+    url: str
+    domain: Optional[str] = None
+    snippet: Optional[str] = None
+    source_type: str = "web"
+    trust_level: str = "supporting"
+    accessed_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+class WebEvidence(BaseModel):
+    """External evidence that clarifies a topic without masquerading as course evidence."""
+
+    knowledge_point_id: Optional[str] = None
+    query: str
+    summary: str
+    citations: list[SourceCitation] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
+class KnowledgeTreeNode(BaseModel):
+    """A recursive, chapter-first view of a course."""
+
+    id: str
+    title: str
+    summary: Optional[str] = None
+    knowledge_point_ids: list[str] = Field(default_factory=list)
+    prerequisites: list[str] = Field(default_factory=list)
+    children: list["KnowledgeTreeNode"] = Field(default_factory=list)
+
+
+class CostBreakdown(BaseModel):
+    label: str
+    estimated_min: float = Field(ge=0)
+    estimated_max: float = Field(ge=0)
+    unit: str = "USD"
+    assumptions: list[str] = Field(default_factory=list)
+
+
+class CostEstimate(BaseModel):
+    """A conservative pre-run estimate; never presented as an exact invoice."""
+
+    provider: str
+    estimated_min: float = Field(ge=0)
+    estimated_max: float = Field(ge=0)
+    currency: str = "USD"
+    breakdown: list[CostBreakdown] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    pricing_updated_at: Optional[str] = None
 
 
 class PredictionReport(BaseModel):
@@ -100,3 +168,11 @@ class PredictionReport(BaseModel):
     generated_questions: list[GeneratedQuestion]
     overall_confidence: float                # narrows with more data
     warnings: list[str] = Field(default_factory=list)
+    knowledge_tree: list[KnowledgeTreeNode] = Field(default_factory=list)
+    web_evidence: list[WebEvidence] = Field(default_factory=list)
+    study_guide: Optional[str] = None
+    provider: Optional[str] = None
+    source_language: Optional[str] = None
+    generated_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )

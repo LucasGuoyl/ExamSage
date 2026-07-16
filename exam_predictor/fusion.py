@@ -20,8 +20,7 @@ import numpy as np
 
 from .aligner import AlignmentResult
 from .embedder import Embedder
-from .schema import Chunk, ChunkFeatures, ExamQuestion
-from .vector_store import FAISSStore
+from .schema import Chunk, ChunkFeatures
 
 
 # ---------------------------------------------------------------------------
