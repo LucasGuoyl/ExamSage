@@ -23,6 +23,7 @@ class KernelState(TypedDict, total=False):
     plan_reason: str
     tool_result: dict[str, Any]
     assistant_message: str
+    pause_pending: bool
 
 
 EventEmitter = Callable[[str, str, str, str, dict[str, Any] | None], None]
@@ -38,17 +39,24 @@ class KernelDependencies:
 
 
 def build_kernel_graph(deps: KernelDependencies, checkpointer):
-    def stop_gate(state: KernelState) -> dict[str, Any]:
+    def detect_stop(state: KernelState) -> dict[str, Any]:
         run_id = state["run_id"]
-        if not deps.controls.is_stop_requested(run_id):
+        if state.get("pause_pending") or not deps.controls.is_stop_requested(run_id):
             return {}
         deps.emit(run_id, "paused", "paused", "The run is paused at a safe boundary.")
+        return {"pause_pending": True}
+
+    def pause(state: KernelState) -> dict[str, Any]:
+        run_id = state["run_id"]
         resume = interrupt({"kind": "stopped", "run_id": run_id})
         if resume != {"action": "resume"}:
             raise ValueError("A paused run must be resumed with {'action': 'resume'}.")
         deps.controls.clear_stop(run_id)
         deps.emit(run_id, "resumed", "planning", "The run resumed from its checkpoint.")
-        return {}
+        return {"pause_pending": False}
+
+    def route_after_stop(state: KernelState) -> str:
+        return "pause" if state.get("pause_pending") else "continue"
 
     def plan(state: KernelState) -> dict[str, Any]:
         run_id = state["run_id"]
@@ -84,17 +92,35 @@ def build_kernel_graph(deps: KernelDependencies, checkpointer):
         }
 
     builder = StateGraph(KernelState)
-    builder.add_node("stop_before_plan", stop_gate)
+    builder.add_node("stop_before_plan", detect_stop)
+    builder.add_node("pause_before_plan", pause)
     builder.add_node("plan", plan)
-    builder.add_node("stop_before_tool", stop_gate)
+    builder.add_node("stop_before_tool", detect_stop)
+    builder.add_node("pause_before_tool", pause)
     builder.add_node("run_tool", run_tool)
-    builder.add_node("stop_before_compose", stop_gate)
+    builder.add_node("stop_before_compose", detect_stop)
+    builder.add_node("pause_before_compose", pause)
     builder.add_node("compose", compose)
     builder.add_edge(START, "stop_before_plan")
-    builder.add_edge("stop_before_plan", "plan")
+    builder.add_conditional_edges(
+        "stop_before_plan",
+        route_after_stop,
+        {"pause": "pause_before_plan", "continue": "plan"},
+    )
+    builder.add_edge("pause_before_plan", "plan")
     builder.add_edge("plan", "stop_before_tool")
-    builder.add_edge("stop_before_tool", "run_tool")
+    builder.add_conditional_edges(
+        "stop_before_tool",
+        route_after_stop,
+        {"pause": "pause_before_tool", "continue": "run_tool"},
+    )
+    builder.add_edge("pause_before_tool", "run_tool")
     builder.add_edge("run_tool", "stop_before_compose")
-    builder.add_edge("stop_before_compose", "compose")
+    builder.add_conditional_edges(
+        "stop_before_compose",
+        route_after_stop,
+        {"pause": "pause_before_compose", "continue": "compose"},
+    )
+    builder.add_edge("pause_before_compose", "compose")
     builder.add_edge("compose", END)
     return builder.compile(checkpointer=checkpointer)

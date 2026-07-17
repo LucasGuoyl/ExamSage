@@ -1,6 +1,11 @@
 import json
 from pathlib import Path
+from shutil import copyfile
+from threading import Event
 from types import SimpleNamespace
+from typing import Any
+
+import pytest
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
@@ -10,6 +15,9 @@ from exam_predictor.runtime.control import RunControlRegistry
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
 
 
+TEST_API_KEY = "sk-task-3-checkpoint-secret"
+
+
 class FakeProvider:
     name = "fake"
     capabilities = SimpleNamespace(chat=True)
@@ -17,9 +25,12 @@ class FakeProvider:
 
     def __init__(self):
         self.calls = 0
+        self.api_key = TEST_API_KEY
+        self.requests: list[dict[str, Any]] = []
 
     def create_chat_completion(self, **kwargs):
         self.calls += 1
+        self.requests.append(kwargs)
         content = (
             json.dumps({"tool": "tutor_reply", "arguments": {}, "reason": "Tutor request"})
             if self.calls % 2 == 1
@@ -29,56 +40,87 @@ class FakeProvider:
 
 
 class Sessions:
-    def __init__(self):
-        self.provider = FakeProvider()
+    def __init__(self, provider: FakeProvider | None = None):
+        self.provider = provider or FakeProvider()
 
     def get_provider(self, profile_id: str):
         assert profile_id == "primary"
         return self.provider
 
 
-def dependencies(events: list[dict], controls: RunControlRegistry):
-    return KernelDependencies(
-        provider_sessions=Sessions(),
-        planner=KernelPlanner(),
-        tools=KernelToolRegistry(),
-        controls=controls,
-        emit=lambda run_id, event_type, stage, message, payload=None: events.append({
+def dependencies(
+    events: list[dict],
+    controls: RunControlRegistry,
+    *,
+    provider: FakeProvider | None = None,
+    on_emit=None,
+):
+    def emit(run_id, event_type, stage, message, payload=None):
+        event = {
             "run_id": run_id,
             "event_type": event_type,
             "stage": stage,
             "message": message,
             "payload": payload or {},
-        }),
+        }
+        events.append(event)
+        if on_emit is not None:
+            on_emit(event)
+
+    return KernelDependencies(
+        provider_sessions=Sessions(provider),
+        planner=KernelPlanner(),
+        tools=KernelToolRegistry(),
+        controls=controls,
+        emit=emit,
     )
 
 
 def test_graph_runs_tool_and_persists_follow_up_state(tmp_path: Path):
     events: list[dict] = []
     controls = RunControlRegistry()
+    provider = FakeProvider()
     with SqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite3")) as saver:
-        graph = build_kernel_graph(dependencies(events, controls), saver)
+        graph = build_kernel_graph(dependencies(events, controls, provider=provider), saver)
         config = {"configurable": {"thread_id": "calculus"}}
-        result = graph.invoke({
+        first = graph.invoke({
             "run_id": "run-1",
             "provider_profile_id": "primary",
             "user_message": "Explain limits.",
             "messages": [{"role": "user", "content": "Explain limits."}],
         }, config)
-        assert "approached" in result["assistant_message"]
+        result = graph.invoke({
+            "run_id": "run-1-follow-up",
+            "provider_profile_id": "primary",
+            "user_message": "Can you say that another way?",
+            "messages": [{"role": "user", "content": "Can you say that another way?"}],
+        }, config)
+        assert "approached" in first["assistant_message"]
         assert result["selected_tool"] == "tutor_reply"
-        assert graph.get_state(config).values["messages"][-1]["role"] == "assistant"
+        assert [message["role"] for message in result["messages"]] == [
+            "user", "assistant", "user", "assistant"
+        ]
+        assert result["messages"][1] == {
+            "role": "assistant",
+            "content": first["assistant_message"],
+        }
+        planner_payload = json.loads(provider.requests[2]["messages"][1]["content"])
+        assert planner_payload["history"] == result["messages"][:-1]
+        assert provider.requests[3]["messages"][1:] == result["messages"][:-1]
+        assert provider.calls == 4
     assert [event["event_type"] for event in events] == [
-        "progress", "tool_started", "tool_completed", "message"
+        "progress", "tool_started", "tool_completed", "message",
+        "progress", "tool_started", "tool_completed", "message",
     ]
 
 
-def test_stop_interrupt_requires_explicit_resume(tmp_path: Path):
+def test_pause_and_resume_events_are_emitted_once(tmp_path: Path):
     events: list[dict] = []
     controls = RunControlRegistry()
     controls.request_stop("run-2")
+    provider = FakeProvider()
     with SqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite3")) as saver:
-        graph = build_kernel_graph(dependencies(events, controls), saver)
+        graph = build_kernel_graph(dependencies(events, controls, provider=provider), saver)
         config = {"configurable": {"thread_id": "physics"}}
         paused = graph.invoke({
             "run_id": "run-2",
@@ -87,6 +129,143 @@ def test_stop_interrupt_requires_explicit_resume(tmp_path: Path):
             "messages": [{"role": "user", "content": "Explain momentum."}],
         }, config)
         assert paused["__interrupt__"]
+        assert provider.calls == 0
+        assert [event["event_type"] for event in events] == ["paused"]
         resumed = graph.invoke(Command(resume={"action": "resume"}), config)
         assert resumed["assistant_message"]
         assert not controls.is_stop_requested("run-2")
+        assert provider.calls == 2
+    event_types = [event["event_type"] for event in events]
+    assert event_types == [
+        "paused", "resumed", "progress", "tool_started", "tool_completed", "message"
+    ]
+    assert event_types.count("paused") == 1
+    assert event_types.count("resumed") == 1
+
+
+def test_interrupted_checkpoint_validates_resume_after_restart(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    valid_resume_checkpoint_path = tmp_path / "valid-resume-checkpoints.sqlite3"
+    initial_events: list[dict] = []
+    initial_controls = RunControlRegistry()
+    initial_provider = FakeProvider()
+
+    def stop_after_tool(event: dict) -> None:
+        if event["event_type"] == "tool_completed":
+            initial_controls.request_stop("run-3")
+
+    config = {"configurable": {"thread_id": "mechanics"}}
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        graph = build_kernel_graph(
+            dependencies(
+                initial_events,
+                initial_controls,
+                provider=initial_provider,
+                on_emit=stop_after_tool,
+            ),
+            saver,
+        )
+        paused = graph.invoke({
+            "run_id": "run-3",
+            "provider_profile_id": "primary",
+            "user_message": "Explain momentum.",
+            "messages": [{"role": "user", "content": "Explain momentum."}],
+        }, config)
+        assert paused["__interrupt__"]
+        checkpoint = saver.get_tuple(config)
+        assert checkpoint is not None
+        assert checkpoint.checkpoint["channel_values"]["pause_pending"] is True
+
+    assert initial_provider.calls == 2
+    assert [event["event_type"] for event in initial_events] == [
+        "progress", "tool_started", "tool_completed", "paused"
+    ]
+    copyfile(checkpoint_path, valid_resume_checkpoint_path)
+
+    invalid_events: list[dict] = []
+    invalid_controls = RunControlRegistry()
+    invalid_provider = FakeProvider()
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        graph = build_kernel_graph(
+            dependencies(
+                invalid_events,
+                invalid_controls,
+                provider=invalid_provider,
+            ),
+            saver,
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"A paused run must be resumed with \{'action': 'resume'\}\.",
+        ):
+            graph.invoke(Command(resume={"action": "wrong"}), config)
+        assert invalid_provider.calls == 0
+        assert invalid_events == []
+
+    resumed_events: list[dict] = []
+    resumed_controls = RunControlRegistry()
+    resumed_provider = FakeProvider()
+    with SqliteSaver.from_conn_string(str(valid_resume_checkpoint_path)) as saver:
+        graph = build_kernel_graph(
+            dependencies(
+                resumed_events,
+                resumed_controls,
+                provider=resumed_provider,
+            ),
+            saver,
+        )
+        resumed = graph.invoke(Command(resume={"action": "resume"}), config)
+        assert resumed["assistant_message"]
+        assert resumed["pause_pending"] is False
+        assert resumed_provider.calls == 0
+        assert not resumed_controls.is_stop_requested("run-3")
+
+    event_types = [
+        event["event_type"] for event in [*initial_events, *resumed_events]
+    ]
+    assert event_types == [
+        "progress", "tool_started", "tool_completed", "paused", "resumed", "message"
+    ]
+    assert event_types.count("paused") == 1
+    assert event_types.count("resumed") == 1
+
+
+def test_checkpoint_state_is_json_safe_and_contains_no_runtime_secrets(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    events: list[dict] = []
+    controls = RunControlRegistry()
+    provider = FakeProvider()
+    config = {"configurable": {"thread_id": "safe-state"}}
+
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        graph = build_kernel_graph(
+            dependencies(events, controls, provider=provider),
+            saver,
+        )
+        graph.invoke({
+            "run_id": "run-4",
+            "provider_profile_id": "primary",
+            "user_message": "Explain limits.",
+            "messages": [{"role": "user", "content": "Explain limits."}],
+        }, config)
+        checkpoint = saver.get_tuple(config)
+        assert checkpoint is not None
+        values = checkpoint.checkpoint["channel_values"]
+
+    serialized = json.dumps(values, ensure_ascii=False, sort_keys=True)
+    assert TEST_API_KEY not in serialized
+    assert TEST_API_KEY.encode() not in checkpoint_path.read_bytes()
+    assert not any(
+        isinstance(value, (FakeProvider, RunControlRegistry, Event)) or callable(value)
+        for value in _walk(values)
+    )
+
+
+def _walk(value):
+    yield value
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _walk(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk(item)
