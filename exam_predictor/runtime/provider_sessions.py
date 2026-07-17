@@ -18,20 +18,25 @@ class ProviderSessionRegistry:
     def connect(self, request: ConnectProviderRequest) -> ProviderDescriptor:
         config = request.profile.provider_config()
         secret = request.api_key.get_secret_value()
+        if not secret.strip():
+            raise ValueError(
+                f"An API key is required to connect provider profile '{request.profile.profile_id}'."
+            )
         config["api_key"] = secret
         config.pop("approved_max_usd", None)
         try:
             provider = self._factory(config)
         except Exception as exc:
             safe_message = str(exc).replace(secret, "[REDACTED]")
-            raise RuntimeError(safe_message or "Provider connection failed.") from None
-        with self._lock:
-            self._providers[request.profile.profile_id] = provider
-        capabilities = {
-            name: bool(value)
-            for name, value in vars(provider.capabilities).items()
-        }
-        return ProviderDescriptor(profile=request.profile, capabilities=capabilities)
+        else:
+            with self._lock:
+                self._providers[request.profile.profile_id] = provider
+            capabilities = {
+                name: bool(value)
+                for name, value in vars(provider.capabilities).items()
+            }
+            return ProviderDescriptor(profile=request.profile, capabilities=capabilities)
+        raise RuntimeError(safe_message or "Provider connection failed.") from None
 
     def get_provider(self, profile_id: str) -> BaseProvider:
         with self._lock:

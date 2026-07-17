@@ -56,3 +56,41 @@ def test_provider_connection_error_redacts_the_key():
         ))
     assert "secret-key" not in str(captured.value)
     assert "[REDACTED]" in str(captured.value)
+
+
+def test_provider_connection_error_redacts_the_full_exception_chain():
+    def failing_factory(config: dict):
+        raise RuntimeError(f"rejected {config['api_key']}")
+
+    registry = ProviderSessionRegistry(factory=failing_factory)
+    with pytest.raises(RuntimeError) as captured:
+        registry.connect(ConnectProviderRequest(
+            profile=ProviderProfile(profile_id="primary", provider="gemini"),
+            api_key="secret-key",
+        ))
+
+    chain: list[BaseException] = []
+    current: BaseException | None = captured.value
+    while current is not None:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    assert all("secret-key" not in str(error) for error in chain)
+
+
+@pytest.mark.parametrize("api_key", ["", "   "])
+def test_empty_api_key_is_rejected_before_provider_factory(api_key: str):
+    seen: list[dict] = []
+
+    def factory(config: dict):
+        seen.append(config)
+        return FakeProvider()
+
+    registry = ProviderSessionRegistry(factory=factory)
+    with pytest.raises(ValueError, match="API key is required to connect provider profile 'primary'"):
+        registry.connect(ConnectProviderRequest(
+            profile=ProviderProfile(profile_id="primary", provider="gemini"),
+            api_key=api_key,
+        ))
+
+    assert seen == []
