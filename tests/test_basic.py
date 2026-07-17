@@ -20,6 +20,7 @@ def test_imports():
         "schema", "ingest", "chunker", "embedder", "vector_store", "aligner",
         "fusion", "generator", "reranker", "evaluator", "pipeline", "providers",
         "security", "cloud_analyzer", "agent", "state", "budget",
+        "runtime.models",
     ]
     for module in modules:
         importlib.import_module(f"exam_predictor.{module}")
