@@ -54,12 +54,16 @@ class FakeRuntime:
         return run
 
     def stop(self, run_id):
-        self.store.get_run(run_id)
+        run = self.store.get_run(run_id)
+        if run.status is not RunStatus.RUNNING:
+            raise ValueError("Only a running Agent run can be stopped.")
         self.store.append_event(run_id, EventType.PAUSED, "paused", "Paused.")
         return self.store.set_status(run_id, RunStatus.PAUSED)
 
     def resume(self, run_id):
         run = self.store.get_run(run_id)
+        if run.status is not RunStatus.PAUSED:
+            raise ValueError("Only a paused Agent run can be resumed.")
         self.provider_sessions.get_provider(run.provider_profile_id)
         self.store.append_event(
             run_id,
@@ -255,6 +259,54 @@ async def test_authentication_precedes_malformed_body_validation(client):
     assert API_KEY not in response.text
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Content-Type": "application/json"},
+        {
+            "Content-Type": "application/json",
+            "X-ExamSage-Token": "wrong",
+        },
+    ],
+)
+async def test_malformed_json_is_rejected_at_auth_boundary(client, headers):
+    response = await client.post(
+        "/v1/providers/connect",
+        headers=headers,
+        content=b"{",
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized."}
+    assert API_KEY not in response.text
+    assert WORKER_TOKEN not in response.text
+
+
+async def test_authenticated_malformed_json_returns_safe_422(client, auth_headers):
+    response = await client.post(
+        "/v1/providers/connect",
+        headers={**auth_headers, "Content-Type": "application/json"},
+        content=b"{",
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid request."}
+    assert API_KEY not in response.text
+    assert WORKER_TOKEN not in response.text
+
+
+async def test_auth_boundary_matches_only_v1_root_and_subpaths(client, auth_headers):
+    assert (await client.get("/v1")).status_code == 401
+    assert (
+        await client.get(
+            "/v1/",
+            headers={"X-ExamSage-Token": "wrong"},
+        )
+    ).status_code == 401
+    assert (await client.get("/v1", headers=auth_headers)).status_code == 404
+    assert (await client.get("/v10")).status_code == 404
+
+
 async def test_valid_message_run_event_stop_resume_and_pause_all_routes(
     client,
     auth_headers,
@@ -349,6 +401,32 @@ async def test_resume_without_reconnected_provider_returns_stable_409(
 
 
 @pytest.mark.parametrize(
+    ("operation", "run_status"),
+    [
+        ("stop", RunStatus.PAUSED),
+        ("resume", RunStatus.RUNNING),
+    ],
+)
+async def test_invalid_run_transition_returns_stable_409(
+    client,
+    auth_headers,
+    runtime,
+    operation,
+    run_status,
+):
+    run = runtime.store.create_run("course-1", "primary", "Explain", run_status)
+
+    response = await client.post(
+        f"/v1/runs/{run.run_id}/{operation}",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Run state conflicts with this operation."}
+    assert run.run_id not in response.text
+
+
+@pytest.mark.parametrize(
     ("method", "suffix"),
     [
         ("get", ""),
@@ -411,6 +489,8 @@ async def test_sse_respects_after_emits_ordered_frames_and_drains_settled_run(
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
     assert f"id: {skipped.sequence}\n" not in body
     assert body.index(f"id: {message.sequence}\n") < body.index(
         f"id: {complete.sequence}\n"
@@ -421,6 +501,46 @@ async def test_sse_respects_after_emits_ordered_frames_and_drains_settled_run(
     assert "\n\n" in body
     assert WORKER_TOKEN not in body
     assert API_KEY not in body
+
+
+@pytest.mark.parametrize(
+    ("run_status", "terminal_type"),
+    [
+        (RunStatus.PAUSED, EventType.PAUSED),
+        (RunStatus.FAILED, EventType.FAILED),
+    ],
+)
+async def test_sse_closes_after_status_specific_terminal_event(
+    client,
+    auth_headers,
+    runtime,
+    run_status,
+    terminal_type,
+):
+    run = runtime.store.create_run(
+        "course-1",
+        "primary",
+        "Explain",
+        RunStatus.RUNNING,
+    )
+    terminal = runtime.store.append_event(
+        run.run_id,
+        terminal_type,
+        terminal_type.value,
+        "Settled",
+    )
+    runtime.store.set_status(run.run_id, run_status)
+
+    async with client.stream(
+        "GET",
+        f"/v1/runs/{run.run_id}/stream",
+        headers=auth_headers,
+    ) as response:
+        body = "".join([chunk async for chunk in response.aiter_text()])
+
+    assert response.status_code == 200
+    assert f"id: {terminal.sequence}\n" in body
+    assert f"event: {terminal_type.value}\n" in body
 
 
 async def test_sse_waits_for_terminal_event_published_after_settled_status(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -11,6 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, SecretStr, field_validator, model_validator
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from exam_predictor.runtime.coordinator import RuntimeCoordinator
 from exam_predictor.runtime.models import (
@@ -32,6 +34,39 @@ _PROVIDER_REQUIRED_DETAIL = (
     "Connect provider profile before starting or resuming this run."
 )
 _RUN_CONFLICT_DETAIL = "Run state conflicts with this operation."
+
+
+class _V1TokenAuthBoundary:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        token_matches: Callable[[bytes], bool],
+    ):
+        self.app = app
+        self.token_matches = token_matches
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        path = scope.get("path", "")
+        if scope["type"] == "http" and (path == "/v1" or path.startswith("/v1/")):
+            supplied = [
+                value
+                for name, value in scope.get("headers", [])
+                if name.lower() == b"x-examsage-token"
+            ]
+            if len(supplied) != 1 or not self.token_matches(supplied[0]):
+                response = JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": "Unauthorized."},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 class WorkerSettings(BaseModel):
@@ -74,6 +109,9 @@ def create_worker_app(
 
     expected_token = settings.token.get_secret_value().encode()
 
+    def token_matches(supplied: bytes) -> bool:
+        return secrets.compare_digest(supplied, expected_token)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         runtime.start()
@@ -89,6 +127,7 @@ def create_worker_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+    app.add_middleware(_V1TokenAuthBoundary, token_matches=token_matches)
     app.state.runtime = runtime
 
     @app.exception_handler(RequestValidationError)
@@ -102,7 +141,7 @@ def create_worker_app(
         supplied: Annotated[str | None, Header(alias="X-ExamSage-Token")] = None,
     ) -> None:
         supplied_token = supplied.encode() if supplied is not None else b""
-        if not secrets.compare_digest(supplied_token, expected_token):
+        if not token_matches(supplied_token):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized.",
