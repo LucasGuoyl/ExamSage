@@ -283,6 +283,12 @@ def render_report(report: PredictionReport, course_id: str | None) -> None:
 
 
 st.set_page_config(page_title="ExamSage", page_icon="🎓", layout="wide")
+if os.environ.get("EXAMSAGE_AGENT_V2", "0") == "1":
+    from exam_predictor.ui.agent_view import render_agent_kernel
+
+    render_agent_kernel()
+    st.stop()
+
 st.title("🎓 ExamSage")
 st.subheader("Turn course materials into a structured, evidence-aware revision agent")
 st.caption("Local app · your API key · no ExamSage server · no telemetry")
