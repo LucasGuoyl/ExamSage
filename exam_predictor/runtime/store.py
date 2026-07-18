@@ -43,6 +43,8 @@ class RuntimeStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_runs_thread_status
                   ON agent_runs(thread_id, status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_agent_runs_status_created_at
+                  ON agent_runs(status, created_at);
                 CREATE TABLE IF NOT EXISTS agent_events (
                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                   run_id TEXT NOT NULL,
@@ -53,6 +55,8 @@ class RuntimeStore:
                   created_at TEXT NOT NULL,
                   FOREIGN KEY(run_id) REFERENCES agent_runs(run_id) ON DELETE CASCADE
                 );
+                CREATE INDEX IF NOT EXISTS idx_agent_events_run_sequence
+                  ON agent_events(run_id, sequence);
                 """
             )
 

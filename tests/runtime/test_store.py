@@ -2,6 +2,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timezone
 from pathlib import Path
 import sqlite3
+import threading
+
+import pytest
 
 from exam_predictor.runtime.models import EventType, RunStatus
 from exam_predictor.runtime.store import RuntimeStore
@@ -31,6 +34,26 @@ def test_store_orders_the_global_serial_queue(tmp_path: Path):
     second = store.create_run("course-2", "primary", "Second", RunStatus.QUEUED)
     assert store.active_run().run_id == first.run_id
     assert store.next_queued_run().run_id == second.run_id
+
+
+def test_global_queue_preserves_insertion_order_for_identical_timestamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    timestamp = "2026-07-17T12:00:00+00:00"
+    monkeypatch.setattr(RuntimeStore, "_now", staticmethod(lambda: timestamp))
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runs = [
+        store.create_run(f"course-{index}", "primary", f"Message {index}", RunStatus.QUEUED)
+        for index in range(3)
+    ]
+
+    assert store.next_queued_run().run_id == runs[0].run_id
+    store.set_status(runs[0].run_id, RunStatus.COMPLETED)
+    assert store.next_queued_run().run_id == runs[1].run_id
+    store.set_status(runs[1].run_id, RunStatus.FAILED)
+    assert store.next_queued_run().run_id == runs[2].run_id
+    store.set_status(runs[2].run_id, RunStatus.COMPLETED)
+    assert store.next_queued_run() is None
 
 
 def test_paused_run_remains_globally_active(tmp_path: Path):
@@ -84,6 +107,29 @@ def test_store_enables_wal_and_foreign_keys_for_each_connection(tmp_path: Path):
             raise AssertionError("agent_events must retain its foreign-key constraint")
 
 
+def test_store_indexes_match_global_queue_and_event_cursor_queries(tmp_path: Path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+
+    with store._connect() as connection:
+        run_indexes = {
+            row["name"]: tuple(
+                column["name"]
+                for column in connection.execute(f"PRAGMA index_info('{row['name']}')")
+            )
+            for row in connection.execute("PRAGMA index_list('agent_runs')")
+        }
+        event_indexes = {
+            row["name"]: tuple(
+                column["name"]
+                for column in connection.execute(f"PRAGMA index_info('{row['name']}')")
+            )
+            for row in connection.execute("PRAGMA index_list('agent_events')")
+        }
+
+    assert ("status", "created_at") in run_indexes.values()
+    assert ("run_id", "sequence") in event_indexes.values()
+
+
 def test_event_payload_round_trips_json_safely(tmp_path: Path):
     store = RuntimeStore(tmp_path / "runtime.sqlite3")
     run = store.create_run("course-1", "primary", "Explain", RunStatus.RUNNING)
@@ -97,6 +143,35 @@ def test_event_payload_round_trips_json_safely(tmp_path: Path):
 
     assert event.payload == payload
     assert store.get_run(run.run_id).status is RunStatus.RUNNING
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        pytest.param(RuntimeError("provider failed"), id="exception-instance"),
+        pytest.param(threading.Lock(), id="threading-lock"),
+        pytest.param(object(), id="opaque-object"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_event_payload_rejects_unsafe_values_without_partial_writes(
+    tmp_path: Path, unsafe_value: object
+):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    run = store.create_run("course-1", "primary", "Explain", RunStatus.RUNNING)
+
+    with pytest.raises((TypeError, ValueError)):
+        store.append_event(
+            run.run_id,
+            EventType.PROGRESS,
+            "research",
+            "Working",
+            {"unsafe": unsafe_value},
+        )
+
+    assert store.list_events(run.run_id) == []
 
 
 def test_store_methods_are_safe_across_concurrent_threads(tmp_path: Path):
@@ -139,6 +214,32 @@ def test_recovery_is_idempotent_and_leaves_settled_runs_unchanged(tmp_path: Path
     for status, run in unchanged.items():
         assert store.get_run(run.run_id).status is status
         assert store.list_events(run.run_id) == []
+
+
+def test_simultaneous_recovery_transitions_and_emits_once(tmp_path: Path):
+    path = tmp_path / "runtime.sqlite3"
+    seed = RuntimeStore(path)
+    runs = [
+        seed.create_run("course-1", "primary", "Running", RunStatus.RUNNING),
+        seed.create_run("course-2", "primary", "Stopping", RunStatus.STOPPING),
+    ]
+    stores = (RuntimeStore(path), RuntimeStore(path))
+    barrier = threading.Barrier(len(stores))
+
+    def recover(store: RuntimeStore) -> list[str]:
+        barrier.wait()
+        return store.recover_unfinished()
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+        recovery_results = list(executor.map(recover, stores))
+
+    recovered_ids = [run_id for result in recovery_results for run_id in result]
+    assert sorted(recovered_ids) == sorted(run.run_id for run in runs)
+    for run in runs:
+        assert seed.get_run(run.run_id).status is RunStatus.PAUSED
+        events = seed.list_events(run.run_id)
+        assert len(events) == 1
+        assert events[0].event_type is EventType.PAUSED
 
 
 def test_status_updates_and_missing_runs(tmp_path: Path):
