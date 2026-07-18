@@ -57,21 +57,27 @@ class FakeRuntime:
         run = self.store.get_run(run_id)
         if run.status is not RunStatus.RUNNING:
             raise ValueError("Only a running Agent run can be stopped.")
-        self.store.append_event(run_id, EventType.PAUSED, "paused", "Paused.")
-        return self.store.set_status(run_id, RunStatus.PAUSED)
+        self.store.append_event(
+            run_id,
+            EventType.STOP_REQUESTED,
+            "stopping",
+            "Stop requested.",
+        )
+        return self.store.set_status(run_id, RunStatus.STOPPING)
 
     def resume(self, run_id):
         run = self.store.get_run(run_id)
         if run.status is not RunStatus.PAUSED:
             raise ValueError("Only a paused Agent run can be resumed.")
         self.provider_sessions.get_provider(run.provider_profile_id)
+        self.store.set_status(run_id, RunStatus.RUNNING)
         self.store.append_event(
             run_id,
-            EventType.COMPLETED,
-            "complete",
-            "Completed.",
+            EventType.RESUMED,
+            "queue",
+            "Resume requested.",
         )
-        return self.store.set_status(run_id, RunStatus.COMPLETED)
+        return self.store.get_run(run_id)
 
     def pause_all(self):
         self.lifecycle_calls.append("pause_all")
@@ -307,6 +313,21 @@ async def test_auth_boundary_matches_only_v1_root_and_subpaths(client, auth_head
     assert (await client.get("/v10")).status_code == 404
 
 
+async def test_auth_boundary_rejects_duplicate_token_headers(client):
+    response = await client.get(
+        "/v1/runs/missing",
+        headers=[
+            ("X-ExamSage-Token", WORKER_TOKEN),
+            ("X-ExamSage-Token", WORKER_TOKEN),
+        ],
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized."}
+    assert WORKER_TOKEN not in response.text
+    assert API_KEY not in response.text
+
+
 async def test_valid_message_run_event_stop_resume_and_pause_all_routes(
     client,
     auth_headers,
@@ -330,8 +351,19 @@ async def test_valid_message_run_event_stop_resume_and_pause_all_routes(
         f"/v1/runs/{run_id}/stop",
         headers=auth_headers,
     )
+    runtime.store.set_status(run_id, RunStatus.PAUSED)
+    runtime.store.append_event(
+        run_id,
+        EventType.PAUSED,
+        "paused",
+        "Paused at a safe boundary.",
+    )
     resume_response = await client.post(
         f"/v1/runs/{run_id}/resume",
+        headers=auth_headers,
+    )
+    lifecycle_events = await client.get(
+        f"/v1/runs/{run_id}/events",
         headers=auth_headers,
     )
     pause_response = await client.post(
@@ -344,9 +376,15 @@ async def test_valid_message_run_event_stop_resume_and_pause_all_routes(
     assert events_response.status_code == 200
     assert [event["event_type"] for event in events_response.json()] == ["started"]
     assert stop_response.status_code == 200
-    assert stop_response.json()["status"] == "paused"
+    assert stop_response.json()["status"] == "stopping"
     assert resume_response.status_code == 200
-    assert resume_response.json()["status"] == "completed"
+    assert resume_response.json()["status"] == "running"
+    assert [event["event_type"] for event in lifecycle_events.json()] == [
+        "started",
+        "stop_requested",
+        "paused",
+        "resumed",
+    ]
     assert pause_response.status_code == 204
     assert runtime.lifecycle_calls.count("pause_all") == 1
 
@@ -585,6 +623,69 @@ async def test_sse_waits_for_terminal_event_published_after_settled_status(
     assert response.status_code == 200
     assert "event: completed\n" in body
     assert '"message":"Done"' in body
+
+
+async def test_sse_waits_for_current_pause_epoch_terminal_event(
+    client,
+    auth_headers,
+    runtime,
+    monkeypatch,
+):
+    run = runtime.store.create_run(
+        "course-1",
+        "primary",
+        "Explain",
+        RunStatus.RUNNING,
+    )
+    runtime.store.append_event(
+        run.run_id,
+        EventType.STARTED,
+        "queue",
+        "Started",
+    )
+    first_pause = runtime.store.append_event(
+        run.run_id,
+        EventType.PAUSED,
+        "paused",
+        "First pause",
+    )
+    resumed = runtime.store.append_event(
+        run.run_id,
+        EventType.RESUMED,
+        "queue",
+        "Resumed",
+    )
+    runtime.store.set_status(run.run_id, RunStatus.PAUSED)
+    ready = asyncio.Event()
+    monkeypatch.setattr(worker_api, "time", SignalingClock(ready))
+
+    async def publish_second_pause():
+        await ready.wait()
+        runtime.store.append_event(
+            run.run_id,
+            EventType.PAUSED,
+            "paused",
+            "Second pause",
+        )
+
+    publisher = asyncio.create_task(publish_second_pause())
+    try:
+        async with client.stream(
+            "GET",
+            f"/v1/runs/{run.run_id}/stream",
+            params={"after": resumed.sequence},
+            headers=auth_headers,
+        ) as response:
+            body = "".join([chunk async for chunk in response.aiter_text()])
+    finally:
+        if not publisher.done():
+            publisher.cancel()
+        with suppress(asyncio.CancelledError):
+            await publisher
+
+    assert response.status_code == 200
+    assert f"id: {first_pause.sequence}\n" not in body
+    assert '"message":"Second pause"' in body
 
 
 async def test_sse_emits_heartbeat_while_waiting_for_live_events(

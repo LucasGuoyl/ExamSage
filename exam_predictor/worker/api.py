@@ -246,17 +246,11 @@ def create_worker_app(
 
         async def generate():
             cursor = after
-            delivered_types = {
-                event.event_type
-                for event in runtime.store.list_events(run_id)
-                if event.sequence <= cursor
-            }
             heartbeat_at = time.monotonic() + 15.0
             while True:
                 events = runtime.store.list_events(run_id, after=cursor)
                 for event in events:
                     cursor = event.sequence
-                    delivered_types.add(event.event_type)
                     yield (
                         f"id: {event.sequence}\n"
                         f"event: {event.event_type.value}\n"
@@ -269,8 +263,22 @@ def create_worker_app(
                     RunStatus.COMPLETED: EventType.COMPLETED,
                     RunStatus.FAILED: EventType.FAILED,
                 }.get(run.status)
+                history = runtime.store.list_events(run_id)
+                epoch_sequence = max(
+                    (
+                        event.sequence
+                        for event in history
+                        if event.event_type in {EventType.STARTED, EventType.RESUMED}
+                    ),
+                    default=0,
+                )
+                terminal_delivered = any(
+                    event.event_type is terminal_type
+                    and epoch_sequence < event.sequence <= cursor
+                    for event in history
+                )
                 if (
-                    terminal_type in delivered_types
+                    terminal_delivered
                     and not runtime.store.list_events(run_id, after=cursor)
                 ):
                     return
