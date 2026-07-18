@@ -31,10 +31,12 @@ class GraphHarness:
         self,
         *,
         pause_first: bool = False,
+        emit_pause: bool = False,
         fail_first: Exception | None = None,
         honor_stop: bool = False,
     ):
         self.pause_first = pause_first
+        self.emit_pause = emit_pause
         self.fail_first = fail_first
         self.honor_stop = honor_stop
         self.first_started = Event()
@@ -51,6 +53,7 @@ class GraphHarness:
             def invoke(self, value, config):
                 harness.configs.append(config)
                 if isinstance(value, Command):
+                    assert value.resume == {"action": "resume"}
                     harness.resume_calls += 1
                     return {"assistant_message": "resumed answer"}
                 harness.initial_calls += 1
@@ -64,6 +67,13 @@ class GraphHarness:
                         and dependencies.controls.is_stop_requested(value["run_id"])
                     )
                     if should_pause:
+                        if harness.emit_pause:
+                            dependencies.emit(
+                                value["run_id"],
+                                "paused",
+                                "paused",
+                                "The run is paused at a safe boundary.",
+                            )
                         return {"__interrupt__": [{"kind": "stopped"}]}
                 return {"assistant_message": "completed answer"}
 
@@ -133,11 +143,34 @@ def test_stop_pauses_and_resume_continues_same_run(tmp_path: Path):
         types = [event.event_type for event in store.list_events(run.run_id)]
         assert EventType.STOP_REQUESTED in types
         assert EventType.RESUMED in types
+        assert types.count(EventType.PAUSED) == 1
         assert harness.resume_calls == 1
         assert harness.configs == [
             {"configurable": {"thread_id": "course-1"}},
             {"configurable": {"thread_id": "course-1"}},
         ]
+    finally:
+        runtime.shutdown()
+
+
+def test_coordinator_does_not_duplicate_graph_emitted_paused_event(tmp_path: Path):
+    harness = GraphHarness(pause_first=True, emit_pause=True)
+    store, runtime = runtime_for(tmp_path, harness)
+    runtime.start()
+    try:
+        run = runtime.submit_message("course-1", "primary", "Explain")
+        assert harness.first_started.wait(timeout=2)
+        runtime.stop(run.run_id)
+        harness.release_first.set()
+        wait_for_status(store, run.run_id, RunStatus.PAUSED)
+
+        paused_events = [
+            event
+            for event in store.list_events(run.run_id)
+            if event.event_type is EventType.PAUSED
+        ]
+        assert len(paused_events) == 1
+        assert paused_events[0].message == "The run is paused at a safe boundary."
     finally:
         runtime.shutdown()
 
@@ -155,6 +188,45 @@ def test_resume_requires_reconnected_provider_without_changing_status(tmp_path: 
         with pytest.raises(KeyError, match="Connect provider profile 'primary'"):
             runtime.resume(run.run_id)
         assert store.get_run(run.run_id).status is RunStatus.PAUSED
+    finally:
+        runtime.shutdown()
+
+
+def test_restart_recovers_unfinished_run_and_keeps_queued_work_blocked(tmp_path: Path):
+    store_path = tmp_path / "runtime.sqlite3"
+    seeded_store = RuntimeStore(store_path)
+    unfinished = seeded_store.create_run(
+        "course-1",
+        "primary",
+        "First",
+        RunStatus.RUNNING,
+    )
+    queued = seeded_store.create_run(
+        "course-2",
+        "primary",
+        "Second",
+        RunStatus.QUEUED,
+    )
+    harness = GraphHarness()
+    reconstructed_store = RuntimeStore(store_path)
+    runtime = RuntimeCoordinator(
+        store=reconstructed_store,
+        provider_sessions=registry(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        graph_factory=harness.factory,
+    )
+
+    runtime.start()
+    try:
+        assert reconstructed_store.get_run(unfinished.run_id).status is RunStatus.PAUSED
+        assert reconstructed_store.get_run(queued.run_id).status is RunStatus.QUEUED
+        paused_events = [
+            event
+            for event in reconstructed_store.list_events(unfinished.run_id)
+            if event.event_type is EventType.PAUSED
+        ]
+        assert len(paused_events) == 1
+        assert harness.initial_calls == 0
     finally:
         runtime.shutdown()
 
@@ -266,4 +338,26 @@ def test_shutdown_does_not_start_queued_work_when_active_work_finishes(tmp_path:
     assert store.get_run(second.run_id).status is RunStatus.QUEUED
     assert harness.initial_calls == 1
     assert not shutdown.is_alive()
+    assert not runtime._thread.is_alive()
+
+
+def test_shutdown_timeout_is_explicit_and_repeated_shutdown_cleans_worker(tmp_path: Path):
+    harness = GraphHarness(honor_stop=True)
+    store, runtime = runtime_for(tmp_path, harness)
+    runtime.start()
+    run = runtime.submit_message("course-1", "primary", "Explain")
+    assert harness.first_started.wait(timeout=2)
+
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="RuntimeCoordinator worker did not stop before the shutdown timeout",
+        ):
+            runtime.shutdown(timeout=0.01)
+        assert runtime._thread.is_alive()
+    finally:
+        harness.release_first.set()
+        runtime.shutdown(timeout=2)
+
+    assert store.get_run(run.run_id).status is RunStatus.PAUSED
     assert not runtime._thread.is_alive()

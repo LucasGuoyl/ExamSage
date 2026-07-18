@@ -142,6 +142,10 @@ class RuntimeCoordinator:
                     self._commands.put(None)
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise TimeoutError(
+                    "RuntimeCoordinator worker did not stop before the shutdown timeout."
+                )
 
     def _ensure_accepting_commands(self) -> None:
         if self._shutdown_requested:
@@ -166,6 +170,8 @@ class RuntimeCoordinator:
 
     def _execute(self, graph: Any, action: str, run_id: str) -> None:
         run = self.store.get_run(run_id)
+        existing_events = self.store.list_events(run_id)
+        event_cursor = existing_events[-1].sequence if existing_events else 0
         config = {"configurable": {"thread_id": run.thread_id}}
         try:
             if action == "resume":
@@ -192,6 +198,16 @@ class RuntimeCoordinator:
         with self._lock:
             if result.get("__interrupt__"):
                 self.store.set_status(run_id, RunStatus.PAUSED)
+                invocation_events = self.store.list_events(run_id, after=event_cursor)
+                if not any(
+                    event.event_type is EventType.PAUSED for event in invocation_events
+                ):
+                    self.store.append_event(
+                        run_id,
+                        EventType.PAUSED,
+                        "paused",
+                        "The run is paused at a safe boundary.",
+                    )
                 return
             self.store.set_status(run_id, RunStatus.COMPLETED)
             self.store.append_event(
