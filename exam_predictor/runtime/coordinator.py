@@ -1,0 +1,221 @@
+from __future__ import annotations
+
+import queue
+import threading
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
+
+from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
+from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
+
+from .control import RunControlRegistry
+from .models import EventType, RunSnapshot, RunStatus
+from .provider_sessions import ProviderSessionRegistry
+from .store import RuntimeStore
+
+
+class RuntimeCoordinator:
+    def __init__(
+        self,
+        *,
+        store: RuntimeStore,
+        provider_sessions: ProviderSessionRegistry,
+        checkpoints_path: str | Path,
+        graph_factory: Callable[..., Any] = build_kernel_graph,
+    ):
+        self.store = store
+        self.provider_sessions = provider_sessions
+        self.checkpoints_path = Path(checkpoints_path)
+        self.graph_factory = graph_factory
+        self.controls = RunControlRegistry()
+        self._commands: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.RLock()
+        self._shutdown_requested = False
+
+    def _emit(
+        self,
+        run_id: str,
+        event_type: str,
+        stage: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.store.append_event(run_id, EventType(event_type), stage, message, payload)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            if self._shutdown_requested:
+                raise RuntimeError("A shut down RuntimeCoordinator cannot be restarted.")
+            self.store.recover_unfinished()
+            self.checkpoints_path.parent.mkdir(parents=True, exist_ok=True)
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="examsage-agent",
+                daemon=True,
+            )
+            self._thread.start()
+            if self.store.active_run() is None:
+                self._start_next()
+
+    def submit_message(
+        self,
+        thread_id: str,
+        provider_profile_id: str,
+        message: str,
+    ) -> RunSnapshot:
+        self.provider_sessions.get_provider(provider_profile_id)
+        with self._lock:
+            self._ensure_accepting_commands()
+            active = self.store.active_run()
+            queued = self.store.next_queued_run()
+            status = RunStatus.QUEUED if active or queued else RunStatus.RUNNING
+            run = self.store.create_run(
+                thread_id,
+                provider_profile_id,
+                message,
+                status,
+            )
+            event_type = EventType.QUEUED if status is RunStatus.QUEUED else EventType.STARTED
+            text = (
+                "Message queued behind the active run."
+                if status is RunStatus.QUEUED
+                else "Agent run started."
+            )
+            self.store.append_event(run.run_id, event_type, "queue", text)
+            if status is RunStatus.RUNNING:
+                self._commands.put(("start", run.run_id))
+            elif active is None:
+                self._start_next()
+            return run
+
+    def stop(self, run_id: str) -> RunSnapshot:
+        with self._lock:
+            run = self.store.get_run(run_id)
+            if run.status is not RunStatus.RUNNING:
+                raise ValueError("Only a running Agent run can be stopped.")
+            self.controls.request_stop(run_id)
+            self.store.append_event(
+                run_id,
+                EventType.STOP_REQUESTED,
+                "stopping",
+                "Stop requested.",
+            )
+            return self.store.set_status(run_id, RunStatus.STOPPING)
+
+    def resume(self, run_id: str) -> RunSnapshot:
+        with self._lock:
+            run = self.store.get_run(run_id)
+            if run.status is not RunStatus.PAUSED:
+                raise ValueError("Only a paused Agent run can be resumed.")
+            self.provider_sessions.get_provider(run.provider_profile_id)
+            self._ensure_accepting_commands()
+            self.store.set_status(run_id, RunStatus.RUNNING)
+            self.store.append_event(
+                run_id,
+                EventType.RESUMED,
+                "queue",
+                "Resume requested.",
+            )
+            self._commands.put(("resume", run_id))
+            return self.store.get_run(run_id)
+
+    def pause_all(self) -> None:
+        with self._lock:
+            active_statuses = {RunStatus.RUNNING, RunStatus.STOPPING}
+            for run in self.store.list_by_status(active_statuses):
+                self.controls.request_stop(run.run_id)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        with self._lock:
+            self.pause_all()
+            thread = self._thread
+            if not self._shutdown_requested:
+                self._shutdown_requested = True
+                if thread is not None:
+                    self._commands.put(None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
+    def _ensure_accepting_commands(self) -> None:
+        if self._shutdown_requested:
+            raise RuntimeError("The RuntimeCoordinator is shutting down.")
+
+    def _loop(self) -> None:
+        with SqliteSaver.from_conn_string(str(self.checkpoints_path)) as saver:
+            dependencies = KernelDependencies(
+                provider_sessions=self.provider_sessions,
+                planner=KernelPlanner(),
+                tools=KernelToolRegistry(),
+                controls=self.controls,
+                emit=self._emit,
+            )
+            graph = self.graph_factory(dependencies, saver)
+            while True:
+                command = self._commands.get()
+                if command is None:
+                    return
+                action, run_id = command
+                self._execute(graph, action, run_id)
+
+    def _execute(self, graph: Any, action: str, run_id: str) -> None:
+        run = self.store.get_run(run_id)
+        config = {"configurable": {"thread_id": run.thread_id}}
+        try:
+            if action == "resume":
+                result = graph.invoke(Command(resume={"action": "resume"}), config)
+            else:
+                result = graph.invoke(
+                    {
+                        "run_id": run.run_id,
+                        "provider_profile_id": run.provider_profile_id,
+                        "user_message": run.message,
+                        "messages": [{"role": "user", "content": run.message}],
+                    },
+                    config,
+                )
+        except Exception as exc:
+            message = f"{type(exc).__name__}: Agent run failed."
+            with self._lock:
+                self.store.set_status(run_id, RunStatus.FAILED, error=message)
+                self.store.append_event(run_id, EventType.FAILED, "failed", message)
+                self.controls.discard(run_id)
+                self._start_next()
+            return
+
+        with self._lock:
+            if result.get("__interrupt__"):
+                self.store.set_status(run_id, RunStatus.PAUSED)
+                return
+            self.store.set_status(run_id, RunStatus.COMPLETED)
+            self.store.append_event(
+                run_id,
+                EventType.COMPLETED,
+                "complete",
+                "Agent run completed.",
+            )
+            self.controls.discard(run_id)
+            self._start_next()
+
+    def _start_next(self) -> None:
+        if self._shutdown_requested:
+            return
+        if self.store.active_run() is not None:
+            return
+        queued = self.store.next_queued_run()
+        if queued is None:
+            return
+        self.store.set_status(queued.run_id, RunStatus.RUNNING)
+        self.store.append_event(
+            queued.run_id,
+            EventType.STARTED,
+            "queue",
+            "Queued run started.",
+        )
+        self._commands.put(("start", queued.run_id))
