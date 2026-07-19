@@ -20,9 +20,13 @@ class RuntimeStore:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     @contextmanager
@@ -224,15 +228,33 @@ class RuntimeStore:
 
     def recover_unfinished(self) -> list[str]:
         unfinished = (RunStatus.RUNNING.value, RunStatus.STOPPING.value)
+        lifecycle_events = (
+            EventType.QUEUED.value,
+            EventType.STARTED.value,
+            EventType.STOP_REQUESTED.value,
+            EventType.PAUSED.value,
+            EventType.RESUMED.value,
+            EventType.COMPLETED.value,
+            EventType.FAILED.value,
+        )
         recovered: list[str] = []
         now = self._now()
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
-                """SELECT run_id FROM agent_runs
-                   WHERE status IN (?, ?)
-                   ORDER BY created_at ASC, rowid ASC""",
-                unfinished,
+                """SELECT runs.run_id,
+                          (
+                            SELECT events.event_type
+                            FROM agent_events AS events
+                            WHERE events.run_id = runs.run_id
+                              AND events.event_type IN (?, ?, ?, ?, ?, ?, ?)
+                            ORDER BY events.sequence DESC
+                            LIMIT 1
+                          ) AS last_lifecycle_event
+                   FROM agent_runs AS runs
+                   WHERE runs.status IN (?, ?)
+                   ORDER BY runs.created_at ASC, runs.rowid ASC""",
+                (*lifecycle_events, *unfinished),
             ).fetchall()
             for row in rows:
                 run_id = str(row["run_id"])
@@ -242,17 +264,18 @@ class RuntimeStore:
                        WHERE run_id = ?""",
                     (RunStatus.PAUSED.value, now, run_id),
                 )
-                db.execute(
-                    """INSERT INTO agent_events(
-                           run_id, event_type, stage, message, payload_json, created_at
-                       ) VALUES (?, ?, ?, ?, '{}', ?)""",
-                    (
-                        run_id,
-                        EventType.PAUSED.value,
-                        "paused",
-                        "ExamSage stopped before this run completed. Select Resume to continue.",
-                        now,
-                    ),
-                )
+                if row["last_lifecycle_event"] != EventType.PAUSED.value:
+                    db.execute(
+                        """INSERT INTO agent_events(
+                               run_id, event_type, stage, message, payload_json, created_at
+                           ) VALUES (?, ?, ?, ?, '{}', ?)""",
+                        (
+                            run_id,
+                            EventType.PAUSED.value,
+                            "paused",
+                            "ExamSage stopped before this run completed. Select Resume to continue.",
+                            now,
+                        ),
+                    )
                 recovered.append(run_id)
         return recovered

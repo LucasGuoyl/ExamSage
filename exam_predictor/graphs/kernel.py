@@ -43,10 +43,11 @@ def build_kernel_graph(deps: KernelDependencies, checkpointer):
         run_id = state["run_id"]
         if state.get("pause_pending") or not deps.controls.is_stop_requested(run_id):
             return {}
-        deps.emit(run_id, "paused", "paused", "The run is paused at a safe boundary.")
         return {"pause_pending": True}
 
     def pause(state: KernelState) -> dict[str, Any]:
+        if not state.get("pause_pending"):
+            return {}
         run_id = state["run_id"]
         resume = interrupt({"kind": "stopped", "run_id": run_id})
         if resume != {"action": "resume"}:

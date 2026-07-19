@@ -5,8 +5,11 @@ from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
+from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
+from exam_predictor.runtime.control import RunControlRegistry
 from exam_predictor.runtime.coordinator import RuntimeCoordinator
 from exam_predictor.runtime.models import (
     ConnectProviderRequest,
@@ -16,6 +19,7 @@ from exam_predictor.runtime.models import (
 )
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.runtime.store import RuntimeStore
+from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
 
 
 def wait_for_status(store: RuntimeStore, run_id: str, status: RunStatus) -> None:
@@ -142,8 +146,6 @@ def test_second_message_queues_until_first_finishes(tmp_path: Path):
         assert harness.initial_calls == 2
     finally:
         runtime.shutdown()
-
-
 def test_replacing_provider_used_by_running_run_is_rejected_and_original_completes(
     tmp_path: Path,
 ):
@@ -449,6 +451,119 @@ def test_restart_resume_without_checkpoint_restarts_same_run_from_durable_payloa
         runtime.shutdown()
 
 
+def test_restart_resume_continues_pending_pause_checkpoint_with_one_click(
+    tmp_path: Path,
+):
+    store_path = tmp_path / "runtime.sqlite3"
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    store = RuntimeStore(store_path)
+    interrupted = store.create_run(
+        "course-1",
+        "primary",
+        "Explain limits.",
+        RunStatus.STOPPING,
+    )
+    store.append_event(interrupted.run_id, EventType.STARTED, "queue", "Started")
+    store.append_event(
+        interrupted.run_id,
+        EventType.STOP_REQUESTED,
+        "stopping",
+        "Stop requested.",
+    )
+    store.append_event(
+        interrupted.run_id,
+        EventType.PAUSED,
+        "paused",
+        "The run is paused at a safe boundary.",
+    )
+    queued = store.create_run(
+        "course-2",
+        "primary",
+        "Explain derivatives.",
+        RunStatus.QUEUED,
+    )
+    store.append_event(queued.run_id, EventType.QUEUED, "queue", "Queued")
+
+    provider = SimpleNamespace(
+        name="fake",
+        capabilities=SimpleNamespace(chat=True),
+        models=SimpleNamespace(fast="fast", balanced="balanced"),
+        calls=0,
+    )
+
+    def complete(**_kwargs):
+        provider.calls += 1
+        content = (
+            json.dumps(
+                {
+                    "tool": "tutor_reply",
+                    "arguments": {},
+                    "reason": "Tutor request",
+                }
+            )
+            if provider.calls % 2 == 1
+            else "A clear worked answer."
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    provider.create_chat_completion = complete
+    sessions = ProviderSessionRegistry(factory=lambda _config: provider)
+    sessions.connect(provider_request("test-only-key"))
+    seed_controls = RunControlRegistry()
+    seed_controls.request_stop(interrupted.run_id)
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        graph = build_kernel_graph(
+            KernelDependencies(
+                provider_sessions=sessions,
+                planner=KernelPlanner(),
+                tools=KernelToolRegistry(),
+                controls=seed_controls,
+                emit=lambda *_args, **_kwargs: None,
+            ),
+            saver,
+        )
+        config = {"configurable": {"thread_id": interrupted.thread_id}}
+        stream = graph.stream(
+            RuntimeCoordinator._initial_state(interrupted),
+            config,
+            stream_mode="updates",
+        )
+        assert next(stream) == {"stop_before_plan": {"pause_pending": True}}
+        stream.close()
+        checkpoint = graph.get_state(config)
+        assert checkpoint.next == ("pause_before_plan",)
+        assert not any(task.interrupts for task in checkpoint.tasks)
+
+    runtime = RuntimeCoordinator(
+        store=RuntimeStore(store_path),
+        provider_sessions=sessions,
+        checkpoints_path=checkpoint_path,
+    )
+    runtime.start()
+    try:
+        assert runtime.store.get_run(interrupted.run_id).status is RunStatus.PAUSED
+        assert runtime.store.get_run(queued.run_id).status is RunStatus.QUEUED
+        assert [
+            event.event_type for event in runtime.store.list_events(interrupted.run_id)
+        ].count(EventType.PAUSED) == 1
+
+        runtime.resume(interrupted.run_id)
+
+        wait_for_status(runtime.store, interrupted.run_id, RunStatus.COMPLETED)
+        wait_for_status(runtime.store, queued.run_id, RunStatus.COMPLETED)
+        lifecycle = [
+            event.event_type for event in runtime.store.list_events(interrupted.run_id)
+        ]
+        assert lifecycle.count(EventType.PAUSED) == 1
+        assert lifecycle.count(EventType.RESUMED) == 1
+        assert provider.calls == 4
+    finally:
+        runtime.shutdown()
+    assert b"test-only-key" not in checkpoint_path.read_bytes()
+
+
 def test_paused_run_blocks_queued_work_until_it_resumes(tmp_path: Path):
     harness = GraphHarness(pause_first=True)
     store, runtime = runtime_for(tmp_path, harness)
@@ -493,28 +608,40 @@ def test_failed_run_is_safe_and_starts_next_queued_run(tmp_path: Path):
 
 
 def test_completed_status_and_terminal_event_become_visible_atomically(tmp_path: Path):
-    class DelayedCompletedEventStore(RuntimeStore):
+    class BlockingCompletedEventStore(RuntimeStore):
         def __init__(self, db_path):
+            self.before_completed_insert = Event()
+            self.release_completed_insert = Event()
             super().__init__(db_path)
-            self.before_completed_event = Event()
-            self.release_completed_event = Event()
 
-        def append_event(
-            self,
-            run_id,
-            event_type,
-            stage,
-            message,
-            payload=None,
-        ):
-            if event_type is EventType.COMPLETED:
-                self.before_completed_event.set()
-                assert self.release_completed_event.wait(timeout=2)
-            return super().append_event(run_id, event_type, stage, message, payload)
+        def _connect(self):
+            connection = super()._connect()
+            connection.create_function(
+                "block_completed_insert",
+                0,
+                self._block_completed_insert,
+            )
+            return connection
+
+        def _block_completed_insert(self):
+            self.before_completed_insert.set()
+            assert self.release_completed_insert.wait(timeout=2)
+            return 0
 
     harness = GraphHarness()
     harness.release_first.set()
-    store = DelayedCompletedEventStore(tmp_path / "runtime.sqlite3")
+    path = tmp_path / "runtime.sqlite3"
+    store = BlockingCompletedEventStore(path)
+    observer = RuntimeStore(path)
+    with store._connection() as connection:
+        connection.execute(
+            """CREATE TRIGGER block_completed_event_insert
+               BEFORE INSERT ON agent_events
+               WHEN NEW.event_type = 'completed'
+               BEGIN
+                 SELECT block_completed_insert();
+               END"""
+        )
     runtime = RuntimeCoordinator(
         store=store,
         provider_sessions=registry(),
@@ -524,20 +651,20 @@ def test_completed_status_and_terminal_event_become_visible_atomically(tmp_path:
     runtime.start()
     try:
         run = runtime.submit_message("course-1", "primary", "Explain")
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if (
-                store.before_completed_event.is_set()
-                or store.get_run(run.run_id).status is RunStatus.COMPLETED
-            ):
-                break
-            time.sleep(0.01)
-        assert store.get_run(run.run_id).status is RunStatus.COMPLETED
+        assert store.before_completed_insert.wait(timeout=2)
+
+        assert observer.get_run(run.run_id).status is RunStatus.RUNNING
+        assert EventType.COMPLETED not in {
+            event.event_type for event in observer.list_events(run.run_id)
+        }
+
+        store.release_completed_insert.set()
+        wait_for_status(observer, run.run_id, RunStatus.COMPLETED)
         assert EventType.COMPLETED in {
-            event.event_type for event in store.list_events(run.run_id)
+            event.event_type for event in observer.list_events(run.run_id)
         }
     finally:
-        store.release_completed_event.set()
+        store.release_completed_insert.set()
         runtime.shutdown()
 
 

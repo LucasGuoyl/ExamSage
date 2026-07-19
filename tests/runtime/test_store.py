@@ -73,6 +73,43 @@ def test_every_store_operation_explicitly_closes_its_sqlite_connection(
     assert all(connection.was_closed for connection in connections)
 
 
+def test_connect_closes_new_connection_when_pragma_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sqlite_connect = sqlite3.connect
+
+    class FailingPragmaConnection(sqlite3.Connection):
+        was_closed = False
+
+        def execute(self, sql, parameters=()):
+            if sql == "PRAGMA foreign_keys=ON":
+                raise sqlite3.OperationalError("forced pragma failure")
+            return super().execute(sql, parameters)
+
+        def close(self) -> None:
+            self.was_closed = True
+            super().close()
+
+    connections: list[FailingPragmaConnection] = []
+
+    def tracked_connect(*args, **kwargs):
+        kwargs["factory"] = FailingPragmaConnection
+        connection = sqlite_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", tracked_connect)
+    store = RuntimeStore.__new__(RuntimeStore)
+    store.db_path = tmp_path / "runtime.sqlite3"
+
+    with pytest.raises(sqlite3.OperationalError, match="forced pragma failure"):
+        store._connect()
+
+    assert len(connections) == 1
+    assert connections[0].was_closed
+
+
 def test_store_orders_the_global_serial_queue(tmp_path: Path):
     store = RuntimeStore(tmp_path / "runtime.sqlite3")
     first = store.create_run("course-1", "primary", "First", RunStatus.RUNNING)
@@ -190,6 +227,35 @@ def test_event_payload_round_trips_json_safely(tmp_path: Path):
     assert store.get_run(run.run_id).status is RunStatus.RUNNING
 
 
+def test_status_event_transition_rolls_back_when_event_insert_fails(tmp_path: Path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    run = store.create_run("course-1", "primary", "Explain", RunStatus.RUNNING)
+    with store._connection() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_failed_event_insert
+               BEFORE INSERT ON agent_events
+               WHEN NEW.event_type = 'failed'
+               BEGIN
+                 SELECT RAISE(ABORT, 'forced event insert failure');
+               END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced event insert failure"):
+        store.set_status_and_append_event(
+            run.run_id,
+            RunStatus.FAILED,
+            EventType.FAILED,
+            "failed",
+            "Failed",
+            error="safe failure",
+        )
+
+    unchanged = store.get_run(run.run_id)
+    assert unchanged.status is RunStatus.RUNNING
+    assert unchanged.error is None
+    assert store.list_events(run.run_id) == []
+
+
 @pytest.mark.parametrize(
     "unsafe_value",
     [
@@ -259,6 +325,30 @@ def test_recovery_is_idempotent_and_leaves_settled_runs_unchanged(tmp_path: Path
     for status, run in unchanged.items():
         assert store.get_run(run.run_id).status is status
         assert store.list_events(run.run_id) == []
+
+
+def test_recovery_reuses_current_paused_boundary_without_duplicate_event(
+    tmp_path: Path,
+):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    run = store.create_run("course-1", "primary", "Explain", RunStatus.STOPPING)
+    store.append_event(run.run_id, EventType.STOP_REQUESTED, "stopping", "Stop requested.")
+    existing_pause = store.append_event(
+        run.run_id,
+        EventType.PAUSED,
+        "paused",
+        "The run is paused at a safe boundary.",
+    )
+
+    assert store.recover_unfinished() == [run.run_id]
+
+    assert store.get_run(run.run_id).status is RunStatus.PAUSED
+    paused_events = [
+        event
+        for event in store.list_events(run.run_id)
+        if event.event_type is EventType.PAUSED
+    ]
+    assert paused_events == [existing_pause]
 
 
 def test_simultaneous_recovery_transitions_and_emits_once(tmp_path: Path):

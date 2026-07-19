@@ -268,6 +268,17 @@ class RuntimeCoordinator:
         if interrupted:
             return graph.invoke(Command(resume={"action": "resume"}), config)
 
+        pending_nodes = getattr(checkpoint, "next", ())
+        pending_pause = (
+            same_run
+            and checkpoint_values.get("pause_pending") is True
+            and len(pending_nodes) == 1
+            and str(pending_nodes[0]).startswith("pause_before_")
+        )
+        if pending_pause:
+            graph.update_state(config, {"pause_pending": False})
+            self.controls.clear_stop(run.run_id)
+
         self.store.append_event(
             run.run_id,
             EventType.RESUMED,
@@ -276,7 +287,7 @@ class RuntimeCoordinator:
         )
         if not same_run:
             return graph.invoke(self._initial_state(run), config)
-        if getattr(checkpoint, "next", ()):
+        if pending_nodes:
             return graph.invoke(None, config)
         return dict(checkpoint_values)
 

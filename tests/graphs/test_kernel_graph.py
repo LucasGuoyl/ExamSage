@@ -114,7 +114,7 @@ def test_graph_runs_tool_and_persists_follow_up_state(tmp_path: Path):
     ]
 
 
-def test_pause_and_resume_events_are_emitted_once(tmp_path: Path):
+def test_graph_emits_resumed_only_after_interrupt_continues(tmp_path: Path):
     events: list[dict] = []
     controls = RunControlRegistry()
     controls.request_stop("run-2")
@@ -130,17 +130,47 @@ def test_pause_and_resume_events_are_emitted_once(tmp_path: Path):
         }, config)
         assert paused["__interrupt__"]
         assert provider.calls == 0
-        assert [event["event_type"] for event in events] == ["paused"]
+        assert events == []
         resumed = graph.invoke(Command(resume={"action": "resume"}), config)
         assert resumed["assistant_message"]
         assert not controls.is_stop_requested("run-2")
         assert provider.calls == 2
     event_types = [event["event_type"] for event in events]
     assert event_types == [
-        "paused", "resumed", "progress", "tool_started", "tool_completed", "message"
+        "resumed", "progress", "tool_started", "tool_completed", "message"
     ]
-    assert event_types.count("paused") == 1
+    assert event_types.count("paused") == 0
     assert event_types.count("resumed") == 1
+
+
+def test_pending_pause_checkpoint_does_not_publish_paused_before_interrupt(
+    tmp_path: Path,
+):
+    events: list[dict] = []
+    controls = RunControlRegistry()
+    controls.request_stop("run-pending")
+    config = {"configurable": {"thread_id": "pending-pause"}}
+    with SqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite3")) as saver:
+        graph = build_kernel_graph(dependencies(events, controls), saver)
+        stream = graph.stream(
+            {
+                "run_id": "run-pending",
+                "provider_profile_id": "primary",
+                "user_message": "Explain momentum.",
+                "messages": [{"role": "user", "content": "Explain momentum."}],
+            },
+            config,
+            stream_mode="updates",
+        )
+        first_update = next(stream)
+        stream.close()
+        checkpoint = graph.get_state(config)
+
+    assert first_update == {"stop_before_plan": {"pause_pending": True}}
+    assert checkpoint.values["pause_pending"] is True
+    assert checkpoint.next == ("pause_before_plan",)
+    assert not any(task.interrupts for task in checkpoint.tasks)
+    assert events == []
 
 
 def test_interrupted_checkpoint_validates_resume_after_restart(tmp_path: Path):
@@ -178,7 +208,7 @@ def test_interrupted_checkpoint_validates_resume_after_restart(tmp_path: Path):
 
     assert initial_provider.calls == 2
     assert [event["event_type"] for event in initial_events] == [
-        "progress", "tool_started", "tool_completed", "paused"
+        "progress", "tool_started", "tool_completed"
     ]
     copyfile(checkpoint_path, valid_resume_checkpoint_path)
 
@@ -224,9 +254,9 @@ def test_interrupted_checkpoint_validates_resume_after_restart(tmp_path: Path):
         event["event_type"] for event in [*initial_events, *resumed_events]
     ]
     assert event_types == [
-        "progress", "tool_started", "tool_completed", "paused", "resumed", "message"
+        "progress", "tool_started", "tool_completed", "resumed", "message"
     ]
-    assert event_types.count("paused") == 1
+    assert event_types.count("paused") == 0
     assert event_types.count("resumed") == 1
 
 
