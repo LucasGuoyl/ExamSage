@@ -11,10 +11,13 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, SecretStr, ValidationError, field_validator, model_validator
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from exam_predictor.runtime.coordinator import RuntimeCoordinator
+from exam_predictor.runtime.coordinator import (
+    ProviderProfileInUseError,
+    RuntimeCoordinator,
+)
 from exam_predictor.runtime.models import (
     AgentEvent,
     ConnectProviderRequest,
@@ -23,6 +26,7 @@ from exam_predictor.runtime.models import (
     ProviderDescriptor,
     RunSnapshot,
     RunStatus,
+    SubmitMessageRequest,
     SubmitMessageResponse,
 )
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
@@ -34,6 +38,7 @@ _PROVIDER_REQUIRED_DETAIL = (
     "Connect provider profile before starting or resuming this run."
 )
 _RUN_CONFLICT_DETAIL = "Run state conflicts with this operation."
+_PROVIDER_IN_USE_DETAIL = "Provider profile is currently in use by an active run."
 
 
 class _V1TokenAuthBoundary:
@@ -178,7 +183,12 @@ def create_worker_app(
     )
     def connect_provider(request: ConnectProviderRequest) -> ProviderDescriptor:
         try:
-            return runtime.provider_sessions.connect(request)
+            return runtime.connect_provider(request)
+        except ProviderProfileInUseError:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=_PROVIDER_IN_USE_DETAIL,
+            ) from None
         except Exception:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -196,10 +206,21 @@ def create_worker_app(
         body: SubmitMessageBody,
     ) -> SubmitMessageResponse:
         try:
+            request = SubmitMessageRequest(
+                thread_id=thread_id,
+                provider_profile_id=body.provider_profile_id,
+                message=body.message,
+            )
+        except ValidationError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Invalid request.",
+            ) from None
+        try:
             run = runtime.submit_message(
-                thread_id,
-                body.provider_profile_id,
-                body.message,
+                request.thread_id,
+                request.provider_profile_id,
+                request.message,
             )
         except KeyError:
             raise provider_required() from None

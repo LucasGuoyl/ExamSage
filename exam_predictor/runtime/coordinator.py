@@ -13,9 +13,19 @@ from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
 
 from .control import RunControlRegistry
-from .models import EventType, RunSnapshot, RunStatus
+from .models import (
+    ConnectProviderRequest,
+    EventType,
+    ProviderDescriptor,
+    RunSnapshot,
+    RunStatus,
+)
 from .provider_sessions import ProviderSessionRegistry
 from .store import RuntimeStore
+
+
+class ProviderProfileInUseError(RuntimeError):
+    pass
 
 
 class RuntimeCoordinator:
@@ -70,9 +80,9 @@ class RuntimeCoordinator:
         provider_profile_id: str,
         message: str,
     ) -> RunSnapshot:
-        self.provider_sessions.get_provider(provider_profile_id)
         with self._lock:
             self._ensure_accepting_commands()
+            self.provider_sessions.get_provider(provider_profile_id)
             active = self.store.active_run()
             queued = self.store.next_queued_run()
             status = RunStatus.QUEUED if active or queued else RunStatus.RUNNING
@@ -94,6 +104,22 @@ class RuntimeCoordinator:
             elif active is None:
                 self._start_next()
             return run
+
+    def connect_provider(
+        self,
+        request: ConnectProviderRequest,
+    ) -> ProviderDescriptor:
+        profile_id = request.profile.profile_id
+        with self._lock:
+            if self.provider_sessions.has_provider(profile_id):
+                active = self.store.list_by_status(
+                    {RunStatus.RUNNING, RunStatus.STOPPING}
+                )
+                if any(run.provider_profile_id == profile_id for run in active):
+                    raise ProviderProfileInUseError(
+                        "Provider profile is currently in use by an active run."
+                    )
+            return self.provider_sessions.connect(request)
 
     def stop(self, run_id: str) -> RunSnapshot:
         with self._lock:
@@ -117,12 +143,6 @@ class RuntimeCoordinator:
             self.provider_sessions.get_provider(run.provider_profile_id)
             self._ensure_accepting_commands()
             self.store.set_status(run_id, RunStatus.RUNNING)
-            self.store.append_event(
-                run_id,
-                EventType.RESUMED,
-                "queue",
-                "Resume requested.",
-            )
             self._commands.put(("resume", run_id))
             return self.store.get_run(run_id)
 
@@ -175,49 +195,90 @@ class RuntimeCoordinator:
         config = {"configurable": {"thread_id": run.thread_id}}
         try:
             if action == "resume":
-                result = graph.invoke(Command(resume={"action": "resume"}), config)
+                result = self._invoke_resume(graph, config, run)
             else:
-                result = graph.invoke(
-                    {
-                        "run_id": run.run_id,
-                        "provider_profile_id": run.provider_profile_id,
-                        "user_message": run.message,
-                        "messages": [{"role": "user", "content": run.message}],
-                    },
-                    config,
-                )
+                result = graph.invoke(self._initial_state(run), config)
         except Exception as exc:
             message = f"{type(exc).__name__}: Agent run failed."
             with self._lock:
-                self.store.set_status(run_id, RunStatus.FAILED, error=message)
-                self.store.append_event(run_id, EventType.FAILED, "failed", message)
+                self.store.set_status_and_append_event(
+                    run_id,
+                    RunStatus.FAILED,
+                    EventType.FAILED,
+                    "failed",
+                    message,
+                    error=message,
+                )
                 self.controls.discard(run_id)
                 self._start_next()
             return
 
         with self._lock:
             if result.get("__interrupt__"):
-                self.store.set_status(run_id, RunStatus.PAUSED)
                 invocation_events = self.store.list_events(run_id, after=event_cursor)
-                if not any(
+                if any(
                     event.event_type is EventType.PAUSED for event in invocation_events
                 ):
-                    self.store.append_event(
+                    self.store.set_status(run_id, RunStatus.PAUSED)
+                else:
+                    self.store.set_status_and_append_event(
                         run_id,
+                        RunStatus.PAUSED,
                         EventType.PAUSED,
                         "paused",
                         "The run is paused at a safe boundary.",
                     )
                 return
-            self.store.set_status(run_id, RunStatus.COMPLETED)
-            self.store.append_event(
+            self.store.set_status_and_append_event(
                 run_id,
+                RunStatus.COMPLETED,
                 EventType.COMPLETED,
                 "complete",
                 "Agent run completed.",
             )
             self.controls.discard(run_id)
             self._start_next()
+
+    @staticmethod
+    def _initial_state(run: RunSnapshot) -> dict[str, Any]:
+        return {
+            "run_id": run.run_id,
+            "provider_profile_id": run.provider_profile_id,
+            "user_message": run.message,
+            "messages": [{"role": "user", "content": run.message}],
+        }
+
+    def _invoke_resume(
+        self,
+        graph: Any,
+        config: dict[str, dict[str, str]],
+        run: RunSnapshot,
+    ) -> dict[str, Any]:
+        get_state = getattr(graph, "get_state", None)
+        if get_state is None:
+            return graph.invoke(Command(resume={"action": "resume"}), config)
+
+        checkpoint = get_state(config)
+        checkpoint_values = getattr(checkpoint, "values", {})
+        same_run = checkpoint_values.get("run_id") == run.run_id
+        interrupted = same_run and any(
+            getattr(task, "interrupts", ())
+            for task in getattr(checkpoint, "tasks", ())
+        )
+        if interrupted:
+            return graph.invoke(Command(resume={"action": "resume"}), config)
+
+        self.store.append_event(
+            run.run_id,
+            EventType.RESUMED,
+            "planning",
+            "The run resumed from durable state.",
+        )
+        if not same_run:
+            return graph.invoke(self._initial_state(run), config)
+        if getattr(checkpoint, "next", ()):
+            return graph.invoke(None, config)
+        return dict(checkpoint_values)
 
     def _start_next(self) -> None:
         if self._shutdown_requested:

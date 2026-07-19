@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from exam_predictor.runtime.coordinator import ProviderProfileInUseError
 from exam_predictor.runtime.models import EventType, RunStatus
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.runtime.store import RuntimeStore
@@ -36,6 +37,9 @@ class FakeRuntime:
 
     def start(self):
         self.lifecycle_calls.append("start")
+
+    def connect_provider(self, request):
+        return self.provider_sessions.connect(request)
 
     def submit_message(self, thread_id, provider_profile_id, message):
         self.provider_sessions.get_provider(provider_profile_id)
@@ -207,6 +211,36 @@ async def test_connect_success_does_not_echo_secrets(client, auth_headers):
     assert response.status_code == 200
     assert response.json()["profile"]["profile_id"] == "primary"
     assert response.json()["capabilities"]["chat"] is True
+    assert API_KEY not in response.text
+    assert WORKER_TOKEN not in response.text
+
+
+async def test_replacing_provider_used_by_active_run_returns_stable_safe_409(
+    client,
+    auth_headers,
+    runtime,
+):
+    assert (await connect_provider(client, auth_headers)).status_code == 200
+
+    def reject_replacement(_request):
+        raise ProviderProfileInUseError(
+            f"profile primary currently in use; rejected {API_KEY} {WORKER_TOKEN}"
+        )
+
+    runtime.connect_provider = reject_replacement
+    response = await client.post(
+        "/v1/providers/connect",
+        headers=auth_headers,
+        json={
+            "profile": {"profile_id": "primary", "provider": "gemini"},
+            "api_key": API_KEY,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Provider profile is currently in use by an active run."
+    }
     assert API_KEY not in response.text
     assert WORKER_TOKEN not in response.text
 
@@ -387,6 +421,65 @@ async def test_valid_message_run_event_stop_resume_and_pause_all_routes(
     ]
     assert pause_response.status_code == 204
     assert runtime.lifecycle_calls.count("pause_all") == 1
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "body"),
+    [
+        ("course-1", {"provider_profile_id": "primary", "message": ""}),
+        ("course-1", {"provider_profile_id": "primary", "message": "   "}),
+        ("course-1", {"provider_profile_id": "   ", "message": "Explain"}),
+        ("%20%20", {"provider_profile_id": "primary", "message": "Explain"}),
+    ],
+)
+async def test_message_route_rejects_blank_required_text_with_stable_422(
+    client,
+    auth_headers,
+    thread_id,
+    body,
+):
+    assert (await connect_provider(client, auth_headers)).status_code == 200
+
+    response = await client.post(
+        f"/v1/threads/{thread_id}/messages",
+        headers=auth_headers,
+        json=body,
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid request."}
+    assert API_KEY not in response.text
+    assert WORKER_TOKEN not in response.text
+
+
+async def test_message_route_uses_shared_required_text_normalization(
+    client,
+    auth_headers,
+    runtime,
+):
+    assert (await connect_provider(client, auth_headers)).status_code == 200
+
+    response = await client.post(
+        "/v1/threads/%20course-1%20/messages",
+        headers=auth_headers,
+        json={"provider_profile_id": " primary ", "message": " Explain limits. "},
+    )
+
+    assert response.status_code == 202
+    run = runtime.store.get_run(response.json()["run_id"])
+    assert run.thread_id == "course-1"
+    assert run.provider_profile_id == "primary"
+    assert run.message == "Explain limits."
+
+
+async def test_message_authentication_precedes_blank_body_validation(client):
+    response = await client.post(
+        "/v1/threads/course-1/messages",
+        json={"provider_profile_id": "", "message": ""},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized."}
 
 
 async def test_events_after_returns_only_later_durable_sequences(

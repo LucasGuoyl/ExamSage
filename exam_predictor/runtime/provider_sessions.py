@@ -46,3 +46,7 @@ class ProviderSessionRegistry:
                 f"Connect provider profile '{profile_id}' before starting or resuming this run."
             )
         return provider
+
+    def has_provider(self, profile_id: str) -> bool:
+        with self._lock:
+            return profile_id in self._providers

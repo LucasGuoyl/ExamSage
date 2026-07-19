@@ -6,6 +6,7 @@ import threading
 
 import pytest
 
+import exam_predictor.runtime.store as store_module
 from exam_predictor.runtime.models import EventType, RunStatus
 from exam_predictor.runtime.store import RuntimeStore
 
@@ -26,6 +27,50 @@ def test_store_serializes_messages_and_events_without_secrets(tmp_path: Path):
     assert "api_key" not in (tmp_path / "runtime.sqlite3").read_bytes().decode(
         "utf-8", errors="ignore"
     )
+
+
+def test_every_store_operation_explicitly_closes_its_sqlite_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sqlite_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        was_closed = False
+
+        def close(self) -> None:
+            self.was_closed = True
+            super().close()
+
+    connections: list[TrackingConnection] = []
+
+    def tracked_connect(*args, **kwargs):
+        kwargs["factory"] = TrackingConnection
+        connection = sqlite_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", tracked_connect)
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    run = store.create_run("course-1", "primary", "Explain", RunStatus.RUNNING)
+    store.get_run(run.run_id)
+    store.active_run()
+    store.next_queued_run()
+    store.set_status(run.run_id, RunStatus.STOPPING)
+    store.append_event(run.run_id, EventType.PROGRESS, "planning", "Working")
+    store.list_events(run.run_id)
+    store.list_by_status({RunStatus.STOPPING})
+    store.recover_unfinished()
+    store.set_status_and_append_event(
+        run.run_id,
+        RunStatus.COMPLETED,
+        EventType.COMPLETED,
+        "complete",
+        "Done",
+    )
+
+    assert connections
+    assert all(connection.was_closed for connection in connections)
 
 
 def test_store_orders_the_global_serial_queue(tmp_path: Path):
@@ -88,7 +133,7 @@ def test_store_enables_wal_and_foreign_keys_for_each_connection(tmp_path: Path):
     store = RuntimeStore(path)
     run = store.create_run("course-1", "primary", "Explain", RunStatus.RUNNING)
 
-    with store._connect() as connection:
+    with store._connection() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
@@ -110,7 +155,7 @@ def test_store_enables_wal_and_foreign_keys_for_each_connection(tmp_path: Path):
 def test_store_indexes_match_global_queue_and_event_cursor_queries(tmp_path: Path):
     store = RuntimeStore(tmp_path / "runtime.sqlite3")
 
-    with store._connect() as connection:
+    with store._connection() as connection:
         run_indexes = {
             row["name"]: tuple(
                 column["name"]
@@ -257,6 +302,13 @@ def test_status_updates_and_missing_runs(tmp_path: Path):
         lambda: store.get_run("missing"),
         lambda: store.set_status("missing", RunStatus.PAUSED),
         lambda: store.append_event("missing", EventType.PAUSED, "paused", "Paused"),
+        lambda: store.set_status_and_append_event(
+            "missing",
+            RunStatus.PAUSED,
+            EventType.PAUSED,
+            "paused",
+            "Paused",
+        ),
     ):
         try:
             operation()
