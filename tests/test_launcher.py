@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import traceback
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -58,12 +59,17 @@ class FakeProcess:
         wait_interrupt: bool = False,
         stubborn: bool = False,
         already_exited: bool = False,
+        terminate_error: BaseException | None = None,
+        wait_after_kill_error: BaseException | None = None,
     ) -> None:
         self.name = name
         self.actions = actions
         self.wait_result = wait_result
         self.wait_interrupt = wait_interrupt
         self.stubborn = stubborn
+        self.terminate_error = terminate_error
+        self.wait_after_kill_error = wait_after_kill_error
+        self.killed = False
         self.returncode: int | None = wait_result if already_exited else None
 
     def poll(self) -> int | None:
@@ -76,6 +82,8 @@ class FakeProcess:
         if timeout is None:
             self.returncode = self.wait_result
             return self.wait_result
+        if self.killed and self.wait_after_kill_error is not None:
+            raise self.wait_after_kill_error
         if self.stubborn and self.returncode is None:
             raise subprocess.TimeoutExpired(self.name, timeout)
         if self.returncode is None:
@@ -84,10 +92,32 @@ class FakeProcess:
 
     def terminate(self) -> None:
         self.actions.append(f"terminate:{self.name}")
+        if self.terminate_error is not None:
+            raise self.terminate_error
 
     def kill(self) -> None:
         self.actions.append(f"kill:{self.name}")
+        self.killed = True
         self.returncode = -9
+
+
+class SequencedPollProcess(FakeProcess):
+    def __init__(
+        self,
+        name: str,
+        actions: list[str],
+        poll_results: list[int | None],
+    ) -> None:
+        super().__init__(name, actions)
+        self.poll_results = iter(poll_results)
+
+    def poll(self) -> int | None:
+        try:
+            self.returncode = next(self.poll_results)
+        except StopIteration:
+            pass
+        self.actions.append(f"poll:{self.name}:{self.returncode}")
+        return self.returncode
 
 
 class SignalRecorder:
@@ -107,6 +137,21 @@ def configure_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EXAMSAGE_AGENT_V2", "1")
     monkeypatch.setattr(launch_app, "allocate_loopback_port", lambda: 43123)
     monkeypatch.setattr(launch_app.secrets, "token_urlsafe", lambda size: TOKEN)
+
+
+def assert_exception_chain_excludes(error: BaseException, secret: str) -> None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        assert secret not in str(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
 
 
 def test_worker_token_is_in_environment_not_process_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -164,6 +209,82 @@ def test_readiness_timeout_is_actionable_and_does_not_echo_failure() -> None:
         )
 
     assert TOKEN not in str(error.value)
+    assert_exception_chain_excludes(error.value, TOKEN)
+
+
+def test_worker_exit_before_first_health_fails_without_starting_streamlit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_agent(monkeypatch)
+    actions: list[str] = []
+    commands: list[list[str]] = []
+
+    def popen(command: list[str], **kwargs: object) -> FakeProcess:
+        commands.append(command)
+        actions.append("start:worker")
+        return FakeProcess("worker", actions, wait_result=23, already_exited=True)
+
+    def readiness(url: str, *, worker_poll: Callable[[], int | None]) -> None:
+        def unexpected_health(url: str, timeout: float) -> object:
+            pytest.fail("health must not be requested after the Worker has exited")
+
+        wait_for_worker(
+            url,
+            timeout=10,
+            health_get=unexpected_health,
+            sleep=lambda seconds: actions.append("sleep"),
+            worker_poll=worker_poll,
+        )
+
+    with pytest.raises(RuntimeError, match=r"exited before becoming ready.*23") as error:
+        run_application(
+            popen=popen,
+            readiness=readiness,
+            pause_request=lambda url, token: actions.append("pause"),
+        )
+
+    assert_exception_chain_excludes(error.value, TOKEN)
+    assert len(commands) == 1
+    assert actions == ["start:worker", "pause"]
+
+
+def test_worker_exit_between_health_retries_fails_without_starting_streamlit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_agent(monkeypatch)
+    actions: list[str] = []
+    commands: list[list[str]] = []
+
+    def popen(command: list[str], **kwargs: object) -> FakeProcess:
+        commands.append(command)
+        actions.append("start:worker")
+        return SequencedPollProcess("worker", actions, [None, 17])
+
+    def readiness(url: str, *, worker_poll: Callable[[], int | None]) -> None:
+        def unavailable(url: str, timeout: float) -> object:
+            actions.append("health")
+            raise OSError(TOKEN)
+
+        wait_for_worker(
+            url,
+            timeout=10,
+            health_get=unavailable,
+            sleep=lambda seconds: actions.append("sleep"),
+            worker_poll=worker_poll,
+        )
+
+    with pytest.raises(RuntimeError, match=r"exited before becoming ready.*17") as error:
+        run_application(
+            popen=popen,
+            readiness=readiness,
+            pause_request=lambda url, token: actions.append("pause"),
+        )
+
+    assert_exception_chain_excludes(error.value, TOKEN)
+    assert len(commands) == 1
+    assert actions.index("health") < actions.index("sleep") < actions.index("poll:worker:17")
+    assert actions.index("pause") > actions.index("poll:worker:17")
+    assert "terminate:worker" not in actions
 
 
 def test_pause_request_uses_exact_token_on_authenticated_runtime_route(
@@ -238,7 +359,7 @@ def test_agent_waits_for_worker_then_starts_streamlit_and_pauses_before_cleanup(
 
     result = run_application(
         popen=popen,
-        readiness=lambda url: actions.append(f"ready:{url}"),
+        readiness=lambda url, *, worker_poll: actions.append(f"ready:{url}"),
         pause_request=lambda url, token: actions.append(f"pause:{url}:{token}"),
     )
 
@@ -259,22 +380,36 @@ def test_readiness_failure_cleans_worker_without_starting_streamlit(
     configure_agent(monkeypatch)
     actions: list[str] = []
     calls: list[list[str]] = []
+    health_calls = 0
 
     def popen(command: list[str], **kwargs: object) -> FakeProcess:
         calls.append(command)
         return FakeProcess("worker", actions)
 
-    def fail_readiness(url: str) -> None:
-        raise RuntimeError("Worker did not become ready within 15 seconds.")
+    def fail_readiness(url: str, *, worker_poll: Callable[[], int | None]) -> None:
+        def unavailable(url: str, timeout: float) -> object:
+            nonlocal health_calls
+            health_calls += 1
+            raise OSError(TOKEN)
 
-    with pytest.raises(RuntimeError, match="Worker did not become ready"):
+        wait_for_worker(
+            url,
+            timeout=0,
+            health_get=unavailable,
+            sleep=lambda seconds: None,
+            worker_poll=worker_poll,
+        )
+
+    with pytest.raises(RuntimeError, match="Worker did not become ready within 0 seconds") as error:
         run_application(
             popen=popen,
             readiness=fail_readiness,
             pause_request=lambda url, token: actions.append("pause"),
         )
 
+    assert_exception_chain_excludes(error.value, TOKEN)
     assert len(calls) == 1
+    assert health_calls == 1
     assert actions.index("pause") < actions.index("terminate:worker")
 
 
@@ -290,7 +425,7 @@ def test_keyboard_interrupt_returns_130_and_cleans_both_children(
 
     result = run_application(
         popen=popen,
-        readiness=lambda url: None,
+        readiness=lambda url, *, worker_poll: None,
         pause_request=lambda url, token: actions.append("pause"),
     )
 
@@ -312,7 +447,7 @@ def test_sigterm_handler_converts_shutdown_to_cleanup_and_is_restored(
         name = "worker" if "exam_predictor.worker.main" in command else "streamlit"
         return FakeProcess(name, actions)
 
-    def readiness(url: str) -> None:
+    def readiness(url: str, *, worker_poll: Callable[[], int | None]) -> None:
         installed_handler = recorder.calls[0][1]
         installed_handler(signal.SIGTERM, None)
 
@@ -344,11 +479,12 @@ def test_child_start_failure_is_actionable_and_cleans_started_worker(
     with pytest.raises(RuntimeError, match=f"Could not start the local ExamSage {failure_target}") as error:
         run_application(
             popen=popen,
-            readiness=lambda url: None,
+            readiness=lambda url, *, worker_poll: None,
             pause_request=lambda url, token: actions.append("pause"),
         )
 
     assert TOKEN not in str(error.value)
+    assert_exception_chain_excludes(error.value, TOKEN)
     rendered_traceback = "".join(
         traceback.format_exception(type(error.value), error.value, error.value.__traceback__)
     )
@@ -376,7 +512,7 @@ def test_cleanup_escalates_after_bounded_wait_and_never_touches_exited_streamlit
 
     result = run_application(
         popen=popen,
-        readiness=lambda url: None,
+        readiness=lambda url, *, worker_poll: None,
         pause_request=lambda url, token: actions.append("pause"),
     )
 
@@ -403,12 +539,54 @@ def test_pause_failure_still_terminates_worker_and_does_not_leak_secret(
 
     result = run_application(
         popen=popen,
-        readiness=lambda url: None,
+        readiness=lambda url, *, worker_poll: None,
         pause_request=pause_request,
     )
 
     assert result.exit_code == 0
     assert actions.index("pause") < actions.index("terminate:worker")
+
+
+def test_cleanup_failures_do_not_skip_other_child_or_signal_restoration(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_agent(monkeypatch)
+    recorder = SignalRecorder()
+    monkeypatch.setattr(launch_app.signal, "getsignal", recorder.getsignal)
+    monkeypatch.setattr(launch_app.signal, "signal", recorder.signal)
+    actions: list[str] = []
+
+    def popen(command: list[str], **kwargs: object) -> FakeProcess:
+        name = "worker" if "exam_predictor.worker.main" in command else "streamlit"
+        if name == "worker":
+            return FakeProcess(
+                name,
+                actions,
+                stubborn=True,
+                wait_after_kill_error=OSError(TOKEN),
+            )
+        return FakeProcess(
+            name,
+            actions,
+            wait_interrupt=True,
+            terminate_error=OSError(TOKEN),
+        )
+
+    result = run_application(
+        popen=popen,
+        readiness=lambda url, *, worker_poll: None,
+        pause_request=lambda url, token: actions.append("pause"),
+    )
+
+    assert result.exit_code == 130
+    assert actions.index("pause") < actions.index("terminate:worker")
+    assert "terminate:streamlit" in actions
+    assert "kill:worker" in actions
+    assert recorder.calls[-1] == (signal.SIGTERM, recorder.previous)
+    captured = capsys.readouterr()
+    assert TOKEN not in captured.out
+    assert TOKEN not in captured.err
 
 
 def test_worker_creation_flag_is_windows_only_and_streamlit_stays_console_attached(
@@ -423,7 +601,11 @@ def test_worker_creation_flag_is_windows_only_and_streamlit_stays_console_attach
         name = "worker" if "exam_predictor.worker.main" in command else "streamlit"
         return FakeProcess(name, [])
 
-    run_application(popen=popen, readiness=lambda url: None, pause_request=lambda url, token: None)
+    run_application(
+        popen=popen,
+        readiness=lambda url, *, worker_poll: None,
+        pause_request=lambda url, token: None,
+    )
 
     assert calls[0][1]["creationflags"] == subprocess.CREATE_NO_WINDOW
     assert "creationflags" not in calls[1][1]
@@ -443,7 +625,11 @@ def test_non_windows_processes_receive_no_windows_creation_flags(
         name = "worker" if "exam_predictor.worker.main" in command else "streamlit"
         return FakeProcess(name, [])
 
-    run_application(popen=popen, readiness=lambda url: None, pause_request=lambda url, token: None)
+    run_application(
+        popen=popen,
+        readiness=lambda url, *, worker_poll: None,
+        pause_request=lambda url, token: None,
+    )
 
     assert all("creationflags" not in kwargs for kwargs in calls)
 

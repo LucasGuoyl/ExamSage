@@ -9,7 +9,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 import httpx
 
@@ -20,6 +20,15 @@ class LauncherResult:
     streamlit_started: bool
     exit_code: int
     commands: list[list[str]] = field(default_factory=list)
+
+
+class ReadinessCheck(Protocol):
+    def __call__(
+        self,
+        worker_url: str,
+        *,
+        worker_poll: Callable[[], int | None] | None = None,
+    ) -> None: ...
 
 
 def worker_command(python: str, port: int) -> list[str]:
@@ -60,9 +69,17 @@ def wait_for_worker(
     timeout: float = 15.0,
     health_get: Callable[..., object] = httpx.get,
     sleep: Callable[[float], None] = time.sleep,
+    worker_poll: Callable[[], int | None] | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout
     while True:
+        if worker_poll is not None:
+            exit_code = worker_poll()
+            if exit_code is not None:
+                raise RuntimeError(
+                    "The local ExamSage Agent Worker exited before becoming ready "
+                    f"(exit code {exit_code})."
+                )
         try:
             response = health_get(f"{worker_url}/health", timeout=1.0)
             if getattr(response, "status_code", 0) == 200:
@@ -85,20 +102,30 @@ def request_pause(worker_url: str, token: str) -> None:
 
 
 def terminate_child(process: subprocess.Popen[bytes] | None) -> None:
-    if process is None or process.poll() is not None:
+    if process is None:
         return
+    try:
+        if process.poll() is not None:
+            return
+    except BaseException:
+        pass
     try:
         process.terminate()
-    except ProcessLookupError:
+    except BaseException:
+        pass
+    try:
+        process.wait(timeout=3.0)
+        return
+    except BaseException:
+        pass
+    try:
+        process.kill()
+    except BaseException:
         return
     try:
         process.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            return
-        process.wait(timeout=3.0)
+    except BaseException:
+        pass
 
 
 def _cleanup_children(
@@ -123,7 +150,7 @@ def _cleanup_children(
 def run_application(
     *,
     popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
-    readiness: Callable[[str], None] = wait_for_worker,
+    readiness: ReadinessCheck = wait_for_worker,
     pause_request: Callable[[str, str], None] = request_pause,
 ) -> LauncherResult:
     project_root = Path(__file__).resolve().parents[1]
@@ -144,10 +171,13 @@ def run_application(
         if not agent_mode:
             streamlit = streamlit_command(python)
             commands.append(streamlit)
+            start_failed = False
             try:
                 streamlit_process = popen(streamlit, cwd=project_root, env=os.environ.copy())
             except OSError:
-                raise RuntimeError("Could not start the local ExamSage streamlit process.") from None
+                start_failed = True
+            if start_failed:
+                raise RuntimeError("Could not start the local ExamSage streamlit process.")
             try:
                 exit_code = int(streamlit_process.wait())
             except KeyboardInterrupt:
@@ -166,19 +196,25 @@ def run_application(
         worker_options: dict[str, object] = {"cwd": project_root, "env": environment}
         if sys.platform == "win32":
             worker_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        start_failed = False
         try:
             worker_process = popen(worker, **worker_options)
         except OSError:
-            raise RuntimeError("Could not start the local ExamSage worker process.") from None
+            start_failed = True
+        if start_failed:
+            raise RuntimeError("Could not start the local ExamSage worker process.")
 
-        readiness(worker_url)
+        readiness(worker_url, worker_poll=worker_process.poll)
 
         streamlit = streamlit_command(python)
         commands.append(streamlit)
+        start_failed = False
         try:
             streamlit_process = popen(streamlit, cwd=project_root, env=environment)
         except OSError:
-            raise RuntimeError("Could not start the local ExamSage streamlit process.") from None
+            start_failed = True
+        if start_failed:
+            raise RuntimeError("Could not start the local ExamSage streamlit process.")
         try:
             exit_code = int(streamlit_process.wait())
         except KeyboardInterrupt:
@@ -187,15 +223,17 @@ def run_application(
     except KeyboardInterrupt:
         return LauncherResult(worker_process is not None, streamlit_process is not None, 130, commands)
     finally:
-        if agent_mode:
-            _cleanup_children(
-                worker_process=worker_process,
-                streamlit_process=streamlit_process,
-                worker_url=worker_url,
-                token=token,
-                pause_request=pause_request,
-            )
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        try:
+            if agent_mode:
+                _cleanup_children(
+                    worker_process=worker_process,
+                    streamlit_process=streamlit_process,
+                    worker_url=worker_url,
+                    token=token,
+                    pause_request=pause_request,
+                )
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def main() -> None:
