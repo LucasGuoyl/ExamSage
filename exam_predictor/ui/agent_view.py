@@ -133,10 +133,10 @@ def _render_run_activity(run_id: str) -> None:
             st.rerun()
         if answer_committed:
             st.rerun()
-    except WorkerClientError as exc:
+    except WorkerClientError:
         st.session_state.pop("agent_provider", None)
         st.error(
-            f"Worker unavailable: {_safe_error(exc)}. "
+            "Worker unavailable: The local Agent Worker request failed. "
             "Restart ExamSage with the launcher."
         )
     finally:

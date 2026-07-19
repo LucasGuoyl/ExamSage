@@ -299,13 +299,16 @@ def test_failed_reconnect_removes_prior_provider_and_blocks_submission(monkeypat
 
 def test_fragment_worker_loss_clears_stale_provider_without_leaking_secrets(monkeypatch):
     fake = FakeWorkerClient()
-    fake.events_error = WorkerClientError("local-worker-token disconnected")
+    fake.events_error = WorkerClientError(
+        "provider-api-secret local-worker-token disconnected"
+    )
     monkeypatch.setattr(agent_view, "_new_client", lambda: fake)
     monkeypatch.setenv("EXAMSAGE_WORKER_TOKEN", "local-worker-token")
 
     app = AppTest.from_string(VIEW_SCRIPT)
     app.session_state["agent_messages"] = []
     app.session_state["agent_active_run_id"] = "run-1"
+    app.session_state["agent_provider_key"] = "provider-api-secret"
     app.session_state["agent_provider"] = {
         "profile": {"profile_id": "primary", "provider": "gemini"},
         "capabilities": {"chat": True},
@@ -313,6 +316,7 @@ def test_fragment_worker_loss_clears_stale_provider_without_leaking_secrets(monk
     app.run()
 
     assert "agent_provider" not in app.session_state
+    assert app.session_state["agent_provider_key"] == "provider-api-secret"
     assert app.session_state["agent_messages"] == []
     visible_errors = " ".join(item.value for item in app.error)
     assert "Worker unavailable" in visible_errors
