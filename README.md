@@ -89,6 +89,28 @@ In agent terminology:
 
 ExamSage is an agent because it follows a conditional multi-step workflow, uses tools, maintains course state, and can continue acting in response to student questions. It is not just a single prompt.
 
+## Agent kernel alpha
+
+The LangGraph Agent route is a hidden internal alpha and remains disabled by default. Developers can
+enable it with `EXAMSAGE_AGENT_V2=1`; the standard launchers then start Streamlit and an authenticated
+local Worker, with the Worker bound only to `127.0.0.1`. The legacy build flow remains the default, and
+its cost-estimate and build controls apply only to that legacy route.
+
+The kernel demonstrates provider-backed planning that selects one bounded kernel tool, durable ordered
+activity events and answers, a globally serialized message queue, cooperative Stop at safe graph
+boundaries, SQLite checkpoints, and explicit Resume. Provider sessions stay in memory: after a restart,
+reconnect the provider before resuming paused work. On startup, unfinished `running` or `stopping`
+metadata is recovered as `paused` so work never resumes implicitly.
+
+Launcher shutdown requests a safe pause before terminating its child processes, but it does not wait for
+a new checkpoint to be durably written before termination. Resume therefore continues from the latest
+durable graph boundary.
+
+This alpha does not yet include course-folder selection, complete file manifests, approval before
+transmission, multimodal evidence extraction, grounded web research, adaptive practice, an operating-
+system credential vault, or the final three-pane interface. Those capabilities remain future
+implementation subprojects.
+
 ## Scoring and question allocation
 
 The relative focus score combines:
@@ -154,9 +176,13 @@ The estimate is not an invoice. Visual page density, model output length, retrie
 
 ```bash
 python -m pip install -r requirements-dev.txt
-pytest
-ruff check exam_predictor tests app.py
+python -m pytest
+python -m ruff check exam_predictor tests scripts app.py
+python -m compileall -q exam_predictor scripts app.py
 ```
+
+The automated Agent-kernel acceptance test uses a complete fake provider at the provider boundary. It
+does not use a real API key, contact a provider, open a browser, or launch application child processes.
 
 Key modules:
 

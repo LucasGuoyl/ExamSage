@@ -25,6 +25,25 @@ Controls include:
 - direct official SDK connections and `store: false`/best-effort deletion controls;
 - user-confirmed cost ceilings before work begins.
 
+## Local Agent Worker threat model
+
+The hidden Agent Worker's HTTP server binds only to `127.0.0.1`. Every `/v1/*` route requires a
+cryptographically random, per-launch `X-ExamSage-Token`; `/health` is the only unauthenticated route and
+exposes readiness only. The launcher passes the token through the child-process environment, never as a
+command-line argument.
+
+On launcher exit, ExamSage requests pause before terminating the Streamlit and Worker child processes.
+That supervisor sequence does not wait for a newly durable checkpoint before termination. Stop requests
+are cooperative and are observed at safe graph boundaries; on the next Worker start, unfinished
+`running` or `stopping` metadata is recovered to `paused`, and Resume continues from the latest durable
+checkpoint only after the provider is reconnected.
+
+SQLite checkpoints contain JSON-safe conversation and tool state, but never SDK clients, credentials,
+locks, file handles, or exception objects. The run and event database likewise excludes credentials.
+Anyone with access to the local operating-system account may still read study content in the application
+data directory, so account access controls, permissions, backups, and disk encryption remain part of the
+security boundary.
+
 ## Important residual risks
 
 - A public hostname can resolve to a private IP after validation. ExamSage currently uses provider-native search rather than locally fetching arbitrary URLs, reducing but not eliminating provider-side URL risks.

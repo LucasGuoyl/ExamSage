@@ -16,6 +16,19 @@ ExamSage is a local application, not a hosted service. The project maintainers d
 
 The API key is stored in Streamlit session memory only. It is not placed in SQLite, normalized course files, reports, logs, exports, or backups. Closing the app/session requires entering it again.
 
+## Agent kernel alpha credentials and local processes
+
+In the hidden Agent route, Streamlit sends the provider API key once to the local Worker over an
+authenticated loopback request. The Worker keeps the key only in its process-memory provider session;
+it is excluded from LangGraph state, checkpoints, run and event databases, logs, exceptions, HTTP
+responses, and Git artifacts. The Worker accepts Agent API requests only on `127.0.0.1`, using a random
+per-launch token shared with the Streamlit child process through their environment.
+
+Closing ExamSage terminates these local child processes and clears the in-memory provider session. Until
+an operating-system credential vault is added in a future subproject, restart the launcher, reconnect the
+provider, and then select Resume for paused work. The automated acceptance test uses a fake provider and
+a test-only credential; it never reads or sends a real provider key.
+
 ## Provider processing
 
 The selected provider receives the uploaded data and user prompts. Its privacy, retention, safety-monitoring, regional-processing, and billing policies apply. OpenAI requests set `store: false` where supported. Gemini temporary files are deleted immediately after analysis on a best-effort basis; provider-side operational retention may still apply.
