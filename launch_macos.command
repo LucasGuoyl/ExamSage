@@ -24,4 +24,4 @@ echo "Installing or updating ExamSage..."
 ".venv/bin/python" -m pip install -r requirements.txt
 
 echo "Opening ExamSage in your browser..."
-".venv/bin/python" -m streamlit run app.py
+".venv/bin/python" scripts/launch_app.py

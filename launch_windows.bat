@@ -32,7 +32,7 @@ echo Installing or updating ExamSage...
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt || goto :error
 
 echo Opening ExamSage in your browser...
-".venv\Scripts\python.exe" -m streamlit run app.py
+".venv\Scripts\python.exe" scripts\launch_app.py
 exit /b 0
 
 :error
