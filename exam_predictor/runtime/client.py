@@ -40,6 +40,7 @@ class WorkerClient:
         self._client = httpx.Client(
             headers={"X-ExamSage-Token": token},
             timeout=httpx.Timeout(60.0, connect=10.0),
+            follow_redirects=False,
             transport=transport,
         )
 
@@ -49,7 +50,10 @@ class WorkerClient:
             parsed = urlsplit(base_url)
             port = parsed.port
         except (TypeError, ValueError):
-            raise WorkerClientError(_SAFE_URL_ERROR) from None
+            parsed = None
+            port = None
+        if parsed is None:
+            raise WorkerClientError(_SAFE_URL_ERROR)
         valid = (
             parsed.scheme == "http"
             and parsed.hostname == "127.0.0.1"
@@ -99,9 +103,12 @@ class WorkerClient:
     @staticmethod
     def _model(response: httpx.Response, model: type[ModelT]) -> ModelT:
         try:
-            return model.model_validate(response.json())
+            parsed = model.model_validate(response.json())
         except (TypeError, ValueError, ValidationError):
-            raise WorkerClientError("Agent Worker returned an invalid response.") from None
+            parsed = None
+        if parsed is None:
+            raise WorkerClientError("Agent Worker returned an invalid response.")
+        return parsed
 
     def health(self) -> HealthResponse:
         return self._model(self._request("GET", "/health"), HealthResponse)
@@ -141,9 +148,12 @@ class WorkerClient:
             params={"after": after},
         )
         try:
-            return TypeAdapter(list[AgentEvent]).validate_python(response.json())
+            events = TypeAdapter(list[AgentEvent]).validate_python(response.json())
         except (TypeError, ValueError, ValidationError):
-            raise WorkerClientError("Agent Worker returned an invalid response.") from None
+            events = None
+        if events is None:
+            raise WorkerClientError("Agent Worker returned an invalid response.")
+        return events
 
     def stop(self, run_id: str) -> RunSnapshot:
         response = self._request("POST", f"/v1/runs/{quote(run_id, safe='')}/stop")

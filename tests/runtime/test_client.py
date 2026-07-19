@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
+from exam_predictor.runtime import client as client_module
 from exam_predictor.runtime.client import WorkerClient, WorkerClientError
 from exam_predictor.runtime.models import (
     ConnectProviderRequest,
@@ -17,6 +18,30 @@ from exam_predictor.runtime.models import (
 NOW = datetime.now(timezone.utc).isoformat()
 WORKER_TOKEN = "local-worker-token"
 PROVIDER_SECRET = "provider-api-secret"
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return chain
+
+
+def _assert_exception_chain_is_secret_safe(error: BaseException) -> None:
+    for linked_error in _exception_chain(error):
+        message = str(linked_error)
+        assert PROVIDER_SECRET not in message
+        assert WORKER_TOKEN not in message
 
 
 def _run_json(status: str) -> dict[str, str]:
@@ -151,6 +176,15 @@ def test_client_rejects_unsafe_worker_urls_before_transport_use(base_url: str):
     assert WORKER_TOKEN not in str(captured.value)
 
 
+def test_malformed_worker_url_exception_chain_omits_all_secrets():
+    base_url = f"http://127.0.0.1:{PROVIDER_SECRET}-{WORKER_TOKEN}"
+
+    with pytest.raises(WorkerClientError) as captured:
+        WorkerClient(base_url, WORKER_TOKEN)
+
+    _assert_exception_chain_is_secret_safe(captured.value)
+
+
 @pytest.mark.parametrize("token", ["", " ", "\t"])
 def test_client_rejects_empty_worker_token_without_echoing_it(token: str):
     with pytest.raises(WorkerClientError, match="Worker authentication is unavailable"):
@@ -195,10 +229,108 @@ def test_client_errors_never_expose_worker_or_provider_secrets(failure_kind: str
     finally:
         client.close()
 
-    message = str(captured.value)
-    assert PROVIDER_SECRET not in message
-    assert WORKER_TOKEN not in message
-    assert message
+    _assert_exception_chain_is_secret_safe(captured.value)
+    assert str(captured.value)
+
+
+@pytest.mark.parametrize("failure_kind", ["invalid-json", "invalid-model"])
+@pytest.mark.parametrize("contract", ["provider", "events"])
+def test_invalid_response_exception_chains_omit_all_secrets(
+    failure_kind: str,
+    contract: str,
+):
+    def reject(_request: httpx.Request) -> httpx.Response:
+        if failure_kind == "invalid-json":
+            return httpx.Response(
+                200,
+                text=f"not-json {PROVIDER_SECRET} {WORKER_TOKEN}",
+            )
+        if contract == "provider":
+            return httpx.Response(
+                200,
+                json={
+                    "profile": {
+                        "profile_id": WORKER_TOKEN,
+                        "provider": PROVIDER_SECRET,
+                    },
+                    "capabilities": {"chat": True},
+                },
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "sequence": PROVIDER_SECRET,
+                    "run_id": WORKER_TOKEN,
+                    "event_type": "message",
+                    "stage": "answer",
+                    "message": "unsafe",
+                    "payload": {},
+                    "created_at": NOW,
+                }
+            ],
+        )
+
+    client = WorkerClient(
+        "http://127.0.0.1:8765",
+        WORKER_TOKEN,
+        transport=httpx.MockTransport(reject),
+    )
+    provider_request = ConnectProviderRequest(
+        profile=ProviderProfile(profile_id="primary", provider="gemini"),
+        api_key=PROVIDER_SECRET,
+    )
+    try:
+        with pytest.raises(WorkerClientError) as captured:
+            if contract == "provider":
+                client.connect_provider(provider_request)
+            else:
+                client.events_after("run-1")
+    finally:
+        client.close()
+
+    _assert_exception_chain_is_secret_safe(captured.value)
+
+
+def test_client_explicitly_refuses_redirects_without_requesting_target(monkeypatch):
+    real_client = httpx.Client
+    seen_paths: list[str] = []
+
+    def client_with_redirecting_default(*args, **kwargs):
+        kwargs.setdefault("follow_redirects", True)
+        return real_client(*args, **kwargs)
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        if request.url.path == "/v1/providers/connect":
+            return httpx.Response(
+                307,
+                headers={"Location": "/redirect-target"},
+                text=f"{PROVIDER_SECRET} {WORKER_TOKEN}",
+            )
+        return httpx.Response(
+            400,
+            text=f"redirected {PROVIDER_SECRET} {WORKER_TOKEN}",
+        )
+
+    monkeypatch.setattr(client_module.httpx, "Client", client_with_redirecting_default)
+    client = WorkerClient(
+        "http://127.0.0.1:8765",
+        WORKER_TOKEN,
+        transport=httpx.MockTransport(redirect),
+    )
+    request = ConnectProviderRequest(
+        profile=ProviderProfile(profile_id="primary", provider="gemini"),
+        api_key=PROVIDER_SECRET,
+    )
+    try:
+        with pytest.raises(WorkerClientError) as captured:
+            client.connect_provider(request)
+    finally:
+        client.close()
+
+    assert seen_paths == ["/v1/providers/connect"]
+    _assert_exception_chain_is_secret_safe(captured.value)
 
 
 def test_closed_client_fails_with_stable_error():

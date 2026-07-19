@@ -77,13 +77,13 @@ def _new_client() -> WorkerClient:
     return WorkerClient(url, token)
 
 
-def _check_worker() -> str | None:
+def _check_worker(*extra_secrets: str) -> str | None:
     client: WorkerClient | None = None
     try:
         client = _new_client()
         client.health()
     except WorkerClientError as exc:
-        return _safe_error(exc)
+        return _safe_error(exc, *extra_secrets)
     finally:
         if client is not None:
             client.close()
@@ -100,12 +100,13 @@ def _render_run_activity(run_id: str) -> None:
         events = client.events_after(run_id, after=state.last_sequence)
         snapshot = client.get_run(run_id)
         reduce_agent_events(state, events)
+        answer_committed = False
         if state.answer and not state.answer_committed:
             st.session_state.agent_messages.append(
                 {"role": "assistant", "content": state.answer}
             )
             state.answer_committed = True
-            st.rerun()
+            answer_committed = True
         with st.status(
             f"Agent: {snapshot.status.value}",
             expanded=not snapshot.status.is_settled,
@@ -127,7 +128,13 @@ def _render_run_activity(run_id: str) -> None:
                 state.paused = False
                 state.failed = False
                 st.rerun()
+        if snapshot.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            st.session_state.pop("agent_active_run_id", None)
+            st.rerun()
+        if answer_committed:
+            st.rerun()
     except WorkerClientError as exc:
+        st.session_state.pop("agent_provider", None)
         st.error(
             f"Worker unavailable: {_safe_error(exc)}. "
             "Restart ExamSage with the launcher."
@@ -146,8 +153,11 @@ def render_agent_kernel() -> None:
         "Agent kernel alpha · chat, tool activity, Stop, checkpoints and Resume"
     )
 
-    unavailable = _check_worker()
+    provider_key = st.session_state.get("agent_provider_key", "")
+    unavailable = _check_worker(provider_key)
     if unavailable:
+        st.session_state["agent_provider_key"] = ""
+        st.session_state.pop("agent_provider", None)
         st.error(
             f"Worker unavailable: {unavailable}. Restart ExamSage with the launcher."
         )
@@ -179,6 +189,7 @@ def render_agent_kernel() -> None:
             key="agent_provider_key",
         )
         if st.button("Connect", type="primary"):
+            st.session_state.pop("agent_provider", None)
             client: WorkerClient | None = None
             try:
                 request = ConnectProviderRequest(
@@ -214,8 +225,8 @@ def render_agent_kernel() -> None:
     if run_id:
         _render_run_activity(run_id)
 
-    prompt = st.chat_input("Message ExamSage…")
-    if not prompt:
+    prompt = st.chat_input("Message ExamSage…", disabled=bool(run_id))
+    if not prompt or run_id:
         return
     if "agent_provider" not in st.session_state:
         st.warning("Connect one provider before sending a message.")
