@@ -1,6 +1,6 @@
 # ExamSage Secure Course Workspace Design
 
-- Status: Approved interactive design; pending written-spec review
+- Status: Approved
 - Date: 2026-07-21
 - Product: ExamSage 0.5 development line
 - Subproject: 2 of 6 — Secure course workspace
