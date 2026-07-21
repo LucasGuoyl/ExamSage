@@ -19,6 +19,8 @@ pypdf>=6.0,<7
 python-pptx>=1.0,<2
 
 # Local web UI and exports
-streamlit>=1.40,<2
+streamlit>=1.49,<2
 pandas>=2.2,<3
 reportlab>=4.2,<5
+keyring>=25.7,<26
+python-multipart>=0.0.32,<0.1
