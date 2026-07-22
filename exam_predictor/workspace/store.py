@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -143,6 +144,87 @@ _SCHEMA = (
       ON workspace_events(job_id, sequence)""",
 )
 
+_BLOCKED_JOB_WORKSPACE_STATES = {
+    WorkspaceState.DELETING,
+    WorkspaceState.CLEANUP_PENDING,
+}
+_TERMINAL_JOB_STATUSES = {
+    WorkspaceJobStatus.SUCCEEDED,
+    WorkspaceJobStatus.FAILED,
+    WorkspaceJobStatus.CANCELLED,
+}
+_ALLOWED_JOB_TRANSITIONS = {
+    WorkspaceJobStatus.QUEUED: {
+        WorkspaceJobStatus.RUNNING,
+        WorkspaceJobStatus.FAILED,
+        WorkspaceJobStatus.CANCELLED,
+    },
+    WorkspaceJobStatus.RUNNING: {
+        WorkspaceJobStatus.SUCCEEDED,
+        WorkspaceJobStatus.FAILED,
+        WorkspaceJobStatus.CANCELLED,
+    },
+    WorkspaceJobStatus.SUCCEEDED: set(),
+    WorkspaceJobStatus.FAILED: set(),
+    WorkspaceJobStatus.CANCELLED: set(),
+}
+_EVENT_RULES = {
+    "queued": ("Workspace operation queued.", frozenset(), frozenset()),
+    "started": ("Workspace scan started.", frozenset(), frozenset()),
+    "scan_progress": (
+        "Scanning course files.",
+        frozenset(
+            {
+                "bytes_hashed",
+                "current_relative_path",
+                "discovered_count",
+                "failure_count",
+            }
+        ),
+        frozenset(
+            {
+                "bytes_hashed",
+                "current_relative_path",
+                "discovered_count",
+                "failure_count",
+            }
+        ),
+    ),
+    "approval_required": (
+        "Scan complete. Review the selected course files.",
+        frozenset(
+            {"bytes_hashed", "discovered_count", "failure_count", "revision_id"}
+        ),
+        frozenset(
+            {"bytes_hashed", "discovered_count", "failure_count", "revision_id"}
+        ),
+    ),
+    "succeeded": (
+        "Workspace operation completed.",
+        frozenset({"revision_id"}),
+        frozenset(),
+    ),
+    "failed": (
+        "Workspace scan failed.",
+        frozenset({"safe_error_code"}),
+        frozenset({"safe_error_code"}),
+    ),
+    "cancelled": (
+        "Workspace operation cancelled.",
+        frozenset({"safe_error_code"}),
+        frozenset(),
+    ),
+}
+_STATUS_EVENTS = {
+    WorkspaceJobStatus.RUNNING: {"started"},
+    WorkspaceJobStatus.SUCCEEDED: {"approval_required", "succeeded"},
+    WorkspaceJobStatus.FAILED: {"failed"},
+    WorkspaceJobStatus.CANCELLED: {"cancelled"},
+}
+_SAFE_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,119}$")
+_SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_SECRET_KEY_PARTS = ("api_key", "credential", "password", "secret", "token")
+
 
 class WorkspaceStore:
     def __init__(self, database_path: Path) -> None:
@@ -194,6 +276,32 @@ class WorkspaceStore:
                 for statement in _SCHEMA:
                     connection.execute(statement)
                 connection.execute("PRAGMA user_version=1")
+            connection.execute(
+                """WITH ranked AS (
+                       SELECT revisions.rowid AS revision_rowid,
+                              ROW_NUMBER() OVER (
+                                PARTITION BY revisions.scan_job_id
+                                ORDER BY
+                                  CASE WHEN EXISTS (
+                                    SELECT 1 FROM workspaces
+                                    WHERE current_draft_revision_id = revisions.revision_id
+                                       OR current_approved_revision_id = revisions.revision_id
+                                  ) THEN 0 ELSE 1 END,
+                                  revisions.created_at DESC,
+                                  revisions.rowid DESC
+                              ) AS replay_rank
+                       FROM manifest_revisions AS revisions
+                       WHERE revisions.scan_job_id IS NOT NULL
+                   )
+                   UPDATE manifest_revisions SET scan_job_id = NULL
+                   WHERE rowid IN (
+                     SELECT revision_rowid FROM ranked WHERE replay_rank > 1
+                   )"""
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_manifest_revisions_scan_job
+                   ON manifest_revisions(scan_job_id) WHERE scan_job_id IS NOT NULL"""
+            )
 
     @staticmethod
     def _now() -> datetime:
@@ -216,6 +324,52 @@ class WorkspaceStore:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    @staticmethod
+    def _safe_code(value: str) -> str:
+        if not _SAFE_CODE_PATTERN.fullmatch(value):
+            raise ValueError("safe_error_code must be a bounded stable code")
+        return value
+
+    @classmethod
+    def _validated_event_payload(
+        cls, event_type: str, message: str, payload: object
+    ) -> dict[str, str | int | float | bool | None]:
+        rule = _EVENT_RULES.get(event_type)
+        if rule is None:
+            raise ValueError("workspace event type is not allowed")
+        expected_message, allowed_keys, required_keys = rule
+        if message != expected_message:
+            raise ValueError("workspace event message is not allowed")
+        if not isinstance(payload, dict):
+            raise ValueError("workspace event payload must be an object")
+        keys = set(payload)
+        if any(part in key.casefold() for key in keys for part in _SECRET_KEY_PARTS):
+            raise ValueError("workspace event payload contains a secret-shaped key")
+        if not required_keys <= keys or not keys <= allowed_keys:
+            raise ValueError("workspace event payload keys are not allowed")
+        for key in {"bytes_hashed", "discovered_count", "failure_count"} & keys:
+            value = payload[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"workspace event {key} must be a nonnegative integer")
+        if "current_relative_path" in keys:
+            value = payload["current_relative_path"]
+            if value is not None:
+                if not isinstance(value, str):
+                    raise ValueError("workspace event path must be text")
+                normalized = normalize_relative_path(value)
+                if normalized != value or len(normalized) > 1_024:
+                    raise ValueError("workspace event path must be bounded and normalized")
+        if "safe_error_code" in keys:
+            value = payload["safe_error_code"]
+            if not isinstance(value, str):
+                raise ValueError("workspace event safe_error_code must be text")
+            cls._safe_code(value)
+        if "revision_id" in keys:
+            value = payload["revision_id"]
+            if not isinstance(value, str) or not _SAFE_ID_PATTERN.fullmatch(value):
+                raise ValueError("workspace event revision_id must be a bounded identifier")
+        return payload
 
     @staticmethod
     def _workspace(row: sqlite3.Row) -> WorkspaceRecord:
@@ -294,6 +448,7 @@ class WorkspaceStore:
         payload: object,
         created_at: datetime,
     ) -> WorkspaceEvent:
+        validated_payload = cls._validated_event_payload(event_type, message, payload)
         cursor = connection.execute(
             """INSERT INTO workspace_events(
                    job_id, event_type, message, payload_json, created_at
@@ -302,7 +457,7 @@ class WorkspaceStore:
                 job_id,
                 event_type,
                 message,
-                cls._canonical_json(payload),
+                cls._canonical_json(validated_payload),
                 cls._timestamp(created_at),
             ),
         )
@@ -331,6 +486,23 @@ class WorkspaceStore:
             raise WorkspaceJobNotFoundError(f"Workspace job '{job_id}' was not found.")
         return row
 
+    @staticmethod
+    def _guard_workspace_accepts_jobs(workspace: sqlite3.Row) -> None:
+        state = WorkspaceState(workspace["state"])
+        if state in _BLOCKED_JOB_WORKSPACE_STATES:
+            raise ActiveWorkspaceOperationError(
+                f"Workspace '{workspace['workspace_id']}' cannot accept jobs while {state.value}."
+            )
+
+    @staticmethod
+    def _guard_job_transition(
+        current: WorkspaceJobStatus, requested: WorkspaceJobStatus
+    ) -> None:
+        if requested not in _ALLOWED_JOB_TRANSITIONS[current]:
+            raise ActiveWorkspaceOperationError(
+                f"Workspace job transition '{current.value}' to '{requested.value}' is not allowed."
+            )
+
     def _revision(
         self, connection: sqlite3.Connection, workspace_id: str, revision_id: str
     ) -> ManifestRevision:
@@ -353,6 +525,31 @@ class WorkspaceStore:
         item = dict(row)
         item["entries"] = tuple(self._entry(entry, workspace_id) for entry in entries)
         return ManifestRevision.model_validate(item)
+
+    def _clone_revision(
+        self,
+        connection: sqlite3.Connection,
+        source: ManifestRevision,
+        revision_id: str,
+        created_at: datetime,
+        transform: Callable[[ManifestEntry], ManifestEntry],
+    ) -> ManifestRevision:
+        connection.execute(
+            """INSERT INTO manifest_revisions(
+                   revision_id, workspace_id, parent_revision_id, scan_job_id,
+                   policy_version, created_at
+               ) VALUES (?, ?, ?, NULL, ?, ?)""",
+            (
+                revision_id,
+                source.workspace_id,
+                source.revision_id,
+                source.policy_version,
+                self._timestamp(created_at),
+            ),
+        )
+        for item in source.entries:
+            self._insert_entry(connection, revision_id, transform(item))
+        return self._revision(connection, source.workspace_id, revision_id)
 
     def create_workspace(self, workspace: WorkspaceRecord) -> WorkspaceRecord:
         with self._transaction() as connection:
@@ -435,7 +632,6 @@ class WorkspaceStore:
     ) -> ManifestRevision:
         if result.workspace_id != workspace_id:
             raise ValueError("scan result workspace does not match")
-        revision_id = uuid4().hex
         with self._transaction() as connection:
             workspace = self._workspace_row(connection, workspace_id)
             job_row = self._job_row(connection, job_id)
@@ -443,6 +639,49 @@ class WorkspaceStore:
                 raise WorkspaceJobNotFoundError(
                     f"Workspace job '{job_id}' does not belong to workspace '{workspace_id}'."
                 )
+            existing = connection.execute(
+                """SELECT revision_id FROM manifest_revisions
+                   WHERE workspace_id = ? AND scan_job_id = ?""",
+                (workspace_id, job_id),
+            ).fetchone()
+            if existing is not None:
+                return self._revision(connection, workspace_id, existing["revision_id"])
+            if WorkspaceJobStatus(job_row["status"]) is not WorkspaceJobStatus.RUNNING:
+                raise ActiveWorkspaceOperationError(
+                    f"Workspace job '{job_id}' is not running."
+                )
+            self._guard_workspace_accepts_jobs(workspace)
+            job_order = connection.execute(
+                "SELECT rowid, created_at FROM workspace_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if job_order is None:
+                raise WorkspaceJobNotFoundError(
+                    f"Workspace job '{job_id}' was not found."
+                )
+            newer_commit = connection.execute(
+                """SELECT 1
+                   FROM manifest_revisions AS revisions
+                   JOIN workspace_jobs AS committed
+                     ON committed.job_id = revisions.scan_job_id
+                   WHERE revisions.workspace_id = ?
+                     AND (
+                       committed.created_at > ?
+                       OR (committed.created_at = ? AND committed.rowid > ?)
+                     )
+                   LIMIT 1""",
+                (
+                    workspace_id,
+                    job_order["created_at"],
+                    job_order["created_at"],
+                    job_order["rowid"],
+                ),
+            ).fetchone()
+            if newer_commit is not None:
+                raise StaleManifestError(
+                    f"Workspace job '{job_id}' completed after a newer scan."
+                )
+            revision_id = uuid4().hex
             connection.execute(
                 """INSERT INTO manifest_revisions(
                        revision_id, workspace_id, parent_revision_id, scan_job_id,
@@ -539,26 +778,17 @@ class WorkspaceStore:
                 raise ManifestNotFoundError(
                     f"Manifest entries were not found: {', '.join(sorted(missing))}."
                 )
-            connection.execute(
-                """INSERT INTO manifest_revisions(
-                       revision_id, workspace_id, parent_revision_id, scan_job_id,
-                       policy_version, created_at
-                   ) VALUES (?, ?, ?, NULL, ?, ?)""",
-                (
-                    new_revision_id,
-                    workspace_id,
-                    revision_id,
-                    current.policy_version,
-                    self._timestamp(now),
-                ),
-            )
-            for item in current.entries:
-                clone = (
+            self._clone_revision(
+                connection,
+                current,
+                new_revision_id,
+                now,
+                lambda item: (
                     item.model_copy(update={"included": included})
                     if item.entry_id in requested
                     else item
-                )
-                self._insert_entry(connection, new_revision_id, clone)
+                ),
+            )
             connection.execute(
                 """UPDATE workspaces
                    SET current_draft_revision_id = ?, state = ?, updated_at = ?
@@ -664,7 +894,8 @@ class WorkspaceStore:
 
     def create_job(self, job: WorkspaceJob, idempotency_key: str) -> WorkspaceJob:
         with self._transaction() as connection:
-            self._workspace_row(connection, job.workspace_id)
+            workspace = self._workspace_row(connection, job.workspace_id)
+            self._guard_workspace_accepts_jobs(workspace)
             existing = connection.execute(
                 """SELECT * FROM workspace_jobs
                    WHERE workspace_id = ? AND job_kind = ? AND idempotency_key = ?""",
@@ -700,6 +931,8 @@ class WorkspaceStore:
         now = self._now()
         with self._transaction() as connection:
             row = self._job_row(connection, job_id)
+            workspace = self._workspace_row(connection, row["workspace_id"])
+            self._guard_workspace_accepts_jobs(workspace)
             status = WorkspaceJobStatus(row["status"])
             if status is WorkspaceJobStatus.RUNNING:
                 return self._job(row)
@@ -757,9 +990,16 @@ class WorkspaceStore:
         return event
 
     def fail_job(self, job_id: str, safe_error_code: str) -> WorkspaceJob:
+        self._safe_code(safe_error_code)
         now = self._now()
         with self._transaction() as connection:
             row = self._job_row(connection, job_id)
+            current_status = WorkspaceJobStatus(row["status"])
+            if current_status in _TERMINAL_JOB_STATUSES:
+                raise ActiveWorkspaceOperationError(
+                    f"Workspace job '{job_id}' is already {current_status.value}."
+                )
+            self._guard_job_transition(current_status, WorkspaceJobStatus.FAILED)
             connection.execute(
                 """UPDATE workspace_jobs
                    SET status = ?, safe_error_code = ?, finished_at = ?
@@ -795,19 +1035,33 @@ class WorkspaceStore:
         if event.job_id != job.job_id:
             raise ValueError("event job does not match the updated job")
         with self._transaction() as connection:
-            self._job_row(connection, job.job_id)
+            stored_row = self._job_row(connection, job.job_id)
+            stored = self._job(stored_row)
+            immutable_identity = (
+                "workspace_id",
+                "job_kind",
+                "idempotency_key",
+                "created_at",
+            )
+            if any(getattr(stored, field) != getattr(job, field) for field in immutable_identity):
+                raise ValueError("workspace job identity fields are immutable")
+            self._guard_job_transition(stored.status, job.status)
+            allowed_events = _STATUS_EVENTS.get(job.status, set())
+            if event.event_type not in allowed_events:
+                raise ValueError("workspace event does not match the job transition")
+            if job.status is WorkspaceJobStatus.RUNNING and job.started_at is None:
+                raise ValueError("a running workspace job requires started_at")
+            if job.status in _TERMINAL_JOB_STATUSES and job.finished_at is None:
+                raise ValueError("a terminal workspace job requires finished_at")
+            if job.safe_error_code is not None:
+                self._safe_code(job.safe_error_code)
             connection.execute(
                 """UPDATE workspace_jobs
-                   SET workspace_id = ?, job_kind = ?, status = ?, idempotency_key = ?,
-                       safe_error_code = ?, created_at = ?, started_at = ?, finished_at = ?
+                   SET status = ?, safe_error_code = ?, started_at = ?, finished_at = ?
                    WHERE job_id = ?""",
                 (
-                    job.workspace_id,
-                    job.job_kind,
                     job.status.value,
-                    job.idempotency_key,
                     job.safe_error_code,
-                    self._timestamp(job.created_at),
                     self._timestamp(job.started_at),
                     self._timestamp(job.finished_at),
                     job.job_id,
@@ -846,32 +1100,27 @@ class WorkspaceStore:
             revision = self._revision(connection, workspace_id, revision_id)
             if entry_id not in {item.entry_id for item in revision.entries}:
                 raise ManifestNotFoundError(f"Manifest entry '{entry_id}' was not found.")
-            connection.execute(
-                """INSERT INTO manifest_revisions(
-                       revision_id, workspace_id, parent_revision_id, scan_job_id,
-                       policy_version, created_at
-                   ) VALUES (?, ?, ?, NULL, ?, ?)""",
-                (
-                    new_revision_id,
-                    workspace_id,
-                    revision_id,
-                    revision.policy_version,
-                    self._timestamp(now),
-                ),
+
+            def mark_changed(item: ManifestEntry) -> ManifestEntry:
+                if item.entry_id != entry_id:
+                    return item
+                return item.model_copy(
+                    update={
+                        "state": SourceState.CHANGED,
+                        "included": False,
+                        "inclusion_reason": code,
+                        "failure_code": code,
+                        "safe_message": "The selected source changed and needs review.",
+                    }
+                )
+
+            self._clone_revision(
+                connection,
+                revision,
+                new_revision_id,
+                now,
+                mark_changed,
             )
-            for item in revision.entries:
-                clone = item
-                if item.entry_id == entry_id:
-                    clone = item.model_copy(
-                        update={
-                            "state": SourceState.CHANGED,
-                            "included": False,
-                            "inclusion_reason": code,
-                            "failure_code": code,
-                            "safe_message": "The selected source changed and needs review.",
-                        }
-                    )
-                self._insert_entry(connection, new_revision_id, clone)
             connection.execute(
                 """UPDATE workspaces
                    SET state = ?, current_draft_revision_id = ?, updated_at = ?
@@ -928,6 +1177,24 @@ class WorkspaceStore:
 
     def delete_workspace_rows(self, workspace_id: str) -> None:
         with self._transaction() as connection:
+            workspace = self._workspace_row(connection, workspace_id)
+            if workspace["state"] != WorkspaceState.DELETING.value:
+                raise ActiveWorkspaceOperationError(
+                    f"Workspace '{workspace_id}' is not marked for deletion."
+                )
+            active_row = connection.execute(
+                """SELECT 1 FROM workspace_jobs
+                   WHERE workspace_id = ? AND status IN (?, ?) LIMIT 1""",
+                (
+                    workspace_id,
+                    WorkspaceJobStatus.QUEUED.value,
+                    WorkspaceJobStatus.RUNNING.value,
+                ),
+            ).fetchone()
+            if active_row is not None:
+                raise ActiveWorkspaceOperationError(
+                    f"Workspace '{workspace_id}' has an active operation."
+                )
             connection.execute("DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,))
 
     def _owned_relative_path(self, owned_path: Path) -> tuple[str, Path]:
