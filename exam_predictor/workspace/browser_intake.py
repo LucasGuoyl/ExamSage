@@ -37,6 +37,13 @@ class _PlannedUpload:
     parts: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _PreparedWorkspace:
+    canonical_root: Path
+    workspace_root: Path
+    identity: tuple[int, int]
+
+
 class _SnapshotSession(Protocol):
     @contextlib.contextmanager
     def open_destination(self, parts: tuple[str, ...]) -> Iterator[BinaryIO]: ...
@@ -53,20 +60,48 @@ class _PosixSnapshotSession:
     _RENAME_NOREPLACE = 1
     _RENAME_EXCL = 0x00000004
 
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(self, workspace: _PreparedWorkspace | Path) -> None:
+        import fcntl
+
+        if isinstance(workspace, Path):
+            workspace_root = workspace.resolve(strict=True)
+            workspace_stat = workspace_root.stat(follow_symlinks=False)
+            workspace = _PreparedWorkspace(
+                canonical_root=workspace_root.parent,
+                workspace_root=workspace_root,
+                identity=(workspace_stat.st_dev, workspace_stat.st_ino),
+            )
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         self._directory_flags = directory_flags
-        self._workspace_fd = os.open(workspace_root, directory_flags)
-        self._temporary_name = self._create_temporary_directory()
+        self._workspace_fd = os.open(workspace.workspace_root, directory_flags)
+        workspace_handle_stat = os.fstat(self._workspace_fd)
+        if (workspace_handle_stat.st_dev, workspace_handle_stat.st_ino) != workspace.identity:
+            os.close(self._workspace_fd)
+            raise BrowserIntakeError("browser_intake_workspace_invalid")
+        self._lock_fd: int | None = None
         try:
+            lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            lock_flags |= getattr(os, "O_NOFOLLOW", 0)
+            self._lock_fd = os.open(
+                ".browser-intake.lock",
+                lock_flags,
+                0o600,
+                dir_fd=self._workspace_fd,
+            )
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+            self._temporary_name = self._create_temporary_directory()
             self._temporary_fd = os.open(
                 self._temporary_name,
                 directory_flags,
                 dir_fd=self._workspace_fd,
             )
         except BaseException:
-            os.rmdir(self._temporary_name, dir_fd=self._workspace_fd)
+            if hasattr(self, "_temporary_name"):
+                with contextlib.suppress(OSError):
+                    os.rmdir(self._temporary_name, dir_fd=self._workspace_fd)
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
             os.close(self._workspace_fd)
             raise
         self._identity = os.fstat(self._temporary_fd)
@@ -119,18 +154,25 @@ class _PosixSnapshotSession:
     def publish(self, destination_name: str) -> None:
         self._verify_temporary_identity()
         try:
-            self._rename_no_replace(destination_name)
+            self._rename_no_replace(self._temporary_name, destination_name)
         except FileExistsError:
             raise BrowserIntakeError("browser_intake_exists") from None
         except OSError:
             raise BrowserIntakeError("browser_intake_write_failed") from None
+        if not self._name_matches_temporary_identity(destination_name):
+            isolation_name = f".examsage-unverified-{secrets.token_hex(16)}"
+            with contextlib.suppress(OSError):
+                self._rename_no_replace(destination_name, isolation_name)
+            raise BrowserIntakeError("browser_intake_write_failed")
         self._closed = True
         os.close(self._temporary_fd)
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
         os.close(self._workspace_fd)
 
-    def _rename_no_replace(self, destination_name: str) -> None:
+    def _rename_no_replace(self, source_name: str, destination_name: str) -> None:
         libc = ctypes.CDLL(None, use_errno=True)
-        old_name = os.fsencode(self._temporary_name)
+        old_name = os.fsencode(source_name)
         new_name = os.fsencode(destination_name)
         if sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
             rename = libc.renameat2
@@ -187,18 +229,38 @@ class _PosixSnapshotSession:
         ):
             raise BrowserIntakeError("browser_intake_write_failed")
 
+    def _name_matches_temporary_identity(self, name: str) -> bool:
+        try:
+            current = os.stat(
+                name,
+                dir_fd=self._workspace_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return False
+        return stat.S_ISDIR(current.st_mode) and os.path.samestat(
+            self._identity, current
+        )
+
     def cleanup(self) -> None:
         if self._closed:
             return
         try:
             self._verify_temporary_identity()
+            quarantine_name = f".examsage-browser-orphan-{secrets.token_hex(16)}"
+            self._rename_no_replace(self._temporary_name, quarantine_name)
+            if not self._name_matches_temporary_identity(quarantine_name):
+                return
             if shutil.rmtree.avoids_symlink_attacks:
-                shutil.rmtree(self._temporary_name, dir_fd=self._workspace_fd)
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(".", dir_fd=self._temporary_fd)
         except (BrowserIntakeError, OSError):
             pass
         finally:
             self._closed = True
             os.close(self._temporary_fd)
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
             os.close(self._workspace_fd)
 
 
@@ -222,7 +284,7 @@ class _WindowsSnapshotSession:
     _FILE_DISPOSITION_INFO = 4
     _FILE_RENAME_INFO = 3
 
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(self, workspace: _PreparedWorkspace | Path) -> None:
         if os.name != "nt":
             raise RuntimeError("Windows snapshot handles are unavailable")
 
@@ -231,21 +293,36 @@ class _WindowsSnapshotSession:
         self._wintypes = wintypes
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._configure_functions()
-        self._workspace_root = workspace_root.resolve(strict=True)
+        if isinstance(workspace, Path):
+            workspace_root = workspace.resolve(strict=True)
+            workspace_stat = workspace_root.stat(follow_symlinks=False)
+            workspace = _PreparedWorkspace(
+                canonical_root=workspace_root.parent,
+                workspace_root=workspace_root,
+                identity=(workspace_stat.st_dev, workspace_stat.st_ino),
+            )
+        self._workspace_root = workspace.workspace_root
         self._workspace_handle = self._open_directory(
             self._workspace_root,
             delete_access=False,
-            containment_root=self._workspace_root,
+            containment_root=workspace.canonical_root,
         )
-        self._temporary_name, self._temporary_root = self._create_temporary_directory()
+        if self._handle_identity(self._workspace_handle)[1] != workspace.identity[1]:
+            self._close_handle(self._workspace_handle)
+            raise BrowserIntakeError("browser_intake_workspace_invalid")
         try:
+            self._temporary_name, self._temporary_root = (
+                self._create_temporary_directory()
+            )
             root_handle = self._open_directory(
                 self._temporary_root,
                 delete_access=True,
                 containment_root=self._temporary_root,
             )
         except BaseException:
-            self._temporary_root.rmdir()
+            if hasattr(self, "_temporary_root"):
+                with contextlib.suppress(OSError):
+                    self._temporary_root.rmdir()
             self._close_handle(self._workspace_handle)
             raise
         self._directory_handles: dict[tuple[str, ...], int] = {(): root_handle}
@@ -533,15 +610,15 @@ class _WindowsSnapshotSession:
             for key in sorted(
                 (key for key in self._directory_paths if key), key=len
             ):
-                self._directory_handles[key] = self._open_directory(
+                candidate_handle = self._open_directory(
                     self._directory_paths[key],
                     delete_access=True,
                     containment_root=self._temporary_root,
                 )
-                if self._handle_identity(self._directory_handles[key]) != (
-                    self._directory_identities[key]
-                ):
+                if self._handle_identity(candidate_handle) != self._directory_identities[key]:
+                    self._close_handle(candidate_handle)
                     raise OSError(errno.ESTALE, "snapshot directory identity changed")
+                self._directory_handles[key] = candidate_handle
             for path, expected_identity in self._file_records:
                 handle = self._create_file_handle(
                     path,
@@ -606,10 +683,10 @@ class _WindowsSnapshotSession:
         self._kernel32.CloseHandle(handle)
 
 
-def _start_snapshot_session(workspace_root: Path) -> _SnapshotSession:
+def _start_snapshot_session(workspace: _PreparedWorkspace) -> _SnapshotSession:
     if os.name == "nt":
-        return _WindowsSnapshotSession(workspace_root)
-    return _PosixSnapshotSession(workspace_root)
+        return _WindowsSnapshotSession(workspace)
+    return _PosixSnapshotSession(workspace)
 
 
 class BrowserIntakeWriter:
@@ -627,13 +704,14 @@ class BrowserIntakeWriter:
         """Create and atomically publish one validated browser-intake snapshot."""
         self._validate_workspace_id(workspace_id)
         plan = self._validate_plan(files)
-        workspace_root = self._prepare_workspace(workspace_id)
+        prepared_workspace = self._prepare_workspace(workspace_id)
+        workspace_root = prepared_workspace.workspace_root
         published_root = workspace_root / "browser-intake"
         if os.path.lexists(published_root):
             raise BrowserIntakeError("browser_intake_exists")
 
         try:
-            session = _start_snapshot_session(workspace_root)
+            session = _start_snapshot_session(prepared_workspace)
         except BrowserIntakeError:
             raise
         except OSError:
@@ -730,7 +808,7 @@ class BrowserIntakeWriter:
         ):
             raise BrowserIntakeError("browser_intake_workspace_invalid")
 
-    def _prepare_workspace(self, workspace_id: str) -> Path:
+    def _prepare_workspace(self, workspace_id: str) -> _PreparedWorkspace:
         try:
             self._workspaces_root.mkdir(parents=True, exist_ok=True)
             if self._is_link_or_reparse(self._workspaces_root):
@@ -745,7 +823,12 @@ class BrowserIntakeWriter:
             canonical_workspace = workspace_root.resolve(strict=True)
             if canonical_workspace.parent != canonical_root:
                 raise BrowserIntakeError("browser_intake_workspace_invalid")
-            return canonical_workspace
+            workspace_stat = canonical_workspace.stat(follow_symlinks=False)
+            return _PreparedWorkspace(
+                canonical_root=canonical_root,
+                workspace_root=canonical_workspace,
+                identity=(workspace_stat.st_dev, workspace_stat.st_ino),
+            )
         except BrowserIntakeError:
             raise
         except OSError:

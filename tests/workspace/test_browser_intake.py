@@ -7,6 +7,7 @@ import shutil
 
 import pytest
 
+from exam_predictor.workspace import browser_intake as browser_intake_module
 from exam_predictor.workspace.browser_intake import (
     BrowserIntakeError,
     BrowserIntakeWriter,
@@ -267,9 +268,10 @@ def test_browser_intake_maps_publish_race_to_existing_snapshot_conflict(
     else:
         original_rename = _PosixSnapshotSession._rename_no_replace
 
-        def race_with_empty_snapshot(session, destination_name):
-            os.mkdir(destination_name, dir_fd=session._workspace_fd)
-            return original_rename(session, destination_name)
+        def race_with_empty_snapshot(session, source_name, destination_name):
+            if destination_name == "browser-intake":
+                os.mkdir(destination_name, dir_fd=session._workspace_fd)
+            return original_rename(session, source_name, destination_name)
 
         monkeypatch.setattr(
             _PosixSnapshotSession, "_rename_no_replace", race_with_empty_snapshot
@@ -380,3 +382,217 @@ def test_windows_cleanup_refuses_a_replaced_file_identity(tmp_path):
     session.cleanup()
 
     assert target.read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-descriptor race")
+def test_posix_publish_rolls_back_a_replacement_injected_before_rename(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    session = _PosixSnapshotSession(workspace)
+    original_root = workspace / ".original-root"
+    replacement = workspace / ".replacement"
+    replacement.mkdir()
+    (replacement / "marker.txt").write_bytes(b"replacement")
+
+    original_rename = session._rename_no_replace
+
+    def substitute_then_rename(source_name, destination_name):
+        if destination_name == "browser-intake":
+            os.rename(
+                session._temporary_name,
+                original_root.name,
+                src_dir_fd=session._workspace_fd,
+                dst_dir_fd=session._workspace_fd,
+            )
+            os.rename(
+                replacement.name,
+                session._temporary_name,
+                src_dir_fd=session._workspace_fd,
+                dst_dir_fd=session._workspace_fd,
+            )
+        return original_rename(source_name, destination_name)
+
+    monkeypatch.setattr(session, "_rename_no_replace", substitute_then_rename)
+
+    with pytest.raises(BrowserIntakeError) as caught:
+        session.publish("browser-intake")
+
+    assert caught.value.code == "browser_intake_write_failed"
+    assert not (workspace / "browser-intake").exists()
+    [isolated] = workspace.glob(".examsage-unverified-*")
+    assert (isolated / "marker.txt").read_bytes() == b"replacement"
+    session.cleanup()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-bound cleanup race")
+def test_posix_cleanup_refuses_a_replacement_injected_before_delete(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    session = _PosixSnapshotSession(workspace)
+    original_root = workspace / ".original-root"
+    replacement = workspace / ".replacement"
+    replacement.mkdir()
+    (replacement / "marker.txt").write_bytes(b"replacement")
+
+    original_rename = session._rename_no_replace
+
+    def substitute_then_rename(source_name, destination_name):
+        if destination_name.startswith(".examsage-browser-orphan-"):
+            os.rename(
+                session._temporary_name,
+                original_root.name,
+                src_dir_fd=session._workspace_fd,
+                dst_dir_fd=session._workspace_fd,
+            )
+            os.rename(
+                replacement.name,
+                session._temporary_name,
+                src_dir_fd=session._workspace_fd,
+                dst_dir_fd=session._workspace_fd,
+            )
+        return original_rename(source_name, destination_name)
+
+    monkeypatch.setattr(session, "_rename_no_replace", substitute_then_rename)
+
+    session.cleanup()
+
+    [quarantine] = workspace.glob(".examsage-browser-orphan-*")
+    assert (quarantine / "marker.txt").read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-bound cleanup race")
+def test_posix_cleanup_after_verification_cleans_only_retained_identity(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    session = _PosixSnapshotSession(workspace)
+    replacement = workspace / ".replacement"
+    replacement.mkdir()
+    (replacement / "marker.txt").write_bytes(b"replacement")
+
+    original_identity_check = session._name_matches_temporary_identity
+
+    def verify_then_substitute(name):
+        matches = original_identity_check(name)
+        if matches and name.startswith(".examsage-browser-orphan-"):
+            quarantine = workspace / name
+            quarantine.rename(workspace / ".original-root")
+            replacement.rename(quarantine)
+        return matches
+
+    monkeypatch.setattr(
+        session, "_name_matches_temporary_identity", verify_then_substitute
+    )
+
+    session.cleanup()
+
+    [quarantine] = workspace.glob(".examsage-browser-orphan-*")
+    assert (quarantine / "marker.txt").read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows workspace handle identity")
+def test_windows_session_rejects_workspace_retarget_between_prepare_and_open(
+    tmp_path, monkeypatch
+):
+    workspaces_root = tmp_path / "workspaces"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    writer = BrowserIntakeWriter(workspaces_root)
+
+    original_start = browser_intake_module._start_snapshot_session
+
+    def retarget_after_prepare(prepared):
+        retargeted = prepared.__class__(
+            canonical_root=prepared.canonical_root,
+            workspace_root=outside,
+            identity=prepared.identity,
+        )
+        return original_start(retargeted)
+
+    monkeypatch.setattr(
+        browser_intake_module, "_start_snapshot_session", retarget_after_prepare
+    )
+
+    with pytest.raises(BrowserIntakeError) as caught:
+        writer.create_snapshot("workspace-1", [_upload("notes.txt", b"safe")])
+
+    assert caught.value.code == "browser_intake_workspace_invalid"
+    assert not list(outside.iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound cleanup")
+def test_windows_cleanup_does_not_adopt_a_replaced_directory_identity(tmp_path):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    session = _WindowsSnapshotSession(workspace)
+    with session.open_destination(("course", "notes.txt")) as destination:
+        destination.write(b"original")
+        destination.flush()
+        os.fsync(destination.fileno())
+    session._close_children_for_publish()
+    course = session._temporary_root / "course"
+    original_course = session._temporary_root / "original-course"
+    course.rename(original_course)
+    course.mkdir()
+
+    session._reopen_children_for_cleanup()
+    session.cleanup()
+
+    assert course.is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor lifecycle")
+def test_posix_session_closes_workspace_fd_if_temp_creation_fails(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    closed: list[int] = []
+    monkeypatch.setattr(
+        _PosixSnapshotSession,
+        "_create_temporary_directory",
+        lambda self: (_ for _ in ()).throw(OSError("create failed")),
+    )
+    original_close = os.close
+
+    def recording_close(file_descriptor):
+        closed.append(file_descriptor)
+        original_close(file_descriptor)
+
+    monkeypatch.setattr(os, "close", recording_close)
+
+    with pytest.raises(OSError, match="create failed"):
+        _PosixSnapshotSession(workspace)
+
+    assert len(closed) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle lifecycle")
+def test_windows_session_closes_workspace_handle_if_temp_creation_fails(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    closed: list[int] = []
+    original_close = _WindowsSnapshotSession._close_handle
+
+    def recording_close(self, handle):
+        closed.append(handle)
+        original_close(self, handle)
+
+    monkeypatch.setattr(_WindowsSnapshotSession, "_close_handle", recording_close)
+    monkeypatch.setattr(
+        _WindowsSnapshotSession,
+        "_create_temporary_directory",
+        lambda self: (_ for _ in ()).throw(OSError("create failed")),
+    )
+
+    with pytest.raises(OSError, match="create failed"):
+        _WindowsSnapshotSession(workspace)
+
+    assert len(closed) == 1
