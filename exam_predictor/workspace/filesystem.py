@@ -239,6 +239,10 @@ class SecureFileOpener:
         ) as source:
             return os.fstat(source.fileno())
 
+    @staticmethod
+    def stat_open_file(source: BinaryIO) -> os.stat_result:
+        return os.fstat(source.fileno())
+
     @contextmanager
     def anchor_root(self, root: Path) -> Iterator[RootAnchor]:
         if self._platform == "windows":

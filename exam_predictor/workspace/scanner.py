@@ -516,6 +516,7 @@ class WorkspaceScanner:
                 relative,
                 root_anchor=root_anchor,
             ) as source:
+                opened_before = self._secure_file_opener.stat_open_file(source)
                 for chunk_index, chunk in enumerate(
                     iter(lambda: source.read(self._policy.hash_chunk_bytes), b"")
                 ):
@@ -531,6 +532,7 @@ class WorkspaceScanner:
                             parent_entry_id="pending",
                         )
                     )
+                opened_after = self._secure_file_opener.stat_open_file(source)
             after = self._secure_file_opener.stat_regular(
                 root,
                 relative,
@@ -542,9 +544,20 @@ class WorkspaceScanner:
             code = ARCHIVE_INVALID if inspect_archive else SOURCE_OPEN_FAILED
             return _ReadOutcome(None, bytes_hashed, failure_code=code)
 
-        if _stat_identity(before) != _stat_identity(after):
+        identities = {
+            _stat_identity(before),
+            _stat_identity(opened_before),
+            _stat_identity(opened_after),
+            _stat_identity(after),
+        }
+        if len(identities) != 1:
             return _ReadOutcome(None, bytes_hashed, failure_code=SOURCE_CHANGED_DURING_SCAN)
-        return _ReadOutcome(digest.hexdigest(), bytes_hashed, members, stat_result=before)
+        return _ReadOutcome(
+            digest.hexdigest(),
+            bytes_hashed,
+            members,
+            stat_result=opened_before,
+        )
 
     def _reusable_metadata(
         self,

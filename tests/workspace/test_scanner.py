@@ -143,6 +143,10 @@ def test_scanner_reads_pre_and_post_hash_metadata_through_the_root_anchor(tmp_pa
                 root_anchor=root_anchor,
             )
 
+        def stat_open_file(self, source):
+            self.events.append(("fstat", None))
+            return self.delegate.stat_open_file(source)
+
         @contextmanager
         def open_regular(
             self,
@@ -165,8 +169,64 @@ def test_scanner_reads_pre_and_post_hash_metadata_through_the_root_anchor(tmp_pa
 
     scanner.scan("workspace-1", tmp_path)
 
-    assert [event for event, _ in opener.events] == ["stat", "open", "stat"]
-    assert all(root_anchor is not None for _, root_anchor in opener.events)
+    assert [event for event, _ in opener.events] == [
+        "stat",
+        "open",
+        "fstat",
+        "fstat",
+        "stat",
+    ]
+    assert all(
+        root_anchor is not None
+        for event, root_anchor in opener.events
+        if event != "fstat"
+    )
+
+
+def test_scanner_rejects_a_different_file_bound_to_the_actual_read_handle(tmp_path):
+    source = tmp_path / "notes.txt"
+    substituted = tmp_path / "substituted.bin"
+    source.write_bytes(b"file-a")
+    substituted.write_bytes(b"file-b")
+    source_stat = source.stat()
+    substituted_stat = substituted.stat()
+
+    class ABAOpener:
+        @staticmethod
+        def stat_regular(
+            canonical_root,
+            relative_path,
+            *,
+            root_anchor=None,
+        ):
+            del canonical_root, relative_path, root_anchor
+            return source_stat
+
+        @contextmanager
+        def open_regular(
+            self,
+            canonical_root,
+            relative_path,
+            *,
+            root_anchor=None,
+        ):
+            del self, canonical_root, relative_path, root_anchor
+            yield io.BytesIO(b"file-b")
+
+        @staticmethod
+        def stat_open_file(source_handle):
+            del source_handle
+            return substituted_stat
+
+    scanner = WorkspaceScanner()
+    scanner._secure_file_opener = ABAOpener()
+
+    result = scanner.scan("workspace-1", tmp_path)
+
+    entry = _entry(result, "notes.txt")
+    assert entry.state is SourceState.FAILED
+    assert entry.failure_code == "source_changed_during_scan"
+    assert entry.sha256 is None
 
 
 def test_scanner_keeps_unsupported_formats_visible_as_excluded(tmp_path):
@@ -361,6 +421,9 @@ def test_scanner_marks_a_file_changed_during_hash_as_failed(tmp_path):
             source.write_text("after", encoding="utf-8")
 
     class SnapshotOpener:
+        def __init__(self) -> None:
+            self.open_stat = None
+
         @staticmethod
         def stat_regular(
             canonical_root: Path,
@@ -382,9 +445,17 @@ def test_scanner_marks_a_file_changed_during_hash_as_failed(tmp_path):
             root_anchor=None,
         ):
             del root_anchor
+            self.open_stat = (
+                canonical_root / relative_path.as_posix()
+            ).stat(follow_symlinks=False)
             yield io.BytesIO(
                 (canonical_root / relative_path.as_posix()).read_bytes()
             )
+
+        def stat_open_file(self, source_handle):
+            del source_handle
+            assert self.open_stat is not None
+            return self.open_stat
 
     scanner = WorkspaceScanner(after_hash_chunk=mutate_after_first_chunk)
     scanner._secure_file_opener = SnapshotOpener()
@@ -515,6 +586,9 @@ def test_scanner_inspects_zip_metadata_through_the_secure_opener(tmp_path):
                 relative_path,
                 root_anchor=root_anchor,
             )
+
+        def stat_open_file(self, source):
+            return self.delegate.stat_open_file(source)
 
         @contextmanager
         def open_regular(
