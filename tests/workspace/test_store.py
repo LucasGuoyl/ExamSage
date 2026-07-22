@@ -508,11 +508,94 @@ def test_idempotent_jobs_restart_recovery_and_event_cursor(
         restarted.close()
 
 
+def test_recover_running_jobs_is_restart_safe_ordered_and_idempotent(tmp_path: Path):
+    path = tmp_path / "workspace.sqlite3"
+    original = WorkspaceStore(path)
+    original.create_workspace(workspace_record(tmp_path))
+    running_jobs = [
+        job(job_id=f"job-{index}", status=WorkspaceJobStatus.RUNNING).model_copy(
+            update={
+                "idempotency_key": f"request-{index}",
+                "safe_error_code": "interrupted",
+                "started_at": NOW + timedelta(minutes=1),
+            }
+        )
+        for index in (1, 2)
+    ]
+    for item in running_jobs:
+        original.create_job(item, item.idempotency_key)
+    settled = job(
+        job_id="job-3",
+        status=WorkspaceJobStatus.SUCCEEDED,
+        idempotency_key="request-3",
+    ).model_copy(update={"finished_at": NOW + timedelta(minutes=2)})
+    original.create_job(settled, settled.idempotency_key)
+    original.close()
+
+    restarted = WorkspaceStore(path)
+    try:
+        recovered = restarted.recover_running_jobs()
+
+        assert [item.job_id for item in recovered] == ["job-1", "job-2"]
+        assert all(item.status is WorkspaceJobStatus.QUEUED for item in recovered)
+        assert all(item.started_at is None for item in recovered)
+        assert all(item.finished_at is None for item in recovered)
+        assert all(item.safe_error_code is None for item in recovered)
+        for item in recovered:
+            events = restarted.list_job_events(item.job_id)
+            assert len(events) == 1
+            assert events[0].event_type == "queued"
+            assert events[0].message == "Workspace operation queued."
+            assert events[0].payload == {}
+        assert restarted.get_job(settled.job_id) == settled
+
+        assert restarted.recover_running_jobs() == ()
+        assert all(
+            len(restarted.list_job_events(item.job_id)) == 1 for item in recovered
+        )
+    finally:
+        restarted.close()
+
+
+def test_generic_update_does_not_allow_running_to_queued_recovery_transition(
+    store: WorkspaceStore, tmp_path: Path
+):
+    store.create_workspace(workspace_record(tmp_path))
+    running = store.create_job(
+        job(status=WorkspaceJobStatus.RUNNING).model_copy(
+            update={"started_at": NOW + timedelta(minutes=1)}
+        ),
+        "request-1",
+    )
+    queued = running.model_copy(
+        update={
+            "status": WorkspaceJobStatus.QUEUED,
+            "started_at": None,
+            "finished_at": None,
+        }
+    )
+    event_value = WorkspaceEvent(
+        sequence=1,
+        job_id=running.job_id,
+        event_type="queued",
+        message="Workspace operation queued.",
+        payload={},
+        created_at=NOW + timedelta(minutes=2),
+    )
+
+    with pytest.raises(ActiveWorkspaceOperationError):
+        store.update_job(queued, event_value)
+
+    assert store.get_job(running.job_id) == running
+    assert store.list_job_events(running.job_id) == ()
+
+
 def test_progress_payload_is_bounded_relative_and_canonical_json(
     store: WorkspaceStore, tmp_path: Path
 ):
     store.create_workspace(workspace_record(tmp_path))
     store.create_job(job(), "request-1")
+    store.start_job("job-1")
     event = store.append_progress(
         "job-1",
         ScanProgress(
@@ -540,6 +623,43 @@ def test_progress_payload_is_bounded_relative_and_canonical_json(
                     current_relative_path=unsafe,
                 ),
             )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        WorkspaceJobStatus.QUEUED,
+        WorkspaceJobStatus.SUCCEEDED,
+        WorkspaceJobStatus.FAILED,
+        WorkspaceJobStatus.CANCELLED,
+    ],
+)
+def test_progress_rejects_non_running_jobs_without_an_event(
+    store: WorkspaceStore, tmp_path: Path, status: WorkspaceJobStatus
+):
+    store.create_workspace(workspace_record(tmp_path))
+    value = job(status=status)
+    if status in {
+        WorkspaceJobStatus.SUCCEEDED,
+        WorkspaceJobStatus.FAILED,
+        WorkspaceJobStatus.CANCELLED,
+    }:
+        value = value.model_copy(update={"finished_at": NOW + timedelta(minutes=1)})
+    stored = store.create_job(value, "request-1")
+
+    with pytest.raises(ActiveWorkspaceOperationError):
+        store.append_progress(
+            stored.job_id,
+            ScanProgress(
+                discovered_count=1,
+                bytes_hashed=10,
+                failure_count=0,
+                current_relative_path="Module/notes.pdf",
+            ),
+        )
+
+    assert store.get_job(stored.job_id) == stored
+    assert store.list_job_events(stored.job_id) == ()
 
 
 def test_update_job_rolls_back_state_when_event_insert_fails(

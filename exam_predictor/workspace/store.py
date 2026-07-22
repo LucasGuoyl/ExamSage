@@ -927,6 +927,38 @@ class WorkspaceStore:
         with self._lock:
             return self._job(self._job_row(self._connection, job_id))
 
+    def recover_running_jobs(self) -> Sequence[WorkspaceJob]:
+        recovered: list[WorkspaceJob] = []
+        now = self._now()
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """SELECT * FROM workspace_jobs WHERE status = ?
+                   ORDER BY created_at ASC, rowid ASC""",
+                (WorkspaceJobStatus.RUNNING.value,),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    """UPDATE workspace_jobs
+                       SET status = ?, safe_error_code = NULL,
+                           started_at = NULL, finished_at = NULL
+                       WHERE job_id = ? AND status = ?""",
+                    (
+                        WorkspaceJobStatus.QUEUED.value,
+                        row["job_id"],
+                        WorkspaceJobStatus.RUNNING.value,
+                    ),
+                )
+                self._insert_event(
+                    connection,
+                    job_id=row["job_id"],
+                    event_type="queued",
+                    message="Workspace operation queued.",
+                    payload={},
+                    created_at=now,
+                )
+                recovered.append(self._job(self._job_row(connection, row["job_id"])))
+        return tuple(recovered)
+
     def start_job(self, job_id: str) -> WorkspaceJob:
         now = self._now()
         with self._transaction() as connection:
@@ -978,7 +1010,11 @@ class WorkspaceStore:
             "failure_count": progress.failure_count,
         }
         with self._transaction() as connection:
-            self._job_row(connection, job_id)
+            row = self._job_row(connection, job_id)
+            if WorkspaceJobStatus(row["status"]) is not WorkspaceJobStatus.RUNNING:
+                raise ActiveWorkspaceOperationError(
+                    f"Workspace job '{job_id}' is not running."
+                )
             event = self._insert_event(
                 connection,
                 job_id=job_id,
