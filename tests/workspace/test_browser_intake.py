@@ -596,3 +596,185 @@ def test_windows_session_closes_workspace_handle_if_temp_creation_fails(
         _WindowsSnapshotSession(workspace)
 
     assert len(closed) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX creation identity")
+def test_posix_temp_creation_refuses_a_replacement_before_open(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    replacement = workspace / ".replacement"
+    replacement.mkdir()
+    (replacement / "marker.txt").write_bytes(b"replacement")
+    original_open = os.open
+    injected = False
+    session = None
+
+    def replace_before_temp_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        if (
+            not injected
+            and isinstance(path, str)
+            and path.startswith(".browser-intake-")
+            and dir_fd is not None
+        ):
+            injected = True
+            os.rename(
+                path,
+                ".original-created-root",
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            os.rename(
+                replacement.name,
+                path,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", replace_before_temp_open)
+
+    try:
+        with pytest.raises(BrowserIntakeError) as caught:
+            session = _PosixSnapshotSession(workspace)
+    finally:
+        if session is not None:
+            session.cleanup()
+
+    assert caught.value.code == "browser_intake_write_failed"
+    [candidate] = workspace.glob(".browser-intake-*.tmp")
+    assert (candidate / "marker.txt").read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows creation identity")
+def test_windows_temp_creation_refuses_a_replacement_before_open(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    replacement = workspace / ".replacement"
+    replacement.mkdir()
+    (replacement / "marker.txt").write_bytes(b"replacement")
+    original_open = _WindowsSnapshotSession._open_directory
+    injected = False
+    session = None
+
+    def replace_before_temp_open(
+        self, path, *, delete_access, containment_root
+    ):
+        nonlocal injected
+        if not injected and path.name.startswith(".browser-intake-"):
+            injected = True
+            path.rename(workspace / ".original-created-root")
+            replacement.rename(path)
+        return original_open(
+            self,
+            path,
+            delete_access=delete_access,
+            containment_root=containment_root,
+        )
+
+    monkeypatch.setattr(
+        _WindowsSnapshotSession, "_open_directory", replace_before_temp_open
+    )
+
+    try:
+        with pytest.raises(BrowserIntakeError) as caught:
+            session = _WindowsSnapshotSession(workspace)
+    finally:
+        if session is not None:
+            session.cleanup()
+
+    assert caught.value.code == "browser_intake_write_failed"
+    [candidate] = workspace.glob(".browser-intake-*.tmp")
+    assert (candidate / "marker.txt").read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor lifecycle")
+def test_posix_session_closes_workspace_fd_if_workspace_identity_query_fails(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    original_close = os.close
+    closed: list[int] = []
+
+    def fail_fstat(file_descriptor):
+        del file_descriptor
+        raise OSError("identity failed")
+
+    def recording_close(file_descriptor):
+        closed.append(file_descriptor)
+        original_close(file_descriptor)
+
+    monkeypatch.setattr(os, "fstat", fail_fstat)
+    monkeypatch.setattr(os, "close", recording_close)
+
+    with pytest.raises(OSError, match="identity failed"):
+        _PosixSnapshotSession(workspace)
+
+    assert len(closed) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor lifecycle")
+def test_posix_session_closes_all_descriptors_if_temp_identity_query_fails(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    original_fstat = os.fstat
+    original_close = os.close
+    fstat_calls = 0
+    closed: list[int] = []
+
+    def fail_temp_fstat(file_descriptor):
+        nonlocal fstat_calls
+        fstat_calls += 1
+        if fstat_calls == 2:
+            raise OSError("identity failed")
+        return original_fstat(file_descriptor)
+
+    def recording_close(file_descriptor):
+        closed.append(file_descriptor)
+        original_close(file_descriptor)
+
+    monkeypatch.setattr(os, "fstat", fail_temp_fstat)
+    monkeypatch.setattr(os, "close", recording_close)
+
+    with pytest.raises(OSError, match="identity failed"):
+        _PosixSnapshotSession(workspace)
+
+    assert len(closed) >= 3
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle lifecycle")
+def test_windows_session_closes_handles_if_temp_identity_query_fails(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    original_identity = _WindowsSnapshotSession._handle_identity
+    original_close = _WindowsSnapshotSession._close_handle
+    identity_calls = 0
+    closed: list[int] = []
+
+    def fail_temp_identity(self, handle):
+        nonlocal identity_calls
+        identity_calls += 1
+        if identity_calls == 2:
+            raise OSError("identity failed")
+        return original_identity(self, handle)
+
+    def recording_close(self, handle):
+        closed.append(handle)
+        original_close(self, handle)
+
+    monkeypatch.setattr(_WindowsSnapshotSession, "_handle_identity", fail_temp_identity)
+    monkeypatch.setattr(_WindowsSnapshotSession, "_close_handle", recording_close)
+
+    with pytest.raises(OSError, match="identity failed"):
+        _WindowsSnapshotSession(workspace)
+
+    assert len(closed) == 2
