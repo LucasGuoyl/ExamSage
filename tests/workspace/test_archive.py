@@ -40,6 +40,14 @@ def _mark_first_entry_encrypted(raw_archive: bytes) -> bytes:
     return bytes(mutable)
 
 
+def _forge_eocd_member_count(raw_archive: bytes, member_count: int) -> bytes:
+    mutable = bytearray(raw_archive)
+    end_offset = mutable.rindex(b"PK\x05\x06")
+    struct.pack_into("<H", mutable, end_offset + 8, member_count)
+    struct.pack_into("<H", mutable, end_offset + 10, member_count)
+    return bytes(mutable)
+
+
 def _by_path(members, path):
     return next(member for member in members if member.display_path == path)
 
@@ -150,6 +158,30 @@ def test_archive_member_limit_is_checked_before_zipfile_materializes_entries(
     )
 
     assert len(members) == 1
+    assert members[0].failure_code == ARCHIVE_MEMBER_LIMIT
+
+
+def test_archive_counts_actual_central_records_before_constructing_zipfile(monkeypatch):
+    policy = DEFAULT_SCAN_POLICY.model_copy(update={"max_archive_members": 1})
+    raw_archive = _forge_eocd_member_count(
+        _archive(("one.txt", b"1"), ("two.txt", b"2")),
+        member_count=1,
+    )
+
+    class UnexpectedZipFile:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("forged member overflow must not construct ZipFile")
+
+    monkeypatch.setattr(archive_module.zipfile, "ZipFile", UnexpectedZipFile)
+
+    members = ArchiveInspector(policy).inspect(
+        io.BytesIO(raw_archive),
+        parent_entry_id="archive-1",
+    )
+
+    assert len(members) == 1
+    assert members[0].state is SourceState.FAILED
     assert members[0].failure_code == ARCHIVE_MEMBER_LIMIT
 
 

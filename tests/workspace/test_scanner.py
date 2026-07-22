@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import os
 import zipfile
@@ -9,7 +10,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from exam_predictor.workspace.filesystem import SecureFileOpener, SecureOpenError
+from exam_predictor.workspace.filesystem import RootAnchor, SecureFileOpener, SecureOpenError
 from exam_predictor.workspace.models import SourceState
 from exam_predictor.workspace.policy import DEFAULT_SCAN_POLICY
 from exam_predictor.workspace.scanner import WorkspaceScanner
@@ -57,6 +58,51 @@ def test_scanner_is_deterministic_for_nested_unicode_and_empty_folders(tmp_path)
     assert _entry(result, "alpha.txt").proposed_course_group == "unclassified"
 
 
+def test_scanner_does_not_adopt_a_resolved_root_with_a_different_identity(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "approved.txt").write_bytes(b"approved")
+    (outside / "secret.txt").write_bytes(b"outside-secret")
+    outside_resolved = outside.resolve()
+    original_resolve = Path.resolve
+
+    def substitute_during_resolve(self, *, strict=False):
+        if self == root:
+            return outside_resolved
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", substitute_during_resolve)
+
+    with pytest.raises(SecureOpenError) as caught:
+        WorkspaceScanner().scan("workspace-1", root)
+
+    assert caught.value.code == "source_link_or_reparse"
+    assert str(tmp_path) not in str(caught.value)
+
+
+def test_scanner_maps_the_final_root_reparse_probe_to_a_safe_error(tmp_path):
+    calls = 0
+
+    def fail_second_probe(path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PermissionError(f"denied: {path}")
+        return False
+
+    with pytest.raises(SecureOpenError) as caught:
+        WorkspaceScanner(is_reparse_point=fail_second_probe).scan(
+            "workspace-1", tmp_path
+        )
+
+    assert caught.value.code == "source_root_invalid"
+    assert str(tmp_path) not in str(caught.value)
+
+
 def test_scanner_hashes_supported_files_with_stable_sha256_and_progress(tmp_path):
     content = b"bounded hashing"
     (tmp_path / "notes.txt").write_bytes(content)
@@ -73,6 +119,54 @@ def test_scanner_hashes_supported_files_with_stable_sha256_and_progress(tmp_path
     assert result.bytes_hashed == len(content)
     assert progress[-1].discovered_count == 1
     assert progress[-1].bytes_hashed == len(content)
+
+
+def test_scanner_reads_pre_and_post_hash_metadata_through_the_root_anchor(tmp_path):
+    (tmp_path / "notes.txt").write_bytes(b"approved")
+
+    class RecordingAnchoredOpener:
+        def __init__(self) -> None:
+            self.delegate = SecureFileOpener()
+            self.events = []
+
+        def stat_regular(
+            self,
+            canonical_root,
+            relative_path,
+            *,
+            root_anchor=None,
+        ):
+            self.events.append(("stat", root_anchor))
+            return self.delegate.stat_regular(
+                canonical_root,
+                relative_path,
+                root_anchor=root_anchor,
+            )
+
+        @contextmanager
+        def open_regular(
+            self,
+            canonical_root,
+            relative_path,
+            *,
+            root_anchor=None,
+        ):
+            self.events.append(("open", root_anchor))
+            with self.delegate.open_regular(
+                canonical_root,
+                relative_path,
+                root_anchor=root_anchor,
+            ) as source:
+                yield source
+
+    opener = RecordingAnchoredOpener()
+    scanner = WorkspaceScanner()
+    scanner._secure_file_opener = opener
+
+    scanner.scan("workspace-1", tmp_path)
+
+    assert [event for event, _ in opener.events] == ["stat", "open", "stat"]
+    assert all(root_anchor is not None for _, root_anchor in opener.events)
 
 
 def test_scanner_keeps_unsupported_formats_visible_as_excluded(tmp_path):
@@ -124,6 +218,11 @@ def test_scanner_anchors_each_directory_during_enumeration(tmp_path):
             self.paths = []
 
         @contextmanager
+        def anchor_root(self, root):
+            platform = "windows" if os.name == "nt" else "posix"
+            yield RootAnchor(canonical_root=root.resolve(), platform=platform)
+
+        @contextmanager
         def anchor_directory(self, canonical_root, relative_path=None):
             del canonical_root
             self.paths.append(relative_path.as_posix() if relative_path is not None else None)
@@ -135,15 +234,33 @@ def test_scanner_anchors_each_directory_during_enumeration(tmp_path):
 
     scanner.scan("workspace-1", tmp_path)
 
-    assert opener.paths == [None, "course"]
+    assert opener.paths == ["course"]
 
 
 class _FailingOpener:
     @contextmanager
-    def open_regular(self, canonical_root: Path, relative_path: PurePosixPath):
-        del canonical_root, relative_path
+    def open_regular(
+        self,
+        canonical_root: Path,
+        relative_path: PurePosixPath,
+        *,
+        root_anchor=None,
+    ):
+        del canonical_root, relative_path, root_anchor
         raise SecureOpenError("source_open_failed")
         yield io.BytesIO()  # pragma: no cover
+
+    @staticmethod
+    def stat_regular(
+        canonical_root: Path,
+        relative_path: PurePosixPath,
+        *,
+        root_anchor=None,
+    ):
+        del root_anchor
+        return (canonical_root / relative_path.as_posix()).stat(
+            follow_symlinks=False
+        )
 
 
 def test_scanner_isolates_an_open_failure_and_uses_only_safe_messages(tmp_path):
@@ -217,9 +334,15 @@ def test_scanner_applies_aggregate_limit_to_the_metadata_of_the_file_actually_ha
     policy = DEFAULT_SCAN_POLICY.model_copy(update={"max_workspace_bytes": 5})
 
     class GrowBeforeReadScanner(WorkspaceScanner):
-        def _read(self, path, root, relative_path, inspect_archive):
+        def _read(self, path, root, root_anchor, relative_path, inspect_archive):
             path.write_bytes(b"123456")
-            return super()._read(path, root, relative_path, inspect_archive)
+            return super()._read(
+                path,
+                root,
+                root_anchor,
+                relative_path,
+                inspect_archive,
+            )
 
     result = GrowBeforeReadScanner(policy).scan("workspace-1", tmp_path)
 
@@ -237,9 +360,35 @@ def test_scanner_marks_a_file_changed_during_hash_as_failed(tmp_path):
         if path == source and chunk_index == 0:
             source.write_text("after", encoding="utf-8")
 
-    result = WorkspaceScanner(after_hash_chunk=mutate_after_first_chunk).scan(
-        "workspace-1", tmp_path
-    )
+    class SnapshotOpener:
+        @staticmethod
+        def stat_regular(
+            canonical_root: Path,
+            relative_path: PurePosixPath,
+            *,
+            root_anchor=None,
+        ):
+            del root_anchor
+            return (canonical_root / relative_path.as_posix()).stat(
+                follow_symlinks=False
+            )
+
+        @contextmanager
+        def open_regular(
+            self,
+            canonical_root: Path,
+            relative_path: PurePosixPath,
+            *,
+            root_anchor=None,
+        ):
+            del root_anchor
+            yield io.BytesIO(
+                (canonical_root / relative_path.as_posix()).read_bytes()
+            )
+
+    scanner = WorkspaceScanner(after_hash_chunk=mutate_after_first_chunk)
+    scanner._secure_file_opener = SnapshotOpener()
+    result = scanner.scan("workspace-1", tmp_path)
     entry = _entry(result, "notes.txt")
     assert entry.state.value == "failed"
     assert entry.failure_code == "source_changed_during_scan"
@@ -280,6 +429,12 @@ def test_scanner_reuses_an_interrupted_digest_only_for_exact_metadata(tmp_path):
     assert _entry(second, "notes.txt").sha256 == _entry(first, "notes.txt").sha256
     assert _entry(second, "notes.txt").state is SourceState.PENDING_APPROVAL
     assert second.bytes_hashed == 0
+
+
+def test_interrupted_reuse_path_contains_no_unreachable_archive_branch():
+    source = inspect.getsource(WorkspaceScanner._scan_candidate)
+
+    assert 'if format_category == "archive":' not in source
 
 
 def test_scanner_rehashes_approved_files_even_when_metadata_is_restored(tmp_path):
@@ -348,10 +503,33 @@ def test_scanner_inspects_zip_metadata_through_the_secure_opener(tmp_path):
             self.paths = []
             self.delegate = SecureFileOpener()
 
+        def stat_regular(
+            self,
+            canonical_root: Path,
+            relative_path: PurePosixPath,
+            *,
+            root_anchor=None,
+        ):
+            return self.delegate.stat_regular(
+                canonical_root,
+                relative_path,
+                root_anchor=root_anchor,
+            )
+
         @contextmanager
-        def open_regular(self, canonical_root: Path, relative_path: PurePosixPath):
+        def open_regular(
+            self,
+            canonical_root: Path,
+            relative_path: PurePosixPath,
+            *,
+            root_anchor=None,
+        ):
             self.paths.append(relative_path.as_posix())
-            with self.delegate.open_regular(canonical_root, relative_path) as source:
+            with self.delegate.open_regular(
+                canonical_root,
+                relative_path,
+                root_anchor=root_anchor,
+            ) as source:
                 yield source
 
     opener = RecordingOpener()

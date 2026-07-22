@@ -5,6 +5,7 @@ import ntpath
 import os
 import stat
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterator, Protocol
 
@@ -14,6 +15,7 @@ FILE_ATTRIBUTE_NORMAL = 0x80
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+FILE_SHARE_READ = 0x00000001
 FILE_TYPE_DISK = 0x0001
 
 
@@ -23,8 +25,16 @@ class SecureOpenError(RuntimeError):
         super().__init__(code)
 
 
+@dataclass(frozen=True)
+class RootAnchor:
+    canonical_root: Path
+    platform: str
+    directory_fd: int | None = None
+    identity: tuple[int, int] | None = None
+
+
 class _WindowsAdapter(Protocol):
-    def create_file(self, path: str, *, flags: int) -> int: ...
+    def create_file(self, path: str, *, flags: int, share_mode: int) -> int: ...
 
     def get_attributes(self, handle: int) -> int: ...
 
@@ -134,14 +144,13 @@ class _NativeWindowsAdapter:
         ]
         self._kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
 
-    def create_file(self, path: str, *, flags: int) -> int:
+    def create_file(self, path: str, *, flags: int, share_mode: int) -> int:
         generic_read = 0x80000000
-        share_read_write = 0x00000001 | 0x00000002
         open_existing = 3
         handle = self._kernel32.CreateFileW(
             path,
             generic_read,
-            share_read_write,
+            share_mode,
             None,
             open_existing,
             flags,
@@ -197,17 +206,82 @@ class SecureFileOpener:
 
     @contextmanager
     def open_regular(
-        self, canonical_root: Path, relative_path: PurePosixPath
+        self,
+        canonical_root: Path,
+        relative_path: PurePosixPath,
+        *,
+        root_anchor: RootAnchor | None = None,
     ) -> Iterator[BinaryIO]:
         parts = _validate_relative_path(relative_path)
+        if root_anchor is not None and root_anchor.platform != self._platform:
+            raise SecureOpenError("source_root_invalid")
         if self._platform == "windows":
             with self._open_windows(canonical_root, parts) as source:
                 yield source
             return
         if self._platform != "posix":
             raise ValueError(f"unsupported secure-open platform: {self._platform}")
-        with self._open_posix(canonical_root, parts) as source:
+        anchored_fd = root_anchor.directory_fd if root_anchor is not None else None
+        with self._open_posix(canonical_root, parts, root_fd=anchored_fd) as source:
             yield source
+
+    def stat_regular(
+        self,
+        canonical_root: Path,
+        relative_path: PurePosixPath,
+        *,
+        root_anchor: RootAnchor | None = None,
+    ) -> os.stat_result:
+        with self.open_regular(
+            canonical_root,
+            relative_path,
+            root_anchor=root_anchor,
+        ) as source:
+            return os.fstat(source.fileno())
+
+    @contextmanager
+    def anchor_root(self, root: Path) -> Iterator[RootAnchor]:
+        if self._platform == "windows":
+            with self._anchor_windows_root(root) as anchor:
+                yield anchor
+            return
+        if self._platform != "posix":
+            raise ValueError(f"unsupported secure-open platform: {self._platform}")
+        with self._anchor_posix_root(root) as anchor:
+            yield anchor
+
+    @contextmanager
+    def _anchor_posix_root(self, root: Path) -> Iterator[RootAnchor]:
+        root_fd: int | None = None
+        try:
+            flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            root_fd = os.open(root, flags)
+            root_stat = os.fstat(root_fd)
+            if not stat.S_ISDIR(root_stat.st_mode):
+                raise SecureOpenError("source_root_invalid")
+            canonical_root = root.resolve(strict=True)
+            canonical_stat = canonical_root.stat(follow_symlinks=False)
+            if (root_stat.st_dev, root_stat.st_ino) != (
+                canonical_stat.st_dev,
+                canonical_stat.st_ino,
+            ):
+                raise SecureOpenError("source_link_or_reparse")
+            yield RootAnchor(
+                canonical_root=canonical_root,
+                platform="posix",
+                directory_fd=root_fd,
+                identity=(root_stat.st_dev, root_stat.st_ino),
+            )
+        except SecureOpenError:
+            raise
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise SecureOpenError("source_link_or_reparse") from None
+            raise SecureOpenError("source_root_invalid") from None
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
 
     @contextmanager
     def anchor_directory(
@@ -267,13 +341,23 @@ class SecureFileOpener:
                 os.close(child_fd)
 
     @contextmanager
-    def _open_posix(self, canonical_root: Path, parts: tuple[str, ...]) -> Iterator[BinaryIO]:
+    def _open_posix(
+        self,
+        canonical_root: Path,
+        parts: tuple[str, ...],
+        *,
+        root_fd: int | None = None,
+    ) -> Iterator[BinaryIO]:
         directory_fds: list[int] = []
         file_fd: int | None = None
         try:
             root_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
             root_flags |= getattr(os, "O_NOFOLLOW", 0)
-            directory_fds.append(os.open(canonical_root, root_flags))
+            directory_fds.append(
+                os.open(canonical_root, root_flags)
+                if root_fd is None
+                else os.dup(root_fd)
+            )
             directory_flags = root_flags
             for part in parts[:-1]:
                 directory_fds.append(os.open(part, directory_flags, dir_fd=directory_fds[-1]))
@@ -307,7 +391,11 @@ class SecureFileOpener:
             directory_flags = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
             for count in range(len(parts)):
                 directory_path = ntpath.join(root_path, *parts[:count])
-                directory_handle = adapter.create_file(directory_path, flags=directory_flags)
+                directory_handle = adapter.create_file(
+                    directory_path,
+                    flags=directory_flags,
+                    share_mode=FILE_SHARE_READ,
+                )
                 directory_handles.append(directory_handle)
                 attributes = adapter.get_attributes(directory_handle)
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
@@ -318,7 +406,11 @@ class SecureFileOpener:
                     raise SecureOpenError("source_not_regular")
 
             file_path = ntpath.join(root_path, *parts)
-            file_handle = adapter.create_file(file_path, flags=FILE_FLAG_OPEN_REPARSE_POINT)
+            file_handle = adapter.create_file(
+                file_path,
+                flags=FILE_FLAG_OPEN_REPARSE_POINT,
+                share_mode=FILE_SHARE_READ,
+            )
             attributes = adapter.get_attributes(file_handle)
             if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
                 raise SecureOpenError("source_link_or_reparse")
@@ -357,7 +449,11 @@ class SecureFileOpener:
             flags = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
             for count in range(len(parts) + 1):
                 directory_path = ntpath.join(root_path, *parts[:count])
-                directory_handle = adapter.create_file(directory_path, flags=flags)
+                directory_handle = adapter.create_file(
+                    directory_path,
+                    flags=flags,
+                    share_mode=FILE_SHARE_READ,
+                )
                 directory_handles.append(directory_handle)
                 attributes = adapter.get_attributes(directory_handle)
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
@@ -379,3 +475,33 @@ class SecureFileOpener:
         finally:
             for directory_handle in reversed(directory_handles):
                 adapter.close_handle(directory_handle)
+
+    @contextmanager
+    def _anchor_windows_root(self, root: Path) -> Iterator[RootAnchor]:
+        adapter = self._windows_adapter or _NativeWindowsAdapter()
+        root_handle: int | None = None
+        try:
+            flags = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
+            root_handle = adapter.create_file(
+                ntpath.abspath(str(root)),
+                flags=flags,
+                share_mode=FILE_SHARE_READ,
+            )
+            attributes = adapter.get_attributes(root_handle)
+            if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                raise SecureOpenError("source_link_or_reparse")
+            if not attributes & FILE_ATTRIBUTE_DIRECTORY:
+                raise SecureOpenError("source_root_invalid")
+            if adapter.get_file_type(root_handle) != FILE_TYPE_DISK:
+                raise SecureOpenError("source_root_invalid")
+            canonical_root = Path(
+                _normalize_windows_final_path(adapter.get_final_path(root_handle))
+            )
+            yield RootAnchor(canonical_root=canonical_root, platform="windows")
+        except SecureOpenError:
+            raise
+        except OSError:
+            raise SecureOpenError("source_root_invalid") from None
+        finally:
+            if root_handle is not None:
+                adapter.close_handle(root_handle)

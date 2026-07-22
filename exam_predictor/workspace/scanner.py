@@ -13,6 +13,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from exam_predictor.workspace.archive import ArchiveInspector
 from exam_predictor.workspace.filesystem import (
+    RootAnchor,
     SecureFileOpener,
     SecureOpenError,
     is_reparse_point as native_is_reparse_point,
@@ -138,9 +139,27 @@ class WorkspaceScanner:
         previous_entries: Sequence[ManifestEntry] = (),
         emit: Callable[[ScanProgress], None] | None = None,
     ) -> ScanResult:
-        canonical_root = self._canonical_root(root)
+        with self._directory_opener.anchor_root(root) as root_anchor:
+            canonical_root = self._canonical_root(root, root_anchor)
+            return self._scan_anchored(
+                workspace_id,
+                canonical_root,
+                root_anchor,
+                previous_entries=previous_entries,
+                emit=emit,
+            )
+
+    def _scan_anchored(
+        self,
+        workspace_id: str,
+        canonical_root: Path,
+        root_anchor: RootAnchor,
+        *,
+        previous_entries: Sequence[ManifestEntry],
+        emit: Callable[[ScanProgress], None] | None,
+    ) -> ScanResult:
         namespace = _workspace_namespace(workspace_id)
-        candidates = self._enumerate(canonical_root)
+        candidates = self._enumerate(canonical_root, root_anchor)
         previous_native = {
             entry.relative_path: entry
             for entry in previous_entries
@@ -161,6 +180,7 @@ class WorkspaceScanner:
                 workspace_id,
                 namespace,
                 canonical_root,
+                root_anchor,
                 candidate,
                 previous_native.get(candidate.relative_path),
                 file_count=file_count,
@@ -234,21 +254,30 @@ class WorkspaceScanner:
             completed_at=datetime.now(UTC),
         )
 
-    def _canonical_root(self, root: Path) -> Path:
+    def _canonical_root(self, root: Path, root_anchor: RootAnchor) -> Path:
         try:
             if root.is_symlink() or self._is_reparse_point(root):
                 raise SecureOpenError(SOURCE_LINK_OR_REPARSE)
             canonical_root = root.resolve(strict=True)
             root_stat = canonical_root.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(root_stat.st_mode) or self._is_reparse_point(
+                canonical_root
+            ):
+                raise SecureOpenError("source_root_invalid")
         except SecureOpenError:
             raise
         except OSError:
             raise SecureOpenError("source_root_invalid") from None
-        if not stat.S_ISDIR(root_stat.st_mode) or self._is_reparse_point(canonical_root):
-            raise SecureOpenError("source_root_invalid")
+        if root_anchor.identity is not None:
+            if root_anchor.identity != (root_stat.st_dev, root_stat.st_ino):
+                raise SecureOpenError(SOURCE_LINK_OR_REPARSE)
+        elif os.path.normcase(os.path.abspath(canonical_root)) != os.path.normcase(
+            os.path.abspath(root_anchor.canonical_root)
+        ):
+            raise SecureOpenError(SOURCE_LINK_OR_REPARSE)
         return canonical_root
 
-    def _enumerate(self, root: Path) -> list[_Candidate]:
+    def _enumerate(self, root: Path, root_anchor: RootAnchor) -> list[_Candidate]:
         candidates: list[_Candidate] = []
 
         def walk(
@@ -344,8 +373,7 @@ class WorkspaceScanner:
                 candidates.append(_Candidate(path, relative_path, "file", metadata))
 
         try:
-            with self._directory_opener.anchor_directory(root) as root_fd:
-                walk(root, (), root_fd)
+            walk(root, (), root_anchor.directory_fd)
         except SecureOpenError:
             raise
         except OSError:
@@ -358,6 +386,7 @@ class WorkspaceScanner:
         workspace_id: str,
         namespace: UUID,
         root: Path,
+        root_anchor: RootAnchor,
         candidate: _Candidate,
         previous: ManifestEntry | None,
         *,
@@ -397,50 +426,36 @@ class WorkspaceScanner:
         if selected_bytes + metadata.st_size > self._policy.max_workspace_bytes:
             return self._failed_entry(base, SOURCE_WORKSPACE_SIZE_LIMIT), (), 0, 0
 
-        reusable_metadata = (
-            self._reusable_metadata(candidate.path, previous) if previous is not None else None
-        )
         if (
             previous is not None
             and previous.state is SourceState.PENDING_APPROVAL
             and format_category != "archive"
-            and reusable_metadata is not None
         ):
-            base.update(_metadata_fields(reusable_metadata))
-            state = (
-                previous.state
-                if previous.state in {SourceState.APPROVED, SourceState.CHANGED}
-                else SourceState.PENDING_APPROVAL
+            reusable_metadata = self._reusable_metadata(
+                root,
+                root_anchor,
+                candidate.relative_path,
+                previous,
             )
-            members: tuple[ArchiveMember, ...] = ()
-            read_bytes = 0
-            if format_category == "archive":
-                archive_outcome = self._read(candidate.path, root, candidate.relative_path, True)
-                read_bytes = archive_outcome.bytes_hashed
-                if archive_outcome.failure_code:
-                    return (
-                        self._failed_entry(base, archive_outcome.failure_code),
-                        (),
-                        read_bytes,
-                        0,
-                    )
-                members = archive_outcome.archive_members
-            return (
-                ManifestEntry(
-                    **base,
-                    sha256=previous.sha256,
-                    state=state,
-                    included=previous.included,
-                    inclusion_reason=previous.inclusion_reason,
-                ),
-                members,
-                read_bytes,
-                reusable_metadata.st_size,
-            )
+            if reusable_metadata is not None:
+                base.update(_metadata_fields(reusable_metadata))
+                return (
+                    ManifestEntry(
+                        **base,
+                        sha256=previous.sha256,
+                        state=SourceState.PENDING_APPROVAL,
+                        included=previous.included,
+                        inclusion_reason=previous.inclusion_reason,
+                    ),
+                    (),
+                    0,
+                    reusable_metadata.st_size,
+                )
 
         outcome = self._read(
             candidate.path,
             root,
+            root_anchor,
             candidate.relative_path,
             format_category == "archive",
         )
@@ -482,17 +497,25 @@ class WorkspaceScanner:
         self,
         path: Path,
         root: Path,
+        root_anchor: RootAnchor,
         relative_path: str,
         inspect_archive: bool,
     ) -> _ReadOutcome:
         bytes_hashed = 0
         members: tuple[ArchiveMember, ...] = ()
         try:
-            before = path.stat(follow_symlinks=False)
-            if not stat.S_ISREG(before.st_mode) or path.is_symlink() or self._is_reparse_point(path):
-                return _ReadOutcome(None, 0, failure_code=SOURCE_LINK_OR_REPARSE)
+            relative = PurePosixPath(relative_path)
+            before = self._secure_file_opener.stat_regular(
+                root,
+                relative,
+                root_anchor=root_anchor,
+            )
             digest = hashlib.sha256()
-            with self._secure_file_opener.open_regular(root, PurePosixPath(relative_path)) as source:
+            with self._secure_file_opener.open_regular(
+                root,
+                relative,
+                root_anchor=root_anchor,
+            ) as source:
                 for chunk_index, chunk in enumerate(
                     iter(lambda: source.read(self._policy.hash_chunk_bytes), b"")
                 ):
@@ -508,7 +531,11 @@ class WorkspaceScanner:
                             parent_entry_id="pending",
                         )
                     )
-            after = path.stat(follow_symlinks=False)
+            after = self._secure_file_opener.stat_regular(
+                root,
+                relative,
+                root_anchor=root_anchor,
+            )
         except SecureOpenError as error:
             return _ReadOutcome(None, bytes_hashed, failure_code=error.code)
         except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
@@ -521,15 +548,19 @@ class WorkspaceScanner:
 
     def _reusable_metadata(
         self,
-        path: Path,
+        root: Path,
+        root_anchor: RootAnchor,
+        relative_path: str,
         previous: ManifestEntry,
     ) -> os.stat_result | None:
         if previous.sha256 is None:
             return None
         try:
-            before = path.stat(follow_symlinks=False)
-            if path.is_symlink() or self._is_reparse_point(path):
-                return None
+            before = self._secure_file_opener.stat_regular(
+                root,
+                PurePosixPath(relative_path),
+                root_anchor=root_anchor,
+            )
             expected = (
                 previous.device_id,
                 previous.file_id,
@@ -537,10 +568,9 @@ class WorkspaceScanner:
                 previous.modified_ns,
             )
             current = (str(before.st_dev), str(before.st_ino), before.st_size, before.st_mtime_ns)
-            after = path.stat(follow_symlinks=False)
-        except OSError:
+        except (OSError, SecureOpenError):
             return None
-        if _stat_identity(before) == _stat_identity(after) and expected == current:
+        if expected == current:
             return before
         return None
 

@@ -22,6 +22,8 @@ ARCHIVE_DEPTH_LIMIT = "archive_depth_limit"
 _END_OF_CENTRAL_DIRECTORY = b"PK\x05\x06"
 _END_OF_CENTRAL_DIRECTORY_SIZE = 22
 _MAX_ZIP_COMMENT_BYTES = 65_535
+_CENTRAL_DIRECTORY_HEADER = b"PK\x01\x02"
+_CENTRAL_DIRECTORY_HEADER_SIZE = 46
 
 
 def _normalized_member_path(info: zipfile.ZipInfo) -> tuple[str, PurePosixPath]:
@@ -47,7 +49,9 @@ def _member_failure(info: zipfile.ZipInfo, policy: ScanPolicy) -> str | None:
     return None
 
 
-def _declared_central_directory(archive_stream: BinaryIO) -> tuple[int, int]:
+def _declared_central_directory(
+    archive_stream: BinaryIO,
+) -> tuple[int, int, int, int]:
     original_position = archive_stream.tell()
     try:
         archive_stream.seek(0, 2)
@@ -69,8 +73,58 @@ def _declared_central_directory(archive_stream: BinaryIO) -> tuple[int, int]:
                 if offset + _END_OF_CENTRAL_DIRECTORY_SIZE + comment_bytes == len(tail):
                     entries_total = fields[4]
                     central_directory_bytes = fields[5]
-                    return entries_total, central_directory_bytes
+                    central_directory_offset = fields[6]
+                    eocd_offset = archive_size - tail_size + offset
+                    return (
+                        entries_total,
+                        central_directory_bytes,
+                        central_directory_offset,
+                        eocd_offset,
+                    )
             search_end = offset
+    finally:
+        archive_stream.seek(original_position)
+
+
+def _count_central_directory_records(
+    archive_stream: BinaryIO,
+    *,
+    central_directory_bytes: int,
+    central_directory_offset: int,
+    eocd_offset: int,
+    max_members: int,
+) -> int:
+    original_position = archive_stream.tell()
+    try:
+        prefix_bytes = eocd_offset - central_directory_bytes - central_directory_offset
+        actual_offset = central_directory_offset + prefix_bytes
+        if prefix_bytes < 0 or actual_offset < 0:
+            raise zipfile.BadZipFile("invalid central directory offset")
+        if actual_offset + central_directory_bytes > eocd_offset:
+            raise zipfile.BadZipFile("central directory overlaps end record")
+
+        archive_stream.seek(actual_offset)
+        remaining = central_directory_bytes
+        member_count = 0
+        while remaining:
+            if remaining < _CENTRAL_DIRECTORY_HEADER_SIZE:
+                raise zipfile.BadZipFile("truncated central directory")
+            header = archive_stream.read(_CENTRAL_DIRECTORY_HEADER_SIZE)
+            if len(header) != _CENTRAL_DIRECTORY_HEADER_SIZE:
+                raise zipfile.BadZipFile("truncated central directory")
+            fields = struct.unpack("<4s6H3L5H2L", header)
+            if fields[0] != _CENTRAL_DIRECTORY_HEADER:
+                raise zipfile.BadZipFile("invalid central directory signature")
+            variable_bytes = fields[10] + fields[11] + fields[12]
+            record_bytes = _CENTRAL_DIRECTORY_HEADER_SIZE + variable_bytes
+            if record_bytes > remaining:
+                raise zipfile.BadZipFile("invalid central directory record length")
+            member_count += 1
+            if member_count > max_members:
+                return member_count
+            archive_stream.seek(variable_bytes, 1)
+            remaining -= record_bytes
+        return member_count
     finally:
         archive_stream.seek(original_position)
 
@@ -94,9 +148,12 @@ class ArchiveInspector:
     def inspect(
         self, archive_stream: BinaryIO, *, parent_entry_id: str
     ) -> Sequence[ArchiveMember]:
-        declared_members, central_directory_bytes = _declared_central_directory(
-            archive_stream
-        )
+        (
+            declared_members,
+            central_directory_bytes,
+            central_directory_offset,
+            eocd_offset,
+        ) = _declared_central_directory(archive_stream)
         max_central_directory_bytes = max(
             4_096,
             self._policy.max_archive_members
@@ -109,6 +166,18 @@ class ArchiveInspector:
             or central_directory_bytes > max_central_directory_bytes
         ):
             return (_archive_limit_member(parent_entry_id, ARCHIVE_MEMBER_LIMIT),)
+
+        actual_members = _count_central_directory_records(
+            archive_stream,
+            central_directory_bytes=central_directory_bytes,
+            central_directory_offset=central_directory_offset,
+            eocd_offset=eocd_offset,
+            max_members=self._policy.max_archive_members,
+        )
+        if actual_members > self._policy.max_archive_members:
+            return (_archive_limit_member(parent_entry_id, ARCHIVE_MEMBER_LIMIT),)
+        if actual_members != declared_members:
+            raise zipfile.BadZipFile("central directory member count mismatch")
 
         members: list[ArchiveMember] = []
         expanded_bytes = 0

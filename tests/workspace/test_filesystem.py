@@ -12,6 +12,7 @@ from exam_predictor.workspace.filesystem import (
     FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_READ,
     FILE_TYPE_DISK,
     SecureFileOpener,
     SecureOpenError,
@@ -138,7 +139,7 @@ class _ClosingBytesIO(io.BytesIO):
 class FakeWindowsAdapter:
     def __init__(self) -> None:
         self.next_handle = 10
-        self.opened: list[tuple[str, int]] = []
+        self.opened: list[tuple[str, int, int]] = []
         self.closed: list[int] = []
         self.events: list[str] = []
         self.attributes: dict[int, int] = {}
@@ -146,10 +147,10 @@ class FakeWindowsAdapter:
         self.file_types: dict[int, int] = {}
         self.contents = b"approved"
 
-    def create_file(self, path: str, *, flags: int) -> int:
+    def create_file(self, path: str, *, flags: int, share_mode: int) -> int:
         handle = self.next_handle
         self.next_handle += 1
-        self.opened.append((path, flags))
+        self.opened.append((path, flags, share_mode))
         self.events.append(f"open:{path}")
         is_file = path.casefold().endswith("notes.txt")
         self.attributes[handle] = FILE_ATTRIBUTE_NORMAL if is_file else FILE_ATTRIBUTE_DIRECTORY
@@ -190,8 +191,9 @@ def test_windows_secure_opener_uses_reparse_point_flags_and_checks_before_wrappi
         assert handle.read() == b"approved"
 
     assert len(adapter.opened) == 3
-    assert all(flags & FILE_FLAG_OPEN_REPARSE_POINT for _, flags in adapter.opened)
-    assert all(flags & FILE_FLAG_BACKUP_SEMANTICS for _, flags in adapter.opened[:-1])
+    assert all(flags & FILE_FLAG_OPEN_REPARSE_POINT for _, flags, _ in adapter.opened)
+    assert all(flags & FILE_FLAG_BACKUP_SEMANTICS for _, flags, _ in adapter.opened[:-1])
+    assert all(share_mode == FILE_SHARE_READ for _, _, share_mode in adapter.opened)
     final_handle = max(adapter.attributes)
     assert adapter.events.index(f"attributes:{final_handle}") < adapter.events.index(
         f"wrap:{final_handle}"
@@ -213,8 +215,9 @@ def test_windows_directory_anchor_holds_verified_handles_until_exit():
         assert target is None
         assert adapter.closed == []
         assert len(adapter.opened) == 2
-        assert all(flags & FILE_FLAG_OPEN_REPARSE_POINT for _, flags in adapter.opened)
-        assert all(flags & FILE_FLAG_BACKUP_SEMANTICS for _, flags in adapter.opened)
+        assert all(flags & FILE_FLAG_OPEN_REPARSE_POINT for _, flags, _ in adapter.opened)
+        assert all(flags & FILE_FLAG_BACKUP_SEMANTICS for _, flags, _ in adapter.opened)
+        assert all(share_mode == FILE_SHARE_READ for _, _, share_mode in adapter.opened)
 
     assert adapter.closed == [11, 10]
 
