@@ -432,6 +432,42 @@ def test_scanner_applies_file_count_limit_in_deterministic_order(tmp_path):
     assert _entry(result, "b.txt").failure_code == "source_file_count_limit"
 
 
+def test_scanner_file_count_limit_bounds_scandir_consumption(tmp_path, monkeypatch):
+    for index in range(100):
+        (tmp_path / f"{index:03}.txt").write_bytes(b"x")
+    policy = DEFAULT_SCAN_POLICY.model_copy(update={"max_files": 3})
+    real_scandir = os.scandir
+    consumed = 0
+
+    class CountingIterator:
+        def __init__(self, target):
+            self._iterator = real_scandir(target)
+
+        def __enter__(self):
+            self._iterator.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._iterator.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal consumed
+            entry = next(self._iterator)
+            consumed += 1
+            return entry
+
+    monkeypatch.setattr(os, "scandir", CountingIterator)
+
+    result = WorkspaceScanner(policy).scan("workspace-1", tmp_path)
+
+    assert consumed <= policy.max_files + 1
+    assert len(result.entries) == policy.max_files + 1
+    assert result.entries[-1].failure_code == "source_file_count_limit"
+
+
 def test_scanner_applies_aggregate_selected_size_without_large_fixtures(tmp_path):
     (tmp_path / "a.txt").write_bytes(b"1234")
     (tmp_path / "b.txt").write_bytes(b"5678")

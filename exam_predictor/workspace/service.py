@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import threading
 from dataclasses import dataclass
 from collections.abc import Callable, Iterator, Sequence
@@ -41,6 +42,8 @@ from exam_predictor.workspace.store import (
     WorkspaceNotFoundError,
     WorkspaceStore,
 )
+
+_BROWSER_TEMP_NAME = re.compile(r"\.browser-intake-[0-9a-f]{32}\.tmp\Z")
 
 
 class WorkspaceRunGuard(Protocol):
@@ -107,8 +110,8 @@ class WorkspaceService:
             self._active_workspaces.clear()
             self._active_jobs.clear()
             self._enqueued_job_ids.clear()
-            self._store.interrupt_claimed_creations()
             self._discover_browser_orphans()
+            self._store.interrupt_claimed_creations()
             self._recover_cleanup()
             for job in self._store.recover_unfinished_jobs():
                 self._queue_existing(job)
@@ -581,14 +584,24 @@ class WorkspaceService:
                         "cleanup_identity_missing",
                     )
                     continue
-                if owned_path.exists():
-                    self._remove_owned_tree(
-                        OwnedTreeClaim(
-                            relative_path=record.owned_relative_path,
-                            device_id=record.deletion_root_device,
-                            file_id=record.deletion_root_file_id,
-                        )
+                try:
+                    owned_path.lstat()
+                except FileNotFoundError:
+                    self._store.complete_cleanup(record.cleanup_id)
+                    continue
+                validation = self._scanner.revalidate_entries(owned_path)
+                if (
+                    validation.root_device != record.deletion_root_device
+                    or validation.root_file_id != record.deletion_root_file_id
+                ):
+                    raise WorkspaceOperationError("cleanup_identity_changed")
+                self._remove_owned_tree(
+                    OwnedTreeClaim(
+                        relative_path=record.owned_relative_path,
+                        device_id=record.deletion_root_device,
+                        file_id=record.deletion_root_file_id,
                     )
+                )
                 self._store.complete_cleanup(record.cleanup_id)
             except Exception:
                 self._store.fail_cleanup(record.cleanup_id, "cleanup_retry_failed")
@@ -643,7 +656,12 @@ class WorkspaceService:
             and parts[2].startswith(".examsage-browser-orphan-")
             and len(parts[2]) <= 96
         )
-        if parts not in exact_paths and not is_task4_orphan:
+        is_browser_temp = (
+            len(parts) == 3
+            and parts[:2] == ("workspaces", workspace_id)
+            and _BROWSER_TEMP_NAME.fullmatch(parts[2]) is not None
+        )
+        if parts not in exact_paths and not is_task4_orphan and not is_browser_temp:
             raise WorkspaceOperationError("cleanup_path_invalid")
         candidate = data_root.joinpath(*parts).absolute()
         if candidate != data_root.joinpath(*parts):
@@ -652,6 +670,10 @@ class WorkspaceService:
 
     def _discover_browser_orphans(self) -> None:
         workspaces_root = self._store.database_path.parent / "workspaces"
+        claimed_workspaces = {
+            request.workspace_id
+            for request in self._store.list_recoverable_browser_creations()
+        }
         try:
             workspaces = tuple(workspaces_root.iterdir())
         except OSError:
@@ -664,13 +686,32 @@ class WorkspaceService:
             except OSError:
                 continue
             for child in children:
-                if not child.name.startswith(".examsage-browser-orphan-"):
+                is_task4_orphan = child.name.startswith(
+                    ".examsage-browser-orphan-"
+                )
+                is_claimed_remnant = workspace_root.name in claimed_workspaces and (
+                    child.name == "browser-intake"
+                    or _BROWSER_TEMP_NAME.fullmatch(child.name) is not None
+                )
+                if not is_task4_orphan and not is_claimed_remnant:
                     continue
+                identity = (
+                    self._try_cleanup_identity(child)
+                    if workspace_root.name in claimed_workspaces
+                    else None
+                )
                 self._queue_orphan_cleanup(
                     workspace_root.name,
                     child,
-                    None,
+                    identity,
                 )
+
+    def _try_cleanup_identity(self, owned_path: Path) -> tuple[str, str] | None:
+        try:
+            validation = self._scanner.revalidate_entries(owned_path)
+        except (OSError, SecureOpenError):
+            return None
+        return validation.root_device, validation.root_file_id
 
     @staticmethod
     def _secure_cleanup_unavailable(claim: OwnedTreeClaim) -> None:

@@ -853,6 +853,17 @@ class WorkspaceStore:
             ).fetchone()
         return self._creation_request(row) if row is not None else None
 
+    def list_recoverable_browser_creations(self) -> Sequence[CreationRequest]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM workspace_creation_requests
+                   WHERE operation_kind = ?
+                     AND state IN ('claimed', 'interrupted', 'failed')
+                   ORDER BY created_at ASC, rowid ASC""",
+                (SourceMode.BROWSER_SNAPSHOT.value,),
+            ).fetchall()
+        return tuple(self._creation_request(row) for row in rows)
+
     def get_creation_job(self, idempotency_key: str) -> WorkspaceJob | None:
         request = self.get_creation_request(idempotency_key)
         if request is None or request.state != "completed" or request.job_id is None:

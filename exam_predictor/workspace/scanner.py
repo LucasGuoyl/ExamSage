@@ -8,6 +8,7 @@ import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path, PurePosixPath
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -399,6 +400,7 @@ class WorkspaceScanner:
 
     def _enumerate(self, root: Path, root_anchor: RootAnchor) -> list[_Candidate]:
         candidates: list[_Candidate] = []
+        consumed_entries = 0
         processed_candidates = 0
         limit_reached = False
 
@@ -407,15 +409,19 @@ class WorkspaceScanner:
             parent_parts: tuple[str, ...],
             directory_fd: int | None,
         ) -> None:
-            nonlocal processed_candidates, limit_reached
+            nonlocal consumed_entries, processed_candidates, limit_reached
             if limit_reached:
+                return
+            remaining_budget = self._policy.max_files + 1 - consumed_entries
+            if remaining_budget <= 0:
                 return
             scan_target = directory if directory_fd is None else directory_fd
             with os.scandir(scan_target) as iterator:
                 directory_entries = sorted(
-                    iterator,
+                    islice(iterator, remaining_budget),
                     key=lambda item: (item.name.casefold(), item.name),
                 )
+            consumed_entries += len(directory_entries)
             for directory_entry in directory_entries:
                 if limit_reached:
                     return

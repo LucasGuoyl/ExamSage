@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import shutil
 import threading
 import time
@@ -12,6 +13,7 @@ import pytest
 from exam_predictor.workspace.browser_intake import BrowserIntakeWriter, BrowserUpload
 from exam_predictor.workspace.filesystem import SecureOpenError
 from exam_predictor.workspace.models import (
+    SourceMode,
     SourceState,
     WorkspaceJobStatus,
     WorkspaceState,
@@ -91,6 +93,13 @@ def _secure_test_remover(data_root: Path, removed: list[Path] | None = None):
             removed.append(path)
 
     return remove
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
 
 
 @pytest.fixture
@@ -419,7 +428,11 @@ def test_unproven_browser_snapshot_orphan_remains_visible_and_is_never_deleted(
     restarted.start()
     try:
         assert owned_path.exists()
-        [pending] = store.list_cleanup()
+        pending = next(
+            record
+            for record in store.list_cleanup()
+            if record.cleanup_id == cleanup.cleanup_id
+        )
         assert pending.cleanup_id == cleanup.cleanup_id
         assert pending.deletion_root_device is None
         assert pending.deletion_root_file_id is None
@@ -481,6 +494,136 @@ def test_start_discovers_task4_browser_orphans_but_does_not_delete_them(
         assert record.owned_relative_path.endswith(orphan.name)
         assert record.deletion_root_device is None
         assert record.deletion_root_file_id is None
+    finally:
+        service.shutdown()
+
+
+def test_start_records_a_claimed_browser_temporary_remnant(
+    tmp_path: Path, store: WorkspaceStore
+):
+    workspace_id = "browser-temp-crash"
+    store.claim_creation(
+        "upload-temp-crash",
+        SourceMode.BROWSER_SNAPSHOT,
+        workspace_id,
+    )
+    remnant = (
+        tmp_path
+        / "workspaces"
+        / workspace_id
+        / ".browser-intake-0123456789abcdef0123456789abcdef.tmp"
+    )
+    remnant.mkdir(parents=True)
+    service = _service(tmp_path, store, FakePicker([]), FakeRunGuard())
+
+    service.start()
+    try:
+        [record] = store.list_cleanup()
+        assert record.workspace_id == workspace_id
+        assert record.owned_relative_path.endswith(remnant.name)
+        assert record.deletion_root_device is not None
+        assert record.deletion_root_file_id is not None
+        assert remnant.exists()
+    finally:
+        service.shutdown()
+
+
+def test_start_records_a_claimed_published_browser_intake_remnant(
+    tmp_path: Path, store: WorkspaceStore
+):
+    workspace_id = "browser-published-crash"
+    store.claim_creation(
+        "upload-published-crash",
+        SourceMode.BROWSER_SNAPSHOT,
+        workspace_id,
+    )
+    writer = BrowserIntakeWriter(tmp_path / "workspaces")
+    remnant = writer.create_snapshot(
+        workspace_id,
+        [BrowserUpload("notes.txt", 5, io.BytesIO(b"notes"))],
+    )
+    service = _service(tmp_path, store, FakePicker([]), FakeRunGuard())
+
+    service.start()
+    try:
+        [record] = store.list_cleanup()
+        assert record.workspace_id == workspace_id
+        assert record.owned_relative_path.endswith("/browser-intake")
+        assert record.deletion_root_device is not None
+        assert record.deletion_root_file_id is not None
+        assert remnant.exists()
+    finally:
+        service.shutdown()
+
+
+def test_cleanup_recovery_keeps_a_dangling_link_pending(
+    tmp_path: Path, store: WorkspaceStore
+):
+    owned_path = tmp_path / "workspaces" / "dangling-workspace" / "browser-intake"
+    owned_path.parent.mkdir(parents=True)
+    _symlink_or_skip(owned_path, tmp_path / "missing-cleanup-target")
+    store.queue_cleanup(
+        "dangling-workspace",
+        owned_path,
+        "cleanup_pending",
+        deletion_root_identity=("7", "22"),
+    )
+    removed: list[OwnedTreeClaim] = []
+    service = _service(
+        tmp_path,
+        store,
+        FakePicker([]),
+        FakeRunGuard(),
+        remove_owned_tree=removed.append,
+    )
+
+    service.start()
+    try:
+        assert removed == []
+        [record] = store.list_cleanup()
+        assert record.attempt_count == 1
+        assert os.path.lexists(owned_path)
+    finally:
+        service.shutdown()
+
+
+def test_cleanup_recovery_keeps_an_inaccessible_path_pending(
+    tmp_path: Path, store: WorkspaceStore, monkeypatch
+):
+    owned_path = tmp_path / "workspaces" / "blocked-workspace" / "browser-intake"
+    owned_path.mkdir(parents=True)
+    validation = WorkspaceScanner().revalidate_entries(owned_path)
+    store.queue_cleanup(
+        "blocked-workspace",
+        owned_path,
+        "cleanup_pending",
+        deletion_root_identity=(
+            validation.root_device,
+            validation.root_file_id,
+        ),
+    )
+    real_lstat = Path.lstat
+
+    def inaccessible_lstat(path):
+        if path == owned_path:
+            raise PermissionError("blocked")
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", inaccessible_lstat)
+    removed: list[OwnedTreeClaim] = []
+    service = _service(
+        tmp_path,
+        store,
+        FakePicker([]),
+        FakeRunGuard(),
+        remove_owned_tree=removed.append,
+    )
+
+    service.start()
+    try:
+        assert removed == []
+        [record] = store.list_cleanup()
+        assert record.attempt_count == 1
     finally:
         service.shutdown()
 
