@@ -84,9 +84,17 @@ class KeyringCredentialVault:
     def delete(self, profile_id: str) -> None:
         account = self._account(profile_id)
         unavailable = False
+        missing = False
         try:
             self._backend.delete_password(self.SERVICE_NAME, account)
-        except Exception:
-            unavailable = True
+        except Exception as exc:
+            exception_type = type(exc)
+            missing = (
+                exception_type.__module__ == "keyring.errors"
+                and exception_type.__name__ == "PasswordDeleteError"
+            )
+            unavailable = not missing
+        if missing:
+            return
         if unavailable:
             raise VaultUnavailableError(self._UNAVAILABLE)

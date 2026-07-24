@@ -108,3 +108,22 @@ def test_missing_native_keyring_import_is_reported_without_exception_context(
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
     assert sentinel not in repr(captured.value)
+
+
+def test_native_missing_password_delete_is_idempotent():
+    class PasswordDeleteError(Exception):
+        pass
+
+    PasswordDeleteError.__module__ = "keyring.errors"
+
+    class MissingDeleteKeyring(FakeKeyring):
+        def delete_password(self, service: str, account: str) -> None:
+            self.calls.append(("delete", service, account))
+            raise PasswordDeleteError("Password not found")
+
+    backend = MissingDeleteKeyring()
+    vault = KeyringCredentialVault(backend)
+
+    vault.delete("primary")
+
+    assert backend.calls == [("delete", "ExamSage", "provider:primary")]

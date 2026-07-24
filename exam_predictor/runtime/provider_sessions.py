@@ -6,7 +6,12 @@ from typing import Any
 
 from exam_predictor.providers import BaseProvider, create_provider
 
-from .models import ConnectProviderRequest, ProviderDescriptor, ProviderProfile
+from .models import (
+    ConnectProviderRequest,
+    ProviderDescriptor,
+    ProviderProfile,
+    validate_provider_profile,
+)
 
 
 class ProviderSessionRegistry:
@@ -24,6 +29,7 @@ class ProviderSessionRegistry:
         return self._install(profile, api_key)
 
     def _install(self, profile: ProviderProfile, secret: str) -> ProviderDescriptor:
+        profile = validate_provider_profile(profile)
         config = profile.provider_config()
         if not secret.strip():
             raise ValueError(
@@ -76,3 +82,10 @@ class ProviderSessionRegistry:
                 self._descriptors[profile_id]
                 for profile_id in sorted(self._descriptors)
             ]
+
+    def update_descriptor(self, descriptor: ProviderDescriptor) -> None:
+        profile_id = descriptor.profile.profile_id
+        with self._lock:
+            if profile_id not in self._providers:
+                raise KeyError(f"Provider profile '{profile_id}' is not connected.")
+            self._descriptors[profile_id] = descriptor

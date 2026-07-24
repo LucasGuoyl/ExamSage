@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from exam_predictor.security import validate_public_https_url
 
@@ -71,17 +71,29 @@ class ProviderProfile(BaseModel):
             raise ValueError("Invalid provider profile ID.")
         return cleaned
 
-    @model_validator(mode="after")
-    def validate_custom_base_url(self) -> ProviderProfile:
-        if self.provider == "custom" and self.base_url is not None:
-            self.base_url = validate_public_https_url(self.base_url)
-            if urlsplit(self.base_url).query:
-                raise ValueError("Custom provider base URLs cannot contain query parameters.")
-        return self
-
     def provider_config(self) -> dict[str, str]:
         values = self.model_dump(exclude={"profile_id"}, exclude_none=True)
         return {key: value for key, value in values.items() if value != ""}
+
+
+class ProviderConfigurationError(RuntimeError):
+    pass
+
+
+def validate_provider_profile(profile: ProviderProfile) -> ProviderProfile:
+    if profile.provider != "custom":
+        return profile
+    invalid = profile.base_url is None
+    validated_url: str | None = None
+    if not invalid:
+        try:
+            validated_url = validate_public_https_url(profile.base_url or "")
+            invalid = bool(urlsplit(validated_url).query)
+        except ValueError:
+            invalid = True
+    if invalid or validated_url is None:
+        raise ProviderConfigurationError("Provider configuration is invalid.") from None
+    return profile.model_copy(update={"base_url": validated_url})
 
 
 class ConnectProviderRequest(BaseModel):

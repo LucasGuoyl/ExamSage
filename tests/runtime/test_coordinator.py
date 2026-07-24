@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import time
 from pathlib import Path
 from threading import Event, Thread
@@ -103,6 +104,7 @@ class FakeVault:
         self.calls: list[tuple[str, str]] = []
         self.fail_save = False
         self.fail_load = False
+        self.fail_delete = False
 
     def save(self, profile_id: str, api_key: str) -> None:
         self.calls.append(("save", profile_id))
@@ -121,6 +123,8 @@ class FakeVault:
 
     def delete(self, profile_id: str) -> None:
         self.calls.append(("delete", profile_id))
+        if self.fail_delete:
+            raise VaultUnavailableError("Secure credential storage is unavailable")
         self.secrets.pop(profile_id, None)
 
 
@@ -193,6 +197,7 @@ def test_connect_validates_then_saves_credential_and_nonsecret_profile(
     assert vault.secrets == {"primary": sentinel}
     assert descriptor.credential_saved is True
     assert descriptor.credential_warning is None
+    assert sessions.list_profiles() == [descriptor]
     saved = store.list_saved_provider_profiles()
     assert len(saved) == 1
     assert saved[0].credential_expected is True
@@ -227,11 +232,48 @@ def test_vault_save_failure_keeps_validated_memory_session_and_safe_metadata(tmp
     assert sessions.get_provider("primary").identity == sentinel
     assert descriptor.credential_saved is False
     assert descriptor.credential_warning == RuntimeCoordinator.CREDENTIAL_WARNING
+    assert sessions.list_profiles() == [descriptor]
     saved = store.list_saved_provider_profiles()[0]
     assert saved.credential_expected is False
     assert saved.reconnect_required is True
     assert sentinel not in descriptor.model_dump_json()
     assert sentinel not in (tmp_path / "runtime.sqlite3").read_bytes().decode("latin1")
+
+
+def test_unsafe_custom_url_is_rejected_before_factory_vault_or_store(
+    tmp_path: Path,
+):
+    sentinel = "runtime-query-sentinel"
+    factory_calls: list[dict] = []
+    vault = FakeVault()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=ProviderSessionRegistry(
+            factory=lambda config: factory_calls.append(config) or object()
+        ),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    request = ConnectProviderRequest(
+        profile=ProviderProfile(
+            profile_id="custom",
+            provider="custom",
+            base_url=f"https://models.example/v1?api_key={sentinel}",
+        ),
+        api_key="provider-key",
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        runtime.connect_provider(request)
+
+    surfaces = json.dumps({"detail": str(captured.value)})
+    assert sentinel not in surfaces
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert factory_calls == []
+    assert vault.calls == []
+    assert store.list_saved_provider_profiles() == []
 
 
 def test_start_restores_saved_provider_without_starting_paused_work(tmp_path: Path):
@@ -258,9 +300,136 @@ def test_start_restores_saved_provider_without_starting_paused_work(tmp_path: Pa
     restored.start()
     try:
         assert restored_sessions.get_provider("primary").identity == "restored-vault-secret"
+        restored_descriptor = restored_sessions.list_profiles()[0]
+        assert restored_descriptor.credential_saved is True
+        assert restored_descriptor.credential_warning is None
         assert store.get_run(paused.run_id).status is RunStatus.PAUSED
     finally:
         restored.shutdown()
+
+
+def test_start_skips_malformed_and_mismatched_profiles_without_vault_access(
+    tmp_path: Path,
+):
+    vault = FakeVault()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=credential_sessions(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    runtime.connect_provider(provider_request("valid-secret"))
+    mismatched = ProviderProfile(profile_id="json-id", provider="gemini")
+    with store._connection() as connection:
+        connection.execute(
+            """INSERT INTO saved_provider_profiles(
+                   profile_id, profile_json, capabilities_json,
+                   credential_expected, reconnect_required, updated_at
+               ) VALUES (?, ?, ?, 1, 0, ?)""",
+            (
+                "sql-id",
+                mismatched.model_dump_json(),
+                '{"chat":true}',
+                "2026-07-24T12:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            """INSERT INTO saved_provider_profiles(
+                   profile_id, profile_json, capabilities_json,
+                   credential_expected, reconnect_required, updated_at
+               ) VALUES (?, ?, ?, 1, 0, ?)""",
+            (
+                "malformed",
+                '{"profile_id":"malformed","provider":"unknown"}',
+                '{"chat":true}',
+                "2026-07-24T12:00:00+00:00",
+            ),
+        )
+    vault.calls.clear()
+
+    restored_sessions = credential_sessions()
+    restored = RuntimeCoordinator(
+        store=RuntimeStore(store.db_path),
+        provider_sessions=restored_sessions,
+        checkpoints_path=tmp_path / "restored-checkpoints.sqlite3",
+        vault=vault,
+    )
+    restored.start()
+    try:
+        assert vault.calls == [("load", "primary")]
+        assert restored_sessions.has_provider("primary") is True
+        assert restored_sessions.has_provider("sql-id") is False
+        assert restored_sessions.has_provider("json-id") is False
+    finally:
+        restored.shutdown()
+
+
+def test_store_failure_after_vault_save_compensates_and_keeps_memory_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sentinel = "replacement-after-store-failure"
+    vault = FakeVault()
+    sessions = credential_sessions()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    runtime.connect_provider(provider_request("original-secret"))
+
+    def fail_save(_profile):
+        raise sqlite3.OperationalError(f"database C:/private/{sentinel}")
+
+    monkeypatch.setattr(store, "save_provider_profile", fail_save)
+
+    descriptor = runtime.connect_provider(provider_request(sentinel))
+
+    assert descriptor.credential_saved is False
+    assert descriptor.credential_warning == RuntimeCoordinator.CREDENTIAL_WARNING
+    assert sessions.get_provider("primary").identity == sentinel
+    assert sessions.list_profiles() == [descriptor]
+    assert vault.secrets == {}
+
+
+def test_failed_store_and_compensation_disconnects_and_blocks_stale_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sentinel = "unsafe-replacement-secret"
+    vault = FakeVault()
+    sessions = credential_sessions()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    runtime.connect_provider(provider_request("original-secret"))
+    vault.fail_delete = True
+
+    def fail_save(_profile):
+        raise sqlite3.OperationalError(f"database C:/private/{sentinel}")
+
+    monkeypatch.setattr(store, "save_provider_profile", fail_save)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^Provider credential state could not be persisted safely\\.$",
+    ) as captured:
+        runtime.connect_provider(provider_request(sentinel))
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert sentinel not in str(captured.value)
+    assert sessions.has_provider("primary") is False
+    saved = store.list_saved_provider_profiles()[0]
+    assert saved.credential_expected is False
+    assert saved.reconnect_required is True
 
 
 @pytest.mark.parametrize("vault_unavailable", [False, True])
@@ -364,6 +533,65 @@ def test_forget_disconnects_and_deletes_only_the_credential(tmp_path: Path):
     saved = store.list_saved_provider_profiles()[0]
     assert saved.credential_expected is False
     assert saved.reconnect_required is True
+
+
+def test_forget_delete_failure_disconnects_without_marking_reconnect_and_can_retry(
+    tmp_path: Path,
+):
+    vault = FakeVault()
+    sessions = credential_sessions()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    runtime.connect_provider(provider_request("retry-secret"))
+    vault.fail_delete = True
+
+    with pytest.raises(VaultUnavailableError) as captured:
+        runtime.forget_provider_credential("primary")
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert sessions.has_provider("primary") is False
+    unchanged = store.list_saved_provider_profiles()[0]
+    assert unchanged.credential_expected is True
+    assert unchanged.reconnect_required is False
+    assert vault.secrets == {"primary": "retry-secret"}
+
+    vault.fail_delete = False
+    runtime.forget_provider_credential("primary")
+    marked = store.list_saved_provider_profiles()[0]
+    assert vault.secrets == {}
+    assert marked.credential_expected is False
+    assert marked.reconnect_required is True
+
+
+def test_start_self_heals_memory_session_after_forget_delete_failure(tmp_path: Path):
+    vault = FakeVault()
+    sessions = credential_sessions()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    runtime.connect_provider(provider_request("self-heal-secret"))
+    vault.fail_delete = True
+    with pytest.raises(VaultUnavailableError):
+        runtime.forget_provider_credential("primary")
+
+    runtime.start()
+    try:
+        assert sessions.get_provider("primary").identity == "self-heal-secret"
+        saved = store.list_saved_provider_profiles()[0]
+        assert saved.credential_expected is True
+        assert saved.reconnect_required is False
+    finally:
+        runtime.shutdown()
 
 
 @pytest.mark.parametrize("status", [RunStatus.RUNNING, RunStatus.STOPPING])

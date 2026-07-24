@@ -83,12 +83,13 @@ def test_every_store_operation_explicitly_closes_its_sqlite_connection(
 
 def saved_provider_profile(
     *,
+    profile_id: str = "primary",
     credential_expected: bool = True,
     reconnect_required: bool = False,
 ) -> SavedProviderProfile:
     return SavedProviderProfile(
         profile=ProviderProfile(
-            profile_id="primary",
+            profile_id=profile_id,
             provider="custom",
             base_url="https://models.example/v1",
             balanced_model="course-model",
@@ -163,8 +164,80 @@ def test_saved_provider_profile_rows_are_validated_on_read(
             (value, "primary"),
         )
 
-    with pytest.raises(ValueError):
-        store.list_saved_provider_profiles()
+    assert store.list_saved_provider_profiles() == []
+
+
+def test_malformed_saved_profile_does_not_abort_other_profile_reads(tmp_path: Path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    valid = saved_provider_profile(profile_id="valid")
+    store.save_provider_profile(valid)
+    with store._connection() as connection:
+        connection.execute(
+            """INSERT INTO saved_provider_profiles(
+                   profile_id, profile_json, capabilities_json,
+                   credential_expected, reconnect_required, updated_at
+               ) VALUES (?, ?, ?, 1, 0, ?)""",
+            (
+                "malformed",
+                '{"profile_id":"malformed","provider":"unknown"}',
+                '{"chat":true}',
+                valid.updated_at.isoformat(),
+            ),
+        )
+
+    assert store.list_saved_provider_profiles() == [valid]
+
+
+def test_saved_profile_sql_and_json_ids_must_match(tmp_path: Path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    profile = saved_provider_profile(profile_id="json-id")
+    with store._connection() as connection:
+        connection.execute(
+            """INSERT INTO saved_provider_profiles(
+                   profile_id, profile_json, capabilities_json,
+                   credential_expected, reconnect_required, updated_at
+               ) VALUES (?, ?, ?, 1, 0, ?)""",
+            (
+                "sql-id",
+                profile.profile.model_dump_json(),
+                '{"chat":true}',
+                profile.updated_at.isoformat(),
+            ),
+        )
+
+    assert store.list_saved_provider_profiles() == []
+
+
+def test_unsafe_saved_custom_url_is_filtered_without_echoing_query_secret(
+    tmp_path: Path,
+):
+    sentinel = "saved-query-sentinel"
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    unsafe = saved_provider_profile().model_copy(
+        update={
+            "profile": ProviderProfile(
+                profile_id="unsafe",
+                provider="custom",
+                base_url=f"https://models.example/v1?api_key={sentinel}",
+            )
+        }
+    )
+    with store._connection() as connection:
+        connection.execute(
+            """INSERT INTO saved_provider_profiles(
+                   profile_id, profile_json, capabilities_json,
+                   credential_expected, reconnect_required, updated_at
+               ) VALUES (?, ?, ?, 1, 0, ?)""",
+            (
+                "unsafe",
+                unsafe.profile.model_dump_json(),
+                '{"chat":true}',
+                unsafe.updated_at.isoformat(),
+            ),
+        )
+
+    assert store.list_saved_provider_profiles() == []
+    assert sentinel not in repr(store.list_saved_provider_profiles())
 
 
 def test_connect_closes_new_connection_when_pragma_setup_fails(

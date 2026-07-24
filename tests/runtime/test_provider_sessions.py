@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -161,17 +162,62 @@ def test_provider_capability_error_is_bounded_and_cause_free():
     [
         "http://models.example/v1",
         "https://127.0.0.1/v1",
-        "https://user:password@models.example/v1",
-        "https://models.example/v1?api_key=query-secret",
+        "https://userinfo-sentinel:password@models.example/v1",
+        "https://models.example/v1?api_key=query-sentinel",
     ],
 )
-def test_custom_provider_profiles_reject_unsafe_base_urls(base_url: str):
-    with pytest.raises(ValueError):
-        ProviderProfile(
-            profile_id="custom",
-            provider="custom",
-            base_url=base_url,
+def test_custom_provider_url_errors_never_echo_untrusted_input(base_url: str):
+    registry = ProviderSessionRegistry(factory=lambda config: FakeProvider())
+
+    with pytest.raises(RuntimeError, match="^Provider configuration is invalid\\.$") as captured:
+        registry.connect(
+            ConnectProviderRequest(
+                profile=ProviderProfile(
+                    profile_id="custom",
+                    provider="custom",
+                    base_url=base_url,
+                ),
+                api_key="provider-key",
+            )
         )
+
+    error = captured.value
+    errors = getattr(error, "errors", lambda: [])()
+    json_value = getattr(error, "json", lambda: "{}")()
+    surfaces = "\n".join(
+        [
+            str(error),
+            repr(error),
+            json.dumps(errors),
+            json_value,
+            json.dumps({"detail": str(error)}),
+        ]
+    )
+    assert "userinfo-sentinel" not in surfaces
+    assert "query-sentinel" not in surfaces
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_custom_provider_safe_base_url_is_normalized_before_factory():
+    seen: list[dict] = []
+    registry = ProviderSessionRegistry(
+        factory=lambda config: seen.append(config) or FakeProvider()
+    )
+
+    descriptor = registry.connect(
+        ConnectProviderRequest(
+            profile=ProviderProfile(
+                profile_id="custom",
+                provider="custom",
+                base_url="  https://models.example/v1  ",
+            ),
+            api_key="provider-key",
+        )
+    )
+
+    assert seen[0]["base_url"] == "https://models.example/v1"
+    assert descriptor.profile.base_url == "https://models.example/v1"
 
 
 @pytest.mark.parametrize(

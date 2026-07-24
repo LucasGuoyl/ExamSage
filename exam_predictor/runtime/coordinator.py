@@ -140,20 +140,51 @@ class RuntimeCoordinator:
                     "credential_warning": warning,
                 }
             )
-            self.store.save_provider_profile(
-                SavedProviderProfile(
-                    profile=descriptor.profile,
-                    capabilities=descriptor.capabilities,
-                    credential_expected=credential_saved,
-                    reconnect_required=not credential_saved,
-                    updated_at=datetime.now(timezone.utc),
-                )
+            saved_profile = SavedProviderProfile(
+                profile=descriptor.profile,
+                capabilities=descriptor.capabilities,
+                credential_expected=credential_saved,
+                reconnect_required=not credential_saved,
+                updated_at=datetime.now(timezone.utc),
             )
+            store_failed = False
+            try:
+                self.store.save_provider_profile(saved_profile)
+            except Exception:
+                store_failed = True
+            if not store_failed:
+                self.provider_sessions.update_descriptor(descriptor)
+                return descriptor
+
+            compensation_failed = False
+            if credential_saved and self.vault is not None:
+                try:
+                    self.vault.delete(profile_id)
+                except Exception:
+                    compensation_failed = True
+            if compensation_failed:
+                try:
+                    self.store.mark_provider_reconnect_required(profile_id)
+                except Exception:
+                    pass
+                self.provider_sessions.disconnect(profile_id)
+                raise RuntimeError(
+                    "Provider credential state could not be persisted safely."
+                ) from None
+
+            descriptor = descriptor.model_copy(
+                update={
+                    "credential_saved": False,
+                    "credential_warning": self.CREDENTIAL_WARNING,
+                }
+            )
+            self.provider_sessions.update_descriptor(descriptor)
             return descriptor
 
     def forget_provider_credential(self, profile_id: str) -> None:
         with self._lock:
             self._ensure_profile_replaceable(profile_id)
+            self.provider_sessions.disconnect(profile_id)
             if self.vault is not None:
                 delete_failed = False
                 try:
@@ -164,7 +195,6 @@ class RuntimeCoordinator:
                     raise VaultUnavailableError(
                         "Secure credential storage is unavailable"
                     )
-            self.provider_sessions.disconnect(profile_id)
             self.store.mark_provider_reconnect_required(profile_id)
 
     def _ensure_profile_replaceable(self, profile_id: str) -> None:
@@ -197,7 +227,15 @@ class RuntimeCoordinator:
                 continue
             restore_failed = False
             try:
-                self.provider_sessions.restore(saved.profile, api_key)
+                descriptor = self.provider_sessions.restore(saved.profile, api_key)
+                self.provider_sessions.update_descriptor(
+                    descriptor.model_copy(
+                        update={
+                            "credential_saved": True,
+                            "credential_warning": None,
+                        }
+                    )
+                )
             except Exception:
                 restore_failed = True
             if restore_failed:

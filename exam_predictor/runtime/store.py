@@ -12,10 +12,12 @@ from typing import Any
 from .models import (
     AgentEvent,
     EventType,
+    ProviderConfigurationError,
     ProviderProfile,
     RunSnapshot,
     RunStatus,
     SavedProviderProfile,
+    validate_provider_profile,
 )
 
 
@@ -99,6 +101,9 @@ class RuntimeStore:
     @staticmethod
     def _saved_provider_profile(row: sqlite3.Row) -> SavedProviderProfile:
         profile = ProviderProfile.model_validate_json(row["profile_json"])
+        if profile.profile_id != row["profile_id"]:
+            raise ValueError("Saved provider profile identity mismatch.")
+        profile = validate_provider_profile(profile)
         capabilities = json.loads(row["capabilities_json"])
         return SavedProviderProfile.model_validate(
             {
@@ -111,7 +116,9 @@ class RuntimeStore:
         )
 
     def save_provider_profile(self, profile: SavedProviderProfile) -> None:
-        profile_json = profile.profile.model_dump_json()
+        validated = validate_provider_profile(profile.profile)
+        profile = profile.model_copy(update={"profile": validated})
+        profile_json = validated.model_dump_json()
         capabilities_json = json.dumps(
             profile.capabilities,
             ensure_ascii=False,
@@ -144,12 +151,18 @@ class RuntimeStore:
     def list_saved_provider_profiles(self) -> list[SavedProviderProfile]:
         with self._connection() as db:
             rows = db.execute(
-                """SELECT profile_json, capabilities_json, credential_expected,
+                """SELECT profile_id, profile_json, capabilities_json, credential_expected,
                           reconnect_required, updated_at
                    FROM saved_provider_profiles
                    ORDER BY profile_id ASC"""
             ).fetchall()
-        return [self._saved_provider_profile(row) for row in rows]
+        profiles: list[SavedProviderProfile] = []
+        for row in rows:
+            try:
+                profiles.append(self._saved_provider_profile(row))
+            except (ValueError, TypeError, ProviderConfigurationError):
+                continue
+        return profiles
 
     def mark_provider_reconnect_required(self, profile_id: str) -> None:
         with self._connection() as db:
