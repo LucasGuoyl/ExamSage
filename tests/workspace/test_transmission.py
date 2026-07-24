@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier
 
 import pytest
 
+import exam_predictor.workspace.transmission as transmission_module
 from exam_predictor.workspace.models import (
     ScanPolicy,
     SourceMode,
@@ -162,6 +165,19 @@ def test_rejects_stale_policy_and_approval_hash_mismatch(
 
     with store._transaction() as connection:
         connection.execute(
+            "UPDATE manifest_revisions SET policy_version = ? WHERE workspace_id = ?",
+            ("legacy-policy", "workspace-1"),
+        )
+    with pytest.raises(SourceAuthorizationError) as revision_stale:
+        WorkspaceTransmissionGate(store).authorize("workspace-1", [entry_id])
+    assert revision_stale.value.code == "source_approval_stale_policy"
+
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE manifest_revisions SET policy_version = ? WHERE workspace_id = ?",
+            ("workspace-v1", "workspace-1"),
+        )
+        connection.execute(
             "UPDATE approvals SET approved_entries_json = ? WHERE workspace_id = ?",
             (
                 json.dumps([{"entry_id": entry_id, "sha256": "0" * 64}]),
@@ -281,12 +297,42 @@ def test_authorize_is_all_or_nothing_for_a_changed_batch(
     assert gate._read_grants == {}
 
 
-def test_tokens_expire_and_restart_invalidates_them(
+def test_concurrent_changed_entries_are_merged_into_the_latest_draft(
     store: WorkspaceStore, tmp_path: Path
 ):
+    _, entry_ids = _approved_workspace(
+        store,
+        tmp_path,
+        sources={"first.txt": b"first", "second.txt": b"second"},
+    )
+    gate = WorkspaceTransmissionGate(store)
+    approved_workspace = store.get_workspace("workspace-1")
+    barrier = Barrier(2)
+
+    def mark(entry_id):
+        barrier.wait()
+        gate._mark_changed(approved_workspace, (entry_id,))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(mark, entry_ids))
+
+    current = store.get_manifest("workspace-1")
+    assert {
+        entry.entry_id
+        for entry in current.entries
+        if entry.state is SourceState.CHANGED
+    } == set(entry_ids)
+
+
+def test_tokens_expire_and_restart_invalidates_them(
+    store: WorkspaceStore, tmp_path: Path, monkeypatch
+):
     _, entry_ids = _approved_workspace(store, tmp_path)
-    expiring = WorkspaceTransmissionGate(store, token_ttl_seconds=0)
+    clock = [100.0]
+    monkeypatch.setattr(transmission_module, "monotonic", lambda: clock[0])
+    expiring = WorkspaceTransmissionGate(store, token_ttl_seconds=1)
     expired = expiring.authorize("workspace-1", [entry_ids[0]])[0]
+    clock[0] = 101.0
 
     with pytest.raises(SourceAuthorizationError) as caught:
         with expiring.open_approved(expired.read_token):
@@ -299,6 +345,44 @@ def test_tokens_expire_and_restart_invalidates_them(
         with WorkspaceTransmissionGate(store).open_approved(token):
             pass
     assert restarted.value.code == "read_token_invalid"
+
+
+@pytest.mark.parametrize(
+    "ttl",
+    [0, -1, 60.0001, float("inf"), float("-inf"), float("nan")],
+)
+def test_token_ttl_must_be_finite_positive_and_at_most_sixty_seconds(
+    store: WorkspaceStore,
+    ttl: float,
+):
+    with pytest.raises(ValueError, match="token_ttl_seconds"):
+        WorkspaceTransmissionGate(store, token_ttl_seconds=ttl)
+
+
+def test_expired_abandoned_tokens_are_purged_on_authorize_and_consume(
+    store: WorkspaceStore,
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, entry_ids = _approved_workspace(store, tmp_path)
+    clock = [100.0]
+    monkeypatch.setattr(transmission_module, "monotonic", lambda: clock[0])
+    gate = WorkspaceTransmissionGate(store, token_ttl_seconds=10)
+    first = gate.authorize("workspace-1", [entry_ids[0]])[0]
+    assert len(gate._read_grants) == 1
+
+    clock[0] = 111.0
+    second = gate.authorize("workspace-1", [entry_ids[0]])[0]
+    assert len(gate._read_grants) == 1
+    assert first.read_token.get_secret_value() not in gate._read_grants
+
+    clock[0] = 122.0
+    with pytest.raises(SourceAuthorizationError) as caught:
+        with gate.open_approved("unknown-token"):
+            pass
+    assert caught.value.code == "read_token_invalid"
+    assert gate._read_grants == {}
+    assert second.read_token.get_secret_value() not in gate._read_grants
 
 
 def test_two_racing_consumers_have_exactly_one_success(
@@ -369,6 +453,44 @@ def test_post_authorize_same_metadata_mutation_fails_on_the_same_open_handle(
     assert consumed.value.code == "read_token_invalid"
 
 
+def test_consume_never_yields_a_native_handle_rewritten_after_its_hash(
+    store: WorkspaceStore, tmp_path: Path
+):
+    root, entry_ids = _approved_workspace(store, tmp_path)
+    gate = WorkspaceTransmissionGate(store)
+    descriptor = gate.authorize("workspace-1", [entry_ids[0]])[0]
+    metadata = (root / "notes.txt").stat()
+    approved = b"approved revision"
+    changed = b"changed! revision"
+
+    class RewrittenAfterHash(io.BytesIO):
+        def seek(self, offset, whence=io.SEEK_SET):
+            if offset == 0 and whence == io.SEEK_SET and self.tell() == len(approved):
+                super().seek(0)
+                super().write(changed)
+            return super().seek(offset, whence)
+
+    class SameMetadataRewritingOpener:
+        @contextmanager
+        def open_regular(self, *_args, **_kwargs):
+            with RewrittenAfterHash(approved) as source:
+                yield source
+
+        @staticmethod
+        def stat_open_file(_source):
+            return metadata
+
+    gate._scanner._secure_file_opener = SameMetadataRewritingOpener()
+
+    try:
+        with gate.open_approved(descriptor.read_token) as source:
+            delivered = source.read()
+    except SourceAuthorizationError as error:
+        assert error.code == "approved_source_changed"
+    else:
+        assert delivered == approved
+
+
 def test_missing_root_fails_without_leaking_a_path(
     store: WorkspaceStore, tmp_path: Path
 ):
@@ -381,3 +503,45 @@ def test_missing_root_fails_without_leaking_a_path(
     assert caught.value.code == "source_root_invalid"
     assert str(tmp_path) not in str(caught.value)
     assert caught.value.__cause__ is None
+
+
+def test_closed_store_authorization_failure_is_stable_and_path_safe(
+    store: WorkspaceStore,
+    tmp_path: Path,
+):
+    store.close()
+
+    with pytest.raises(SourceAuthorizationError) as caught:
+        WorkspaceTransmissionGate(store).authorize("workspace-1", ["entry-1"])
+
+    assert caught.value.code == "source_store_unavailable"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert str(tmp_path) not in str(caught.value)
+
+
+def test_deletion_race_during_consume_is_stable_and_consumes_the_token(
+    store: WorkspaceStore,
+    tmp_path: Path,
+    monkeypatch,
+):
+    _, entry_ids = _approved_workspace(store, tmp_path)
+    gate = WorkspaceTransmissionGate(store)
+    token = gate.authorize("workspace-1", [entry_ids[0]])[0].read_token
+
+    def fail_source_root(_workspace_id):
+        raise RuntimeError(str(tmp_path / "private-root"))
+
+    monkeypatch.setattr(store, "source_root", fail_source_root)
+
+    with pytest.raises(SourceAuthorizationError) as caught:
+        with gate.open_approved(token):
+            pass
+    assert caught.value.code == "source_store_unavailable"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert str(tmp_path) not in str(caught.value)
+    with pytest.raises(SourceAuthorizationError) as consumed:
+        with gate.open_approved(token):
+            pass
+    assert consumed.value.code == "read_token_invalid"

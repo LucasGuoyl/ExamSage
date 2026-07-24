@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path, PurePosixPath
+from tempfile import SpooledTemporaryFile
 from typing import BinaryIO, Iterator
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -276,16 +277,38 @@ class WorkspaceScanner:
         *,
         root_anchor: RootAnchor | None = None,
     ) -> Iterator[tuple[RevalidatedEntry, BinaryIO]]:
-        """Bounded-hash and yield the same securely opened native file handle."""
+        """Copy one securely opened native file into a bounded immutable spool."""
+        max_spool_bytes = max(
+            1,
+            min(self._policy.hash_chunk_bytes * 4, 8 * 1024 * 1024),
+        )
+        with SpooledTemporaryFile(max_size=max_spool_bytes, mode="w+b") as spool:
+            validation = self.copy_revalidated_entry(
+                root,
+                entry,
+                spool,
+                root_anchor=root_anchor,
+            )
+            spool.seek(0)
+            yield validation, spool
+
+    def copy_revalidated_entry(
+        self,
+        root: Path,
+        entry: ManifestEntry,
+        destination: BinaryIO,
+        *,
+        root_anchor: RootAnchor | None = None,
+    ) -> RevalidatedEntry:
+        """Bounded-copy and hash the exact bytes read from one secure native handle."""
         if root_anchor is None:
             with self._directory_opener.anchor_root(root) as opened_anchor:
-                with self.open_revalidated_entry(
+                return self.copy_revalidated_entry(
                     root,
                     entry,
+                    destination,
                     root_anchor=opened_anchor,
-                ) as opened:
-                    yield opened
-            return
+                )
 
         canonical_root = self._canonical_root(root, root_anchor)
         if root_anchor.identity is None:
@@ -310,6 +333,7 @@ class WorkspaceScanner:
                 )
             ):
                 digest.update(chunk)
+                destination.write(chunk)
                 if self._after_hash_chunk is not None:
                     self._after_hash_chunk(
                         canonical_root / Path(*relative.parts),
@@ -318,8 +342,7 @@ class WorkspaceScanner:
             after_hash = self._secure_file_opener.stat_open_file(source)
             if _stat_identity(before) != _stat_identity(after_hash):
                 raise SecureOpenError(SOURCE_CHANGED_DURING_SCAN)
-            source.seek(0)
-            validation = RevalidatedEntry(
+            return RevalidatedEntry(
                 entry_id=entry.entry_id,
                 sha256=digest.hexdigest(),
                 size_bytes=max(after_hash.st_size, 0),
@@ -327,10 +350,6 @@ class WorkspaceScanner:
                 device_id=str(after_hash.st_dev),
                 file_id=str(after_hash.st_ino),
             )
-            yield validation, source
-            after_use = self._secure_file_opener.stat_open_file(source)
-            if _stat_identity(after_hash) != _stat_identity(after_use):
-                raise SecureOpenError(SOURCE_CHANGED_DURING_SCAN)
 
     def _scan_anchored(
         self,

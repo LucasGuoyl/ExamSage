@@ -3,13 +3,15 @@ from __future__ import annotations
 import os
 import secrets
 import threading
-from collections.abc import Iterator, Sequence
+from math import isfinite
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import SpooledTemporaryFile
 from time import monotonic
-from typing import BinaryIO
+from typing import BinaryIO, TypeVar
 
 from pydantic import SecretStr
 
@@ -28,7 +30,10 @@ from exam_predictor.workspace.models import (
 )
 from exam_predictor.workspace.policy import DEFAULT_SCAN_POLICY
 from exam_predictor.workspace.scanner import RevalidatedEntry, WorkspaceScanner
-from exam_predictor.workspace.store import StaleManifestError, WorkspaceStore
+from exam_predictor.workspace.store import WorkspaceStore
+
+
+_T = TypeVar("_T")
 
 
 class SourceAuthorizationError(RuntimeError):
@@ -117,6 +122,12 @@ class WorkspaceTransmissionGate:
         policy: ScanPolicy = DEFAULT_SCAN_POLICY,
         token_ttl_seconds: float = 60.0,
     ) -> None:
+        if (
+            not isfinite(token_ttl_seconds)
+            or token_ttl_seconds <= 0
+            or token_ttl_seconds > 60
+        ):
+            raise ValueError("token_ttl_seconds must be finite and in (0, 60]")
         self._store = store
         self._policy = policy
         self._token_ttl_seconds = token_ttl_seconds
@@ -131,6 +142,8 @@ class WorkspaceTransmissionGate:
         entry_ids: Sequence[str],
     ) -> Sequence[ApprovedSource]:
         requested = tuple(entry_ids)
+        with self._lock:
+            self._purge_expired_locked(monotonic())
         if not requested or len(set(requested)) != len(requested):
             raise SourceAuthorizationError(
                 "source_request_invalid",
@@ -138,14 +151,22 @@ class WorkspaceTransmissionGate:
                 requested[0] if requested else "",
             )
 
-        workspace = self._store.get_workspace(workspace_id)
+        workspace = self._store_call(
+            workspace_id,
+            requested[0],
+            lambda: self._store.get_workspace(workspace_id),
+        )
         if workspace is None:
             raise SourceAuthorizationError(
                 "workspace_not_found",
                 workspace_id,
                 requested[0],
             )
-        approval = self._store.get_approval(workspace_id)
+        approval = self._store_call(
+            workspace_id,
+            requested[0],
+            lambda: self._store.get_approval(workspace_id),
+        )
         if approval is None or workspace.state is not WorkspaceState.APPROVED:
             raise SourceAuthorizationError(
                 "source_approval_required",
@@ -159,7 +180,17 @@ class WorkspaceTransmissionGate:
                 requested[0],
             )
 
-        revision = self._store.get_manifest(workspace_id, approval.revision_id)
+        revision = self._store_call(
+            workspace_id,
+            requested[0],
+            lambda: self._store.get_manifest(workspace_id, approval.revision_id),
+        )
+        if revision.policy_version != self._policy.policy_version:
+            raise SourceAuthorizationError(
+                "source_approval_stale_policy",
+                workspace_id,
+                requested[0],
+            )
         manifest_by_id = {entry.entry_id: entry for entry in revision.entries}
         approved_by_id = {
             approved.entry_id: approved.sha256 for approved in approval.entries
@@ -197,7 +228,11 @@ class WorkspaceTransmissionGate:
                 )
             selected.append((entry, approved_sha256))
 
-        root = self._store.source_root(workspace_id)
+        root = self._store_call(
+            workspace_id,
+            requested[0],
+            lambda: self._store.source_root(workspace_id),
+        )
         changed_entry_ids: tuple[str, ...] = ()
         failure_code: str | None = None
         failure_entry_id = requested[0]
@@ -262,8 +297,16 @@ class WorkspaceTransmissionGate:
                 failure_entry_id,
             ) from None
 
-        self._store.record_access_verified(workspace_id, datetime.now(UTC))
-        expires_at = monotonic() + self._token_ttl_seconds
+        self._store_call(
+            workspace_id,
+            requested[0],
+            lambda: self._store.record_access_verified(
+                workspace_id,
+                datetime.now(UTC),
+            ),
+        )
+        issued_at = monotonic()
+        expires_at = issued_at + self._token_ttl_seconds
         descriptors: list[ApprovedSource] = []
         grants: list[tuple[str, _ReadGrant]] = []
         for entry, approved_sha256 in selected:
@@ -298,6 +341,7 @@ class WorkspaceTransmissionGate:
                 )
             )
         with self._lock:
+            self._purge_expired_locked(issued_at)
             self._read_grants.update(grants)
         return tuple(descriptors)
 
@@ -311,18 +355,24 @@ class WorkspaceTransmissionGate:
             if isinstance(read_token, SecretStr)
             else read_token
         )
+        consumed_at = monotonic()
         with self._lock:
             grant = self._read_grants.pop(token, None)
+            self._purge_expired_locked(consumed_at)
         if grant is None:
             raise SourceAuthorizationError("read_token_invalid", "", "")
-        if monotonic() >= grant.expires_at:
+        if consumed_at >= grant.expires_at:
             raise SourceAuthorizationError(
                 "read_token_expired",
                 grant.workspace_id,
                 grant.entry_id,
             )
 
-        workspace = self._store.get_workspace(grant.workspace_id)
+        workspace = self._store_call(
+            grant.workspace_id,
+            grant.entry_id,
+            lambda: self._store.get_workspace(grant.workspace_id),
+        )
         failure_code: str | None = None
         if workspace is None:
             failure_code = "source_root_invalid"
@@ -333,17 +383,30 @@ class WorkspaceTransmissionGate:
             failure_code = "source_root_identity_changed"
 
         if failure_code is None and workspace is not None:
-            root = self._store.source_root(grant.workspace_id)
+            root = self._store_call(
+                grant.workspace_id,
+                grant.entry_id,
+                lambda: self._store.source_root(grant.workspace_id),
+            )
             try:
                 with self._opener.anchor_root(root) as root_anchor:
                     if not _root_matches(workspace, root_anchor):
                         failure_code = "source_root_identity_changed"
                     else:
-                        with self._scanner.open_revalidated_entry(
-                            root,
-                            _grant_entry(grant),
-                            root_anchor=root_anchor,
-                        ) as (current, source):
+                        max_spool_bytes = max(
+                            1,
+                            min(self._policy.hash_chunk_bytes * 4, 8 * 1024 * 1024),
+                        )
+                        with SpooledTemporaryFile(
+                            max_size=max_spool_bytes,
+                            mode="w+b",
+                        ) as spool:
+                            current = self._scanner.copy_revalidated_entry(
+                                root,
+                                _grant_entry(grant),
+                                spool,
+                                root_anchor=root_anchor,
+                            )
                             if not _entry_matches(
                                 _grant_entry(grant),
                                 current,
@@ -351,7 +414,8 @@ class WorkspaceTransmissionGate:
                             ):
                                 failure_code = "approved_source_changed"
                             else:
-                                yield source
+                                spool.seek(0)
+                                yield spool
             except SecureOpenError:
                 failure_code = "approved_source_changed"
 
@@ -369,20 +433,15 @@ class WorkspaceTransmissionGate:
         workspace: WorkspaceRecord,
         entry_ids: Sequence[str],
     ) -> None:
-        if not entry_ids or workspace.current_draft_revision_id is None:
+        if not entry_ids:
             return
         update_failed = False
         try:
-            self._store.mark_revision_attention_if_current(
+            self._store.mark_entries_changed_latest(
                 workspace.workspace_id,
-                workspace.current_draft_revision_id,
                 entry_ids,
                 "approved_source_changed",
             )
-        except StaleManifestError:
-            current = self._store.get_workspace(workspace.workspace_id)
-            if current is None or current.state is not WorkspaceState.NEEDS_ATTENTION:
-                update_failed = True
         except Exception:
             update_failed = True
         if update_failed:
@@ -391,3 +450,32 @@ class WorkspaceTransmissionGate:
                 workspace.workspace_id,
                 entry_ids[0],
             ) from None
+
+    def _purge_expired_locked(self, now: float) -> None:
+        expired = [
+            token
+            for token, grant in self._read_grants.items()
+            if now >= grant.expires_at
+        ]
+        for token in expired:
+            del self._read_grants[token]
+
+    @staticmethod
+    def _store_call(
+        workspace_id: str,
+        entry_id: str,
+        operation: Callable[[], _T],
+    ) -> _T:
+        failed = False
+        value: _T | None = None
+        try:
+            value = operation()
+        except Exception:
+            failed = True
+        if failed:
+            raise SourceAuthorizationError(
+                "source_store_unavailable",
+                workspace_id,
+                entry_id,
+            ) from None
+        return value  # type: ignore[return-value]

@@ -1628,6 +1628,63 @@ class WorkspaceStore:
             )
             return self._revision(connection, workspace_id, new_revision_id)
 
+    def mark_entries_changed_latest(
+        self,
+        workspace_id: str,
+        entry_ids: Sequence[str],
+        code: str,
+    ) -> ManifestRevision:
+        """Atomically merge changed entries into the latest current draft."""
+        requested = set(entry_ids)
+        new_revision_id = uuid4().hex
+        now = self._now()
+        with self._transaction() as connection:
+            workspace = self._workspace_row(connection, workspace_id)
+            revision_id = workspace["current_draft_revision_id"]
+            if revision_id is None:
+                raise ManifestNotFoundError(
+                    f"Workspace '{workspace_id}' does not have a manifest."
+                )
+            revision = self._revision(connection, workspace_id, revision_id)
+            known = {item.entry_id for item in revision.entries}
+            if not requested <= known:
+                raise ManifestNotFoundError("Manifest entries were not found.")
+
+            def mark_changed(item: ManifestEntry) -> ManifestEntry:
+                if item.entry_id not in requested:
+                    return item
+                return item.model_copy(
+                    update={
+                        "state": SourceState.CHANGED,
+                        "included": False,
+                        "inclusion_reason": code,
+                        "failure_code": code,
+                        "safe_message": (
+                            "The selected source changed and needs review."
+                        ),
+                    }
+                )
+
+            self._clone_revision(
+                connection,
+                revision,
+                new_revision_id,
+                now,
+                mark_changed,
+            )
+            connection.execute(
+                """UPDATE workspaces
+                   SET state = ?, current_draft_revision_id = ?, updated_at = ?
+                   WHERE workspace_id = ?""",
+                (
+                    WorkspaceState.NEEDS_ATTENTION.value,
+                    new_revision_id,
+                    self._timestamp(now),
+                    workspace_id,
+                ),
+            )
+            return self._revision(connection, workspace_id, new_revision_id)
+
     def record_access_verified(self, workspace_id: str, verified_at: datetime) -> None:
         with self._transaction() as connection:
             self._workspace_row(connection, workspace_id)
