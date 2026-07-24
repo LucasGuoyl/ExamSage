@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import os
 import queue
-import shutil
-import stat
 import threading
+from dataclasses import dataclass
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -17,7 +16,7 @@ from exam_predictor.workspace.browser_intake import (
     BrowserIntakeWriter,
     BrowserUpload,
 )
-from exam_predictor.workspace.filesystem import SecureOpenError, is_reparse_point
+from exam_predictor.workspace.filesystem import SecureOpenError
 from exam_predictor.workspace.models import (
     ApprovalRecord,
     ManifestEntry,
@@ -28,11 +27,18 @@ from exam_predictor.workspace.models import (
     WorkspaceRecord,
     WorkspaceState,
 )
-from exam_predictor.workspace.scanner import RevalidationResult, WorkspaceScanner
+from exam_predictor.workspace.scanner import (
+    RevalidationResult,
+    ScanExecution,
+    WorkspaceScanner,
+)
 from exam_predictor.workspace.store import (
     ActiveWorkspaceOperationError,
+    InvalidApprovalError,
+    ManifestNotFoundError,
     StaleManifestError,
     WorkspaceJobNotFoundError,
+    WorkspaceNotFoundError,
     WorkspaceStore,
 )
 
@@ -55,6 +61,13 @@ class WorkspaceOperationError(RuntimeError):
         super().__init__(code)
 
 
+@dataclass(frozen=True)
+class OwnedTreeClaim:
+    relative_path: str
+    device_id: str
+    file_id: str
+
+
 class WorkspaceService:
     def __init__(
         self,
@@ -64,7 +77,7 @@ class WorkspaceService:
         picker: FolderPicker,
         browser_intake: BrowserIntakeWriter,
         run_guard: WorkspaceRunGuard,
-        remove_owned_tree: Callable[[Path], None] | None = None,
+        remove_owned_tree: Callable[[OwnedTreeClaim], None] | None = None,
         close_store_on_shutdown: bool = False,
     ) -> None:
         self._store = store
@@ -72,7 +85,9 @@ class WorkspaceService:
         self._picker = picker
         self._browser_intake = browser_intake
         self._run_guard = run_guard
-        self._remove_owned_tree = remove_owned_tree or shutil.rmtree
+        self._remove_owned_tree = (
+            remove_owned_tree or self._secure_cleanup_unavailable
+        )
         self._close_store_on_shutdown = close_store_on_shutdown
         self._jobs: queue.Queue[str | None] = queue.Queue()
         self._stop = threading.Event()
@@ -88,8 +103,14 @@ class WorkspaceService:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
+            self._jobs = queue.Queue()
+            self._active_workspaces.clear()
+            self._active_jobs.clear()
+            self._enqueued_job_ids.clear()
+            self._store.interrupt_claimed_creations()
+            self._discover_browser_orphans()
             self._recover_cleanup()
-            for job in self._store.recover_running_jobs():
+            for job in self._store.recover_unfinished_jobs():
                 self._queue_existing(job)
             self._stop.clear()
             self._thread = threading.Thread(
@@ -108,6 +129,8 @@ class WorkspaceService:
                 self._jobs.put(None)
         if thread is not None:
             thread.join(timeout=max(timeout_seconds, 0.0))
+        if thread is not None and thread.is_alive():
+            return
         with self._lock:
             if self._thread is thread and (thread is None or not thread.is_alive()):
                 self._thread = None
@@ -116,18 +139,31 @@ class WorkspaceService:
 
     def select_folder(self, idempotency_key: str) -> WorkspaceJob | None:
         """Open the injected picker; return None on cancel or enqueue a scan."""
-        existing = self._creation_job(idempotency_key)
-        if existing is not None:
-            return existing
+        workspace_id = uuid4().hex
+        try:
+            request, claimed = self._store.claim_creation(
+                idempotency_key,
+                SourceMode.NATIVE_FOLDER,
+                workspace_id,
+            )
+        except ActiveWorkspaceOperationError:
+            raise WorkspaceOperationError("idempotency_conflict") from None
+        if not claimed:
+            return self._replay_creation(request.state, idempotency_key)
         try:
             selected = self._picker.choose_folder()
         except Exception as error:
             code = getattr(error, "code", "folder_picker_failed")
+            self._store.fail_creation(idempotency_key, str(code))
             raise WorkspaceOperationError(str(code)) from None
         if selected is None:
+            self._store.finish_cancelled_creation(idempotency_key)
             return None
-        validation = self._validate_root(Path(selected))
-        workspace_id = uuid4().hex
+        try:
+            validation = self._validate_root(Path(selected))
+        except WorkspaceOperationError as error:
+            self._store.fail_creation(idempotency_key, error.code)
+            raise
         now = datetime.now(UTC)
         workspace = WorkspaceRecord(
             workspace_id=workspace_id,
@@ -141,11 +177,18 @@ class WorkspaceService:
             updated_at=now,
             last_access_verified_at=now,
         )
-        self._store.create_workspace(workspace)
-        job = self._enqueue(workspace_id, idempotency_key)
-        with self._lock:
-            self._creation_jobs[idempotency_key] = job.job_id
-        return job
+        job = self._new_job(workspace_id, idempotency_key, "initial_scan")
+        try:
+            _, stored, _ = self._store.create_workspace_with_initial_job(
+                workspace,
+                job,
+                idempotency_key,
+            )
+        except Exception:
+            self._store.fail_creation(idempotency_key, "creation_failed")
+            raise WorkspaceOperationError("creation_failed") from None
+        self._queue_existing(stored)
+        return stored
 
     def create_browser_snapshot(
         self,
@@ -154,18 +197,42 @@ class WorkspaceService:
         idempotency_key: str,
     ) -> WorkspaceJob:
         """Create an app-owned snapshot and enqueue its initial scan."""
-        existing = self._creation_job(idempotency_key)
-        if existing is not None:
-            return existing
         workspace_id = uuid4().hex
+        try:
+            request, claimed = self._store.claim_creation(
+                idempotency_key,
+                SourceMode.BROWSER_SNAPSHOT,
+                workspace_id,
+            )
+        except ActiveWorkspaceOperationError:
+            raise WorkspaceOperationError("idempotency_conflict") from None
+        if not claimed:
+            replay = self._replay_creation(request.state, idempotency_key)
+            if replay is None:
+                raise WorkspaceOperationError("creation_cancelled")
+            return replay
         root: Path | None = None
+        owned_validation: RevalidationResult | None = None
         try:
             root = self._browser_intake.create_snapshot(workspace_id, files)
+            owned_validation = self._validate_root(root.parent)
             validation = self._validate_root(root)
         except (BrowserIntakeError, WorkspaceOperationError) as error:
             if root is not None:
-                self._queue_orphan_cleanup(workspace_id, root.parent)
+                self._queue_orphan_cleanup(
+                    workspace_id,
+                    root.parent,
+                    (
+                        (
+                            owned_validation.root_device,
+                            owned_validation.root_file_id,
+                        )
+                        if owned_validation is not None
+                        else None
+                    ),
+                )
             code = getattr(error, "code", "browser_intake_failed")
+            self._store.fail_creation(idempotency_key, str(code))
             raise WorkspaceOperationError(str(code)) from None
         now = datetime.now(UTC)
         workspace = WorkspaceRecord(
@@ -180,11 +247,30 @@ class WorkspaceService:
             updated_at=now,
             last_access_verified_at=now,
         )
-        self._store.create_workspace(workspace)
-        job = self._enqueue(workspace_id, idempotency_key)
-        with self._lock:
-            self._creation_jobs[idempotency_key] = job.job_id
-        return job
+        job = self._new_job(workspace_id, idempotency_key, "initial_scan")
+        try:
+            _, stored, _ = self._store.create_workspace_with_initial_job(
+                workspace,
+                job,
+                idempotency_key,
+                owned_root_identity=(
+                    owned_validation.root_device,
+                    owned_validation.root_file_id,
+                ),
+            )
+        except Exception:
+            self._queue_orphan_cleanup(
+                workspace_id,
+                root.parent,
+                (
+                    owned_validation.root_device,
+                    owned_validation.root_file_id,
+                ),
+            )
+            self._store.fail_creation(idempotency_key, "creation_failed")
+            raise WorkspaceOperationError("creation_failed") from None
+        self._queue_existing(stored)
+        return stored
 
     def rescan(self, workspace_id: str, idempotency_key: str) -> WorkspaceJob:
         """Return an identical active job or enqueue one new scan."""
@@ -200,15 +286,23 @@ class WorkspaceService:
     ) -> ManifestRevision:
         """Create a draft after expanding an optional subtree."""
         with self._workspace_mutation(workspace_id):
-            revision = self._store.get_manifest(workspace_id, revision_id)
+            try:
+                revision = self._store.get_manifest(workspace_id, revision_id)
+            except WorkspaceNotFoundError:
+                raise WorkspaceOperationError("workspace_not_found") from None
+            except ManifestNotFoundError:
+                raise WorkspaceOperationError("manifest_not_found") from None
             target = next(
                 (entry for entry in revision.entries if entry.entry_id == entry_id),
                 None,
             )
             if target is None:
-                return self._store.set_inclusion(
-                    workspace_id, revision_id, (entry_id,), included
-                )
+                try:
+                    return self._store.set_inclusion(
+                        workspace_id, revision_id, (entry_id,), included
+                    )
+                except ManifestNotFoundError:
+                    raise WorkspaceOperationError("manifest_not_found") from None
             entry_ids = (entry_id,)
             if subtree:
                 prefix = f"{target.relative_path.rstrip('/')}/"
@@ -218,17 +312,27 @@ class WorkspaceService:
                     if entry.entry_id == entry_id
                     or entry.relative_path.startswith(prefix)
                 )
-            return self._store.set_inclusion(
-                workspace_id,
-                revision_id,
-                entry_ids,
-                included,
-            )
+            try:
+                return self._store.set_inclusion(
+                    workspace_id,
+                    revision_id,
+                    entry_ids,
+                    included,
+                )
+            except ManifestNotFoundError:
+                raise WorkspaceOperationError("manifest_not_found") from None
 
     def approve(self, workspace_id: str, revision_id: str) -> ApprovalRecord:
         """Revalidate included files and atomically approve the exact draft."""
         with self._workspace_mutation(workspace_id):
-            revision = self._store.get_manifest(workspace_id, revision_id)
+            try:
+                revision = self._store.require_current_draft(
+                    workspace_id, revision_id
+                )
+            except WorkspaceNotFoundError:
+                raise WorkspaceOperationError("workspace_not_found") from None
+            except ManifestNotFoundError:
+                raise WorkspaceOperationError("manifest_not_found") from None
             workspace = self._require_workspace(workspace_id)
             selected = tuple(
                 entry
@@ -242,39 +346,40 @@ class WorkspaceService:
                 )
                 self._verify_stored_root(workspace, validation)
             except (SecureOpenError, WorkspaceOperationError) as error:
-                if selected:
-                    self._store.mark_entry_changed(
-                        workspace_id,
-                        selected[0].entry_id,
-                        getattr(error, "code", "source_root_invalid"),
-                    )
+                self._store.mark_revision_attention_if_current(
+                    workspace_id,
+                    revision_id,
+                    tuple(entry.entry_id for entry in selected),
+                    getattr(error, "code", "source_root_invalid"),
+                )
                 raise StaleManifestError(
                     "The selected source changed and needs review."
                 ) from None
             current = {entry.entry_id: entry for entry in validation.entries}
-            changed = next(
-                (
-                    entry
-                    for entry in selected
-                    if not self._entry_matches(entry, current.get(entry.entry_id))
-                ),
-                None,
+            changed = tuple(
+                entry.entry_id
+                for entry in selected
+                if not self._entry_matches(entry, current.get(entry.entry_id))
             )
-            if changed is not None:
-                self._store.mark_entry_changed(
+            if changed:
+                self._store.mark_revision_attention_if_current(
                     workspace_id,
-                    changed.entry_id,
+                    revision_id,
+                    changed,
                     "source_changed_before_approval",
                 )
                 raise StaleManifestError(
                     "The selected source changed and needs review."
                 )
-            self._store.record_access_verified(workspace_id, datetime.now(UTC))
-            return self._store.approve(
-                workspace_id,
-                revision_id,
-                revision.policy_version,
-            )
+            try:
+                return self._store.approve(
+                    workspace_id,
+                    revision_id,
+                    revision.policy_version,
+                    verified_at=datetime.now(UTC),
+                )
+            except InvalidApprovalError:
+                raise WorkspaceOperationError("invalid_approval") from None
 
     def delete_workspace(self, workspace_id: str) -> None:
         """Delete ExamSage-owned state only after the run guard settles."""
@@ -291,22 +396,31 @@ class WorkspaceService:
                 self._store.delete_workspace_rows(workspace_id)
                 return
             owned_path = workspace.canonical_root.parent
+            owned_identity = self._store.get_owned_root_identity(workspace_id)
+            self._assert_owned_snapshot_path(workspace, owned_path)
+            record = self._store.queue_cleanup(
+                workspace_id,
+                owned_path,
+                "cleanup_pending",
+                deletion_root_identity=owned_identity,
+            )
+            if owned_identity is None:
+                self._store.fail_cleanup(
+                    record.cleanup_id,
+                    "cleanup_identity_missing",
+                )
+                raise WorkspaceOperationError("cleanup_pending")
+            claim = OwnedTreeClaim(
+                relative_path=record.owned_relative_path,
+                device_id=owned_identity[0],
+                file_id=owned_identity[1],
+            )
             try:
-                self._remove_verified_owned_workspace(workspace, owned_path)
+                self._remove_owned_tree(claim)
             except Exception:
-                self._store.queue_cleanup(
-                    workspace_id,
-                    owned_path,
-                    "cleanup_failed",
-                )
-                record = next(
-                    record
-                    for record in reversed(self._store.list_cleanup())
-                    if record.workspace_id == workspace_id
-                )
                 self._store.fail_cleanup(record.cleanup_id, "cleanup_failed")
                 raise WorkspaceOperationError("cleanup_pending") from None
-            self._store.delete_workspace_rows(workspace_id)
+            self._store.complete_cleanup(record.cleanup_id)
 
     def delete_all_workspaces(self) -> tuple[str, ...]:
         """Safely delete settled workspaces and return sorted conflicts."""
@@ -331,15 +445,13 @@ class WorkspaceService:
                 if active_key == idempotency_key:
                     return self._store.get_job(active_job_id)
                 raise WorkspaceOperationError("workspace_operation_active")
-            candidate = WorkspaceJob(
-                job_id=uuid4().hex,
-                workspace_id=workspace_id,
-                job_kind="scan",
-                status=WorkspaceJobStatus.QUEUED,
-                idempotency_key=idempotency_key,
-                created_at=datetime.now(UTC),
-            )
-            stored = self._store.create_job(candidate, idempotency_key)
+            candidate = self._new_job(workspace_id, idempotency_key, "scan")
+            try:
+                stored = self._store.create_job(candidate, idempotency_key)
+            except WorkspaceNotFoundError:
+                raise WorkspaceOperationError("workspace_not_found") from None
+            except ActiveWorkspaceOperationError:
+                raise WorkspaceOperationError("workspace_operation_active") from None
             if stored.job_id != candidate.job_id:
                 return stored
             self._active_workspaces.add(workspace_id)
@@ -349,6 +461,21 @@ class WorkspaceService:
             )
             self._queue_existing(stored)
             return stored
+
+    @staticmethod
+    def _new_job(
+        workspace_id: str,
+        idempotency_key: str,
+        job_kind: str,
+    ) -> WorkspaceJob:
+        return WorkspaceJob(
+            job_id=uuid4().hex,
+            workspace_id=workspace_id,
+            job_kind=job_kind,
+            status=WorkspaceJobStatus.QUEUED,
+            idempotency_key=idempotency_key,
+            created_at=datetime.now(UTC),
+        )
 
     def _queue_existing(self, job: WorkspaceJob) -> None:
         with self._lock:
@@ -367,15 +494,13 @@ class WorkspaceService:
             job_id = self._jobs.get()
             if job_id is None:
                 return
+            if self._stop.is_set():
+                return
             try:
                 job = self._store.get_job(job_id)
                 self._store.start_job(job_id)
                 workspace = self._require_workspace(job.workspace_id)
-                validation = self._scanner.revalidate_entries(
-                    workspace.canonical_root
-                )
-                self._verify_stored_root(workspace, validation)
-                result = self._scanner.scan(
+                execution = self._scanner.scan_with_identity(
                     job.workspace_id,
                     workspace.canonical_root,
                     previous_entries=self._store.get_manifest_entries(
@@ -385,6 +510,8 @@ class WorkspaceService:
                         job_id, progress
                     ),
                 )
+                self._verify_stored_root(workspace, execution)
+                result = execution.result
                 self._store.record_access_verified(
                     job.workspace_id, result.completed_at
                 )
@@ -409,6 +536,8 @@ class WorkspaceService:
                             job.job_id,
                         ):
                             self._active_jobs.pop(job.workspace_id, None)
+            if self._stop.is_set():
+                return
 
     def _fail_if_active(self, job_id: str, code: str) -> None:
         try:
@@ -443,9 +572,23 @@ class WorkspaceService:
                     if workspace.source_mode is not SourceMode.BROWSER_SNAPSHOT:
                         raise WorkspaceOperationError("cleanup_path_invalid")
                     self._assert_owned_snapshot_path(workspace, owned_path)
+                if (
+                    record.deletion_root_device is None
+                    or record.deletion_root_file_id is None
+                ):
+                    self._store.fail_cleanup(
+                        record.cleanup_id,
+                        "cleanup_identity_missing",
+                    )
+                    continue
                 if owned_path.exists():
-                    self._assert_safe_owned_tree(owned_path)
-                    self._remove_owned_tree(owned_path)
+                    self._remove_owned_tree(
+                        OwnedTreeClaim(
+                            relative_path=record.owned_relative_path,
+                            device_id=record.deletion_root_device,
+                            file_id=record.deletion_root_file_id,
+                        )
+                    )
                 self._store.complete_cleanup(record.cleanup_id)
             except Exception:
                 self._store.fail_cleanup(record.cleanup_id, "cleanup_retry_failed")
@@ -454,6 +597,7 @@ class WorkspaceService:
         self,
         workspace_id: str,
         owned_path: Path,
+        deletion_root_identity: tuple[str, str] | None,
     ) -> None:
         data_root = self._store.database_path.parent.absolute()
         try:
@@ -463,20 +607,10 @@ class WorkspaceService:
                 workspace_id,
                 owned_path,
                 "cleanup_pending",
+                deletion_root_identity=deletion_root_identity,
             )
         except (ValueError, WorkspaceOperationError):
             return
-
-    def _remove_verified_owned_workspace(
-        self,
-        workspace: WorkspaceRecord,
-        owned_path: Path,
-    ) -> None:
-        self._assert_owned_snapshot_path(workspace, owned_path)
-        validation = self._scanner.revalidate_entries(workspace.canonical_root)
-        self._verify_stored_root(workspace, validation)
-        self._assert_safe_owned_tree(owned_path)
-        self._remove_owned_tree(owned_path)
 
     def _assert_owned_snapshot_path(
         self, workspace: WorkspaceRecord, owned_path: Path
@@ -499,37 +633,49 @@ class WorkspaceService:
     ) -> Path:
         relative = PurePosixPath(owned_relative_path)
         parts = relative.parts
-        if parts not in {
+        exact_paths = {
             ("workspaces", workspace_id),
             ("workspaces", workspace_id, "browser-intake"),
-        }:
+        }
+        is_task4_orphan = (
+            len(parts) == 3
+            and parts[:2] == ("workspaces", workspace_id)
+            and parts[2].startswith(".examsage-browser-orphan-")
+            and len(parts[2]) <= 96
+        )
+        if parts not in exact_paths and not is_task4_orphan:
             raise WorkspaceOperationError("cleanup_path_invalid")
         candidate = data_root.joinpath(*parts).absolute()
         if candidate != data_root.joinpath(*parts):
             raise WorkspaceOperationError("cleanup_path_invalid")
         return candidate
 
+    def _discover_browser_orphans(self) -> None:
+        workspaces_root = self._store.database_path.parent / "workspaces"
+        try:
+            workspaces = tuple(workspaces_root.iterdir())
+        except OSError:
+            return
+        for workspace_root in workspaces:
+            if not workspace_root.is_dir() or workspace_root.is_symlink():
+                continue
+            try:
+                children = tuple(workspace_root.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if not child.name.startswith(".examsage-browser-orphan-"):
+                    continue
+                self._queue_orphan_cleanup(
+                    workspace_root.name,
+                    child,
+                    None,
+                )
+
     @staticmethod
-    def _assert_safe_owned_tree(root: Path) -> None:
-        root_stat = root.stat(follow_symlinks=False)
-        if (
-            root.is_symlink()
-            or is_reparse_point(root)
-            or not stat.S_ISDIR(root_stat.st_mode)
-        ):
-            raise WorkspaceOperationError("cleanup_path_invalid")
-        for directory, directories, files in os.walk(root, followlinks=False):
-            current = Path(directory)
-            for name in (*directories, *files):
-                candidate = current / name
-                metadata = candidate.stat(follow_symlinks=False)
-                if candidate.is_symlink() or is_reparse_point(candidate):
-                    raise WorkspaceOperationError("cleanup_path_invalid")
-                if not (
-                    stat.S_ISDIR(metadata.st_mode)
-                    or stat.S_ISREG(metadata.st_mode)
-                ):
-                    raise WorkspaceOperationError("cleanup_path_invalid")
+    def _secure_cleanup_unavailable(claim: OwnedTreeClaim) -> None:
+        del claim
+        raise WorkspaceOperationError("secure_cleanup_unavailable")
 
     def _validate_root(self, root: Path) -> RevalidationResult:
         try:
@@ -540,11 +686,11 @@ class WorkspaceService:
     @staticmethod
     def _verify_stored_root(
         workspace: WorkspaceRecord,
-        validation: RevalidationResult,
+        validation: RevalidationResult | ScanExecution,
     ) -> None:
-        same_path = os.path.normcase(
-            os.path.abspath(workspace.canonical_root)
-        ) == os.path.normcase(os.path.abspath(validation.canonical_root))
+        same_path = os.path.normcase(str(workspace.canonical_root)) == os.path.normcase(
+            str(validation.canonical_root)
+        )
         if not (
             same_path
             and workspace.root_device == validation.root_device
@@ -568,15 +714,23 @@ class WorkspaceService:
             and expected.file_id == getattr(actual, "file_id", None)
         )
 
-    def _creation_job(self, idempotency_key: str) -> WorkspaceJob | None:
-        with self._lock:
-            job_id = self._creation_jobs.get(idempotency_key)
-        if job_id is None:
+    def _replay_creation(
+        self,
+        state: str,
+        idempotency_key: str,
+    ) -> WorkspaceJob | None:
+        if state == "completed":
+            job = self._store.get_creation_job(idempotency_key)
+            if job is None:
+                raise WorkspaceOperationError("creation_interrupted")
+            return job
+        if state == "cancelled":
             return None
-        try:
-            return self._store.get_job(job_id)
-        except WorkspaceJobNotFoundError:
-            return None
+        if state == "claimed":
+            raise WorkspaceOperationError("creation_in_progress")
+        if state == "interrupted":
+            raise WorkspaceOperationError("creation_interrupted")
+        raise WorkspaceOperationError("creation_failed")
 
     def _require_workspace(self, workspace_id: str) -> WorkspaceRecord:
         workspace = self._store.get_workspace(workspace_id)

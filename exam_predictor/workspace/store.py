@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
@@ -18,6 +19,7 @@ from exam_predictor.workspace.models import (
     ManifestRevision,
     ScanProgress,
     ScanResult,
+    SourceMode,
     SourceState,
     WorkspaceEvent,
     WorkspaceJob,
@@ -54,6 +56,16 @@ class InvalidApprovalError(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class CreationRequest:
+    idempotency_key: str
+    operation_kind: SourceMode
+    state: str
+    workspace_id: str
+    job_id: str | None = None
+    safe_error_code: str | None = None
+
+
 _SCHEMA = (
     """CREATE TABLE workspaces (
       workspace_id TEXT PRIMARY KEY,
@@ -62,6 +74,8 @@ _SCHEMA = (
       canonical_root TEXT NOT NULL,
       root_device TEXT,
       root_file_id TEXT,
+      owned_root_device TEXT,
+      owned_root_file_id TEXT,
       state TEXT NOT NULL,
       current_draft_revision_id TEXT,
       current_approved_revision_id TEXT,
@@ -133,6 +147,22 @@ _SCHEMA = (
       owned_relative_path TEXT NOT NULL,
       safe_error_code TEXT NOT NULL,
       attempt_count INTEGER NOT NULL DEFAULT 0,
+      deletion_root_device TEXT,
+      deletion_root_file_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      CHECK(
+        (deletion_root_device IS NULL AND deletion_root_file_id IS NULL) OR
+        (deletion_root_device IS NOT NULL AND deletion_root_file_id IS NOT NULL)
+      )
+    )""",
+    """CREATE TABLE workspace_creation_requests (
+      idempotency_key TEXT PRIMARY KEY,
+      operation_kind TEXT NOT NULL,
+      state TEXT NOT NULL,
+      workspace_id TEXT NOT NULL,
+      job_id TEXT,
+      safe_error_code TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )""",
@@ -142,6 +172,10 @@ _SCHEMA = (
       ON manifest_entries(revision_id, state, relative_path)""",
     """CREATE INDEX idx_workspace_events_job_sequence
       ON workspace_events(job_id, sequence)""",
+    """CREATE UNIQUE INDEX idx_workspace_jobs_one_active
+      ON workspace_jobs(workspace_id) WHERE status IN ('queued', 'running')""",
+    """CREATE UNIQUE INDEX idx_cleanup_owned_path
+      ON cleanup_queue(owned_relative_path)""",
 )
 
 _BLOCKED_JOB_WORKSPACE_STATES = {
@@ -270,12 +304,90 @@ class WorkspaceStore:
     def _migrate(self) -> None:
         with self._transaction() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 1:
+            if version > 2:
                 raise RuntimeError("The workspace database schema is newer than this application.")
             if version == 0:
                 for statement in _SCHEMA:
                     connection.execute(statement)
-                connection.execute("PRAGMA user_version=1")
+                connection.execute("PRAGMA user_version=2")
+            elif version == 1:
+                connection.execute(
+                    "ALTER TABLE workspaces ADD COLUMN owned_root_device TEXT"
+                )
+                connection.execute(
+                    "ALTER TABLE workspaces ADD COLUMN owned_root_file_id TEXT"
+                )
+                connection.execute(
+                    "ALTER TABLE cleanup_queue ADD COLUMN deletion_root_device TEXT"
+                )
+                connection.execute(
+                    "ALTER TABLE cleanup_queue ADD COLUMN deletion_root_file_id TEXT"
+                )
+                connection.execute(
+                    """CREATE TABLE workspace_creation_requests (
+                      idempotency_key TEXT PRIMARY KEY,
+                      operation_kind TEXT NOT NULL,
+                      state TEXT NOT NULL,
+                      workspace_id TEXT NOT NULL,
+                      job_id TEXT,
+                      safe_error_code TEXT,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    )"""
+                )
+                connection.execute("PRAGMA user_version=2")
+            now = self._timestamp(self._now())
+            duplicate_active = connection.execute(
+                """WITH ranked AS (
+                       SELECT rowid,
+                              ROW_NUMBER() OVER (
+                                PARTITION BY workspace_id
+                                ORDER BY created_at ASC, rowid ASC
+                              ) AS active_rank
+                       FROM workspace_jobs
+                       WHERE status IN ('queued', 'running')
+                   )
+                   SELECT jobs.job_id
+                   FROM workspace_jobs AS jobs
+                   JOIN ranked ON ranked.rowid = jobs.rowid
+                   WHERE ranked.active_rank > 1"""
+            ).fetchall()
+            for duplicate in duplicate_active:
+                job_id = str(duplicate["job_id"])
+                connection.execute(
+                    """UPDATE workspace_jobs
+                       SET status = ?, safe_error_code = ?, finished_at = ?
+                       WHERE job_id = ?""",
+                    (
+                        WorkspaceJobStatus.FAILED.value,
+                        "superseded_active_job",
+                        now,
+                        job_id,
+                    ),
+                )
+                self._insert_event(
+                    connection,
+                    job_id=job_id,
+                    event_type="failed",
+                    message="Workspace scan failed.",
+                    payload={"safe_error_code": "superseded_active_job"},
+                    created_at=self._now(),
+                )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_jobs_one_active
+                   ON workspace_jobs(workspace_id)
+                   WHERE status IN ('queued', 'running')"""
+            )
+            connection.execute(
+                """DELETE FROM cleanup_queue
+                   WHERE rowid NOT IN (
+                     SELECT MIN(rowid) FROM cleanup_queue GROUP BY owned_relative_path
+                   )"""
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_cleanup_owned_path
+                   ON cleanup_queue(owned_relative_path)"""
+            )
             connection.execute(
                 """WITH ranked AS (
                        SELECT revisions.rowid AS revision_rowid,
@@ -579,6 +691,213 @@ class WorkspaceStore:
             row = self._workspace_row(connection, workspace.workspace_id)
         return self._workspace(row)
 
+    @staticmethod
+    def _creation_request(row: sqlite3.Row) -> CreationRequest:
+        return CreationRequest(
+            idempotency_key=str(row["idempotency_key"]),
+            operation_kind=SourceMode(row["operation_kind"]),
+            state=str(row["state"]),
+            workspace_id=str(row["workspace_id"]),
+            job_id=str(row["job_id"]) if row["job_id"] is not None else None,
+            safe_error_code=(
+                str(row["safe_error_code"])
+                if row["safe_error_code"] is not None
+                else None
+            ),
+        )
+
+    def claim_creation(
+        self,
+        idempotency_key: str,
+        operation_kind: SourceMode,
+        workspace_id: str,
+    ) -> tuple[CreationRequest, bool]:
+        now = self._now()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                """SELECT * FROM workspace_creation_requests
+                   WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                request = self._creation_request(existing)
+                if request.operation_kind is not operation_kind:
+                    raise ActiveWorkspaceOperationError(
+                        "The creation idempotency key belongs to another operation."
+                    )
+                return request, False
+            connection.execute(
+                """INSERT INTO workspace_creation_requests(
+                       idempotency_key, operation_kind, state, workspace_id,
+                       job_id, safe_error_code, created_at, updated_at
+                   ) VALUES (?, ?, 'claimed', ?, NULL, NULL, ?, ?)""",
+                (
+                    idempotency_key,
+                    operation_kind.value,
+                    workspace_id,
+                    self._timestamp(now),
+                    self._timestamp(now),
+                ),
+            )
+            row = connection.execute(
+                """SELECT * FROM workspace_creation_requests
+                   WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("The creation request could not be read back.")
+            return self._creation_request(row), True
+
+    def create_workspace_with_initial_job(
+        self,
+        workspace: WorkspaceRecord,
+        job: WorkspaceJob,
+        idempotency_key: str,
+        *,
+        owned_root_identity: tuple[str, str] | None = None,
+    ) -> tuple[WorkspaceRecord, WorkspaceJob, bool]:
+        if (
+            job.workspace_id != workspace.workspace_id
+            or job.job_kind != "initial_scan"
+            or job.status is not WorkspaceJobStatus.QUEUED
+        ):
+            raise ValueError("initial workspace job identity is invalid")
+        owned_device, owned_file = owned_root_identity or (None, None)
+        with self._transaction() as connection:
+            request_row = connection.execute(
+                """SELECT * FROM workspace_creation_requests
+                   WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if request_row is None:
+                raise ActiveWorkspaceOperationError(
+                    "The creation idempotency key was not claimed."
+                )
+            request = self._creation_request(request_row)
+            if request.state == "completed":
+                existing_workspace = self._workspace_row(
+                    connection, request.workspace_id
+                )
+                if request.job_id is None:
+                    raise RuntimeError("The completed creation request has no job.")
+                return (
+                    self._workspace(existing_workspace),
+                    self._job(self._job_row(connection, request.job_id)),
+                    False,
+                )
+            if request.state != "claimed" or request.workspace_id != workspace.workspace_id:
+                raise ActiveWorkspaceOperationError(
+                    "The creation request cannot be completed."
+                )
+            connection.execute(
+                """INSERT INTO workspaces(
+                       workspace_id, display_name, source_mode, canonical_root,
+                       root_device, root_file_id, owned_root_device,
+                       owned_root_file_id, state, current_draft_revision_id,
+                       current_approved_revision_id, created_at, updated_at,
+                       last_scanned_at, last_access_verified_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    workspace.workspace_id,
+                    workspace.display_name,
+                    workspace.source_mode.value,
+                    str(workspace.canonical_root),
+                    workspace.root_device,
+                    workspace.root_file_id,
+                    owned_device,
+                    owned_file,
+                    workspace.state.value,
+                    workspace.current_draft_revision_id,
+                    workspace.current_approved_revision_id,
+                    self._timestamp(workspace.created_at),
+                    self._timestamp(workspace.updated_at),
+                    self._timestamp(workspace.last_scanned_at),
+                    self._timestamp(workspace.last_access_verified_at),
+                ),
+            )
+            connection.execute(
+                """INSERT INTO workspace_jobs(
+                       job_id, workspace_id, job_kind, status, idempotency_key,
+                       safe_error_code, created_at, started_at, finished_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job.job_id,
+                    job.workspace_id,
+                    job.job_kind,
+                    job.status.value,
+                    idempotency_key,
+                    job.safe_error_code,
+                    self._timestamp(job.created_at),
+                    self._timestamp(job.started_at),
+                    self._timestamp(job.finished_at),
+                ),
+            )
+            connection.execute(
+                """UPDATE workspace_creation_requests
+                   SET state = 'completed', job_id = ?, updated_at = ?
+                   WHERE idempotency_key = ? AND state = 'claimed'""",
+                (job.job_id, self._timestamp(self._now()), idempotency_key),
+            )
+            return (
+                self._workspace(self._workspace_row(connection, workspace.workspace_id)),
+                self._job(self._job_row(connection, job.job_id)),
+                True,
+            )
+
+    def get_creation_request(self, idempotency_key: str) -> CreationRequest | None:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT * FROM workspace_creation_requests
+                   WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+        return self._creation_request(row) if row is not None else None
+
+    def get_creation_job(self, idempotency_key: str) -> WorkspaceJob | None:
+        request = self.get_creation_request(idempotency_key)
+        if request is None or request.state != "completed" or request.job_id is None:
+            return None
+        return self.get_job(request.job_id)
+
+    def finish_cancelled_creation(self, idempotency_key: str) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """UPDATE workspace_creation_requests
+                   SET state = 'cancelled', updated_at = ?
+                   WHERE idempotency_key = ? AND state = 'claimed'""",
+                (self._timestamp(self._now()), idempotency_key),
+            )
+
+    def fail_creation(self, idempotency_key: str, code: str) -> None:
+        self._safe_code(code)
+        with self._transaction() as connection:
+            connection.execute(
+                """UPDATE workspace_creation_requests
+                   SET state = 'failed', safe_error_code = ?, updated_at = ?
+                   WHERE idempotency_key = ? AND state = 'claimed'""",
+                (code, self._timestamp(self._now()), idempotency_key),
+            )
+
+    def interrupt_claimed_creations(self) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                """UPDATE workspace_creation_requests
+                   SET state = 'interrupted', safe_error_code = 'creation_interrupted',
+                       updated_at = ? WHERE state = 'claimed'""",
+                (self._timestamp(self._now()),),
+            )
+
+    def get_owned_root_identity(
+        self, workspace_id: str
+    ) -> tuple[str, str] | None:
+        with self._lock:
+            row = self._workspace_row(self._connection, workspace_id)
+            device = row["owned_root_device"]
+            file_id = row["owned_root_file_id"]
+        if device is None or file_id is None:
+            return None
+        return str(device), str(file_id)
+
     def list_workspaces(self) -> Sequence[WorkspaceSummary]:
         with self._lock:
             rows = self._connection.execute(
@@ -755,6 +1074,17 @@ class WorkspaceStore:
                 )
             return self._revision(self._connection, workspace_id, selected)
 
+    def require_current_draft(
+        self, workspace_id: str, revision_id: str
+    ) -> ManifestRevision:
+        with self._lock:
+            workspace = self._workspace_row(self._connection, workspace_id)
+            if workspace["current_draft_revision_id"] != revision_id:
+                raise StaleManifestError(
+                    f"Manifest revision '{revision_id}' is no longer current."
+                )
+            return self._revision(self._connection, workspace_id, revision_id)
+
     def set_inclusion(
         self,
         workspace_id: str,
@@ -804,10 +1134,15 @@ class WorkspaceStore:
         return revision
 
     def approve(
-        self, workspace_id: str, revision_id: str, policy_version: str
+        self,
+        workspace_id: str,
+        revision_id: str,
+        policy_version: str,
+        *,
+        verified_at: datetime | None = None,
     ) -> ApprovalRecord:
         approval_id = uuid4().hex
-        now = self._now()
+        now = verified_at or self._now()
         with self._transaction() as connection:
             workspace = self._workspace_row(connection, workspace_id)
             if workspace["current_draft_revision_id"] != revision_id:
@@ -860,12 +1195,14 @@ class WorkspaceStore:
                 )
             connection.execute(
                 """UPDATE workspaces
-                   SET state = ?, current_approved_revision_id = ?, updated_at = ?
+                   SET state = ?, current_approved_revision_id = ?, updated_at = ?,
+                       last_access_verified_at = COALESCE(?, last_access_verified_at)
                    WHERE workspace_id = ?""",
                 (
                     WorkspaceState.APPROVED.value,
                     revision_id,
                     self._timestamp(now),
+                    self._timestamp(verified_at),
                     workspace_id,
                 ),
             )
@@ -893,35 +1230,54 @@ class WorkspaceStore:
         return self._approval(row) if row is not None else None
 
     def create_job(self, job: WorkspaceJob, idempotency_key: str) -> WorkspaceJob:
-        with self._transaction() as connection:
-            workspace = self._workspace_row(connection, job.workspace_id)
-            self._guard_workspace_accepts_jobs(workspace)
-            existing = connection.execute(
-                """SELECT * FROM workspace_jobs
-                   WHERE workspace_id = ? AND job_kind = ? AND idempotency_key = ?""",
-                (job.workspace_id, job.job_kind, idempotency_key),
-            ).fetchone()
-            if existing is not None:
-                return self._job(existing)
-            connection.execute(
-                """INSERT INTO workspace_jobs(
-                       job_id, workspace_id, job_kind, status, idempotency_key,
-                       safe_error_code, created_at, started_at, finished_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    job.job_id,
-                    job.workspace_id,
-                    job.job_kind,
-                    job.status.value,
-                    idempotency_key,
-                    job.safe_error_code,
-                    self._timestamp(job.created_at),
-                    self._timestamp(job.started_at),
-                    self._timestamp(job.finished_at),
-                ),
-            )
-            row = self._job_row(connection, job.job_id)
-        return self._job(row)
+        try:
+            with self._transaction() as connection:
+                workspace = self._workspace_row(connection, job.workspace_id)
+                self._guard_workspace_accepts_jobs(workspace)
+                existing = connection.execute(
+                    """SELECT * FROM workspace_jobs
+                       WHERE workspace_id = ? AND job_kind = ?
+                         AND idempotency_key = ?""",
+                    (job.workspace_id, job.job_kind, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    return self._job(existing)
+                connection.execute(
+                    """INSERT INTO workspace_jobs(
+                           job_id, workspace_id, job_kind, status, idempotency_key,
+                           safe_error_code, created_at, started_at, finished_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        job.job_id,
+                        job.workspace_id,
+                        job.job_kind,
+                        job.status.value,
+                        idempotency_key,
+                        job.safe_error_code,
+                        self._timestamp(job.created_at),
+                        self._timestamp(job.started_at),
+                        self._timestamp(job.finished_at),
+                    ),
+                )
+                row = self._job_row(connection, job.job_id)
+            return self._job(row)
+        except sqlite3.IntegrityError:
+            with self._lock:
+                active = self._connection.execute(
+                    """SELECT * FROM workspace_jobs
+                       WHERE workspace_id = ? AND status IN ('queued', 'running')
+                       ORDER BY created_at ASC, rowid ASC LIMIT 1""",
+                    (job.workspace_id,),
+                ).fetchone()
+            if (
+                active is not None
+                and active["job_kind"] == job.job_kind
+                and active["idempotency_key"] == idempotency_key
+            ):
+                return self._job(active)
+            raise ActiveWorkspaceOperationError(
+                f"Workspace '{job.workspace_id}' has an active operation."
+            ) from None
 
     def get_job(self, job_id: str) -> WorkspaceJob:
         with self._lock:
@@ -958,6 +1314,25 @@ class WorkspaceStore:
                 )
                 recovered.append(self._job(self._job_row(connection, row["job_id"])))
         return tuple(recovered)
+
+    def recover_unfinished_jobs(self) -> Sequence[WorkspaceJob]:
+        self.recover_running_jobs()
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM workspace_jobs WHERE status = ?
+                   ORDER BY created_at ASC, rowid ASC""",
+                (WorkspaceJobStatus.QUEUED.value,),
+            ).fetchall()
+        return tuple(self._job(row) for row in rows)
+
+    def list_queued_jobs(self) -> Sequence[WorkspaceJob]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM workspace_jobs WHERE status = ?
+                   ORDER BY created_at ASC, rowid ASC""",
+                (WorkspaceJobStatus.QUEUED.value,),
+            ).fetchall()
+        return tuple(self._job(row) for row in rows)
 
     def start_job(self, job_id: str) -> WorkspaceJob:
         now = self._now()
@@ -1015,6 +1390,23 @@ class WorkspaceStore:
                 raise ActiveWorkspaceOperationError(
                     f"Workspace job '{job_id}' is not running."
                 )
+            progress_count = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM workspace_events
+                       WHERE job_id = ? AND event_type = 'scan_progress'""",
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            if progress_count >= 256:
+                latest = connection.execute(
+                    """SELECT * FROM workspace_events
+                       WHERE job_id = ? AND event_type = 'scan_progress'
+                       ORDER BY sequence DESC LIMIT 1""",
+                    (job_id,),
+                ).fetchone()
+                if latest is None:
+                    raise RuntimeError("The capped progress event could not be read.")
+                return self._event(latest)
             event = self._insert_event(
                 connection,
                 job_id=job_id,
@@ -1169,6 +1561,62 @@ class WorkspaceStore:
                 ),
             )
 
+    def mark_revision_attention_if_current(
+        self,
+        workspace_id: str,
+        revision_id: str,
+        entry_ids: Sequence[str],
+        code: str,
+    ) -> ManifestRevision:
+        requested = set(entry_ids)
+        new_revision_id = uuid4().hex
+        now = self._now()
+        with self._transaction() as connection:
+            workspace = self._workspace_row(connection, workspace_id)
+            if workspace["current_draft_revision_id"] != revision_id:
+                raise StaleManifestError(
+                    f"Manifest revision '{revision_id}' is no longer current."
+                )
+            revision = self._revision(connection, workspace_id, revision_id)
+            known = {item.entry_id for item in revision.entries}
+            if not requested <= known:
+                raise ManifestNotFoundError("Manifest entries were not found.")
+
+            def mark_changed(item: ManifestEntry) -> ManifestEntry:
+                if item.entry_id not in requested:
+                    return item
+                return item.model_copy(
+                    update={
+                        "state": SourceState.CHANGED,
+                        "included": False,
+                        "inclusion_reason": code,
+                        "failure_code": code,
+                        "safe_message": (
+                            "The selected source changed and needs review."
+                        ),
+                    }
+                )
+
+            self._clone_revision(
+                connection,
+                revision,
+                new_revision_id,
+                now,
+                mark_changed,
+            )
+            connection.execute(
+                """UPDATE workspaces
+                   SET state = ?, current_draft_revision_id = ?, updated_at = ?
+                   WHERE workspace_id = ?""",
+                (
+                    WorkspaceState.NEEDS_ATTENTION.value,
+                    new_revision_id,
+                    self._timestamp(now),
+                    workspace_id,
+                ),
+            )
+            return self._revision(connection, workspace_id, new_revision_id)
+
     def record_access_verified(self, workspace_id: str, verified_at: datetime) -> None:
         with self._transaction() as connection:
             self._workspace_row(connection, workspace_id)
@@ -1253,8 +1701,21 @@ class WorkspaceStore:
             raise ValueError("cleanup path must identify an app-owned path")
         return normalized, candidate
 
-    def queue_cleanup(self, workspace_id: str, owned_path: Path, code: str) -> None:
+    def queue_cleanup(
+        self,
+        workspace_id: str,
+        owned_path: Path,
+        code: str,
+        *,
+        deletion_root_identity: tuple[str, str] | None = None,
+    ) -> CleanupRecord:
         relative_path, absolute_path = self._owned_relative_path(owned_path)
+        deletion_device, deletion_file = deletion_root_identity or (None, None)
+        if any(
+            value is not None and len(value) > 128
+            for value in (deletion_device, deletion_file)
+        ):
+            raise ValueError("cleanup root identity is too long")
         now = self._now()
         with self._transaction() as connection:
             workspace = connection.execute(
@@ -1265,20 +1726,43 @@ class WorkspaceStore:
                 native_root = Path(workspace["canonical_root"]).absolute()
                 if absolute_path == native_root or native_root in absolute_path.parents:
                     raise ValueError("native source roots cannot be queued for cleanup")
+            existing = connection.execute(
+                "SELECT * FROM cleanup_queue WHERE owned_relative_path = ?",
+                (relative_path,),
+            ).fetchone()
+            if existing is not None:
+                existing_identity = (
+                    existing["deletion_root_device"],
+                    existing["deletion_root_file_id"],
+                )
+                requested_identity = (deletion_device, deletion_file)
+                if existing_identity != requested_identity:
+                    raise ValueError("cleanup root identity cannot be replaced")
+                return self._cleanup(existing)
+            cleanup_id = uuid4().hex
             connection.execute(
                 """INSERT INTO cleanup_queue(
                        cleanup_id, workspace_id, owned_relative_path, safe_error_code,
-                       attempt_count, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, 0, ?, ?)""",
+                       attempt_count, deletion_root_device, deletion_root_file_id,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)""",
                 (
-                    uuid4().hex,
+                    cleanup_id,
                     workspace_id,
                     relative_path,
                     code,
+                    deletion_device,
+                    deletion_file,
                     self._timestamp(now),
                     self._timestamp(now),
                 ),
             )
+            row = connection.execute(
+                "SELECT * FROM cleanup_queue WHERE cleanup_id = ?", (cleanup_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("The cleanup record could not be read back.")
+            return self._cleanup(row)
 
     def list_cleanup(self) -> Sequence[CleanupRecord]:
         with self._lock:

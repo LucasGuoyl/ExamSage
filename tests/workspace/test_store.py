@@ -139,7 +139,7 @@ def test_schema_pragmas_and_workspace_round_trip(store: WorkspaceStore, tmp_path
     assert store.source_root(persisted.workspace_id) == (tmp_path / "workspace-1")
     assert store.get_manifest_entries(persisted.workspace_id) == ()
     with store._lock:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert store._connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert store._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         tables = {
@@ -271,7 +271,7 @@ def test_commit_scan_replay_returns_existing_revision_without_duplicate_event(
     assert count == 1
 
 
-def test_commit_scan_requires_running_and_rejects_late_older_completion(
+def test_commit_scan_requires_running_and_active_authority_blocks_a_newer_scan(
     store: WorkspaceStore, tmp_path: Path
 ):
     store.create_workspace(workspace_record(tmp_path))
@@ -288,33 +288,19 @@ def test_commit_scan_requires_running_and_rejects_late_older_completion(
         store.commit_scan("workspace-1", queued_result, older.job_id)
 
     store.start_job(older.job_id)
-    newer = store.create_job(
-        job(
-            job_id="job-2",
-            idempotency_key="request-2",
-        ).model_copy(update={"created_at": NOW + timedelta(minutes=1)}),
-        "request-2",
-    )
-    store.start_job(newer.job_id)
-    newest = store.commit_scan(
-        "workspace-1",
-        ScanResult(
-            workspace_id="workspace-1",
-            entries=(entry(sha256=HASH_B),),
-            discovered_count=1,
-            bytes_hashed=10,
-            failure_count=0,
-            completed_at=NOW + timedelta(minutes=2),
-        ),
-        newer.job_id,
-    )
+    with pytest.raises(ActiveWorkspaceOperationError):
+        store.create_job(
+            job(
+                job_id="job-2",
+                idempotency_key="request-2",
+            ).model_copy(update={"created_at": NOW + timedelta(minutes=1)}),
+            "request-2",
+        )
 
-    with pytest.raises(StaleManifestError):
-        store.commit_scan("workspace-1", queued_result, older.job_id)
+    committed = store.commit_scan("workspace-1", queued_result, older.job_id)
 
-    assert store.get_manifest("workspace-1") == newest
-    assert store.get_job(older.job_id).status is WorkspaceJobStatus.RUNNING
-    assert store.list_job_events(older.job_id)[-1].event_type == "started"
+    assert store.get_manifest("workspace-1") == committed
+    assert store.get_job(older.job_id).status is WorkspaceJobStatus.SUCCEEDED
 
 
 def test_reopen_migrates_unique_scan_job_revision_index(tmp_path: Path):
@@ -512,8 +498,15 @@ def test_recover_running_jobs_is_restart_safe_ordered_and_idempotent(tmp_path: P
     path = tmp_path / "workspace.sqlite3"
     original = WorkspaceStore(path)
     original.create_workspace(workspace_record(tmp_path))
+    original.create_workspace(
+        workspace_record(tmp_path, workspace_id="workspace-2")
+    )
     running_jobs = [
-        job(job_id=f"job-{index}", status=WorkspaceJobStatus.RUNNING).model_copy(
+        job(
+            job_id=f"job-{index}",
+            workspace_id=f"workspace-{index}",
+            status=WorkspaceJobStatus.RUNNING,
+        ).model_copy(
             update={
                 "idempotency_key": f"request-{index}",
                 "safe_error_code": "interrupted",
@@ -711,6 +704,32 @@ def test_fail_job_is_atomic_and_sets_workspace_attention(
     assert failed.finished_at is not None
     assert store.get_workspace("workspace-1").state is WorkspaceState.NEEDS_ATTENTION  # type: ignore[union-attr]
     assert store.list_job_events("job-1")[-1].event_type == "failed"
+
+
+def test_progress_events_have_a_durable_per_job_cap(
+    store: WorkspaceStore, tmp_path: Path
+):
+    store.create_workspace(workspace_record(tmp_path))
+    store.create_job(job(), "request-1")
+    store.start_job("job-1")
+
+    for index in range(300):
+        store.append_progress(
+            "job-1",
+            ScanProgress(
+                discovered_count=index + 1,
+                bytes_hashed=index,
+                failure_count=0,
+                current_relative_path=f"{index}.txt",
+            ),
+        )
+
+    progress = [
+        event
+        for event in store.list_job_events("job-1")
+        if event.event_type == "scan_progress"
+    ]
+    assert len(progress) == 256
 
 
 @pytest.mark.parametrize(
@@ -1066,6 +1085,96 @@ def test_cleanup_failure_and_completion_are_atomic_and_completion_is_idempotent(
     assert store.get_workspace(source.workspace_id) is None
     assert store.list_cleanup() == ()
     assert store.complete_cleanup(record.cleanup_id) is None
+
+
+def test_initial_workspace_and_job_are_atomic_and_durably_idempotent(
+    store: WorkspaceStore, tmp_path: Path
+):
+    first_workspace = workspace_record(tmp_path).model_copy(
+        update={"state": WorkspaceState.READY}
+    )
+    first_job = job().model_copy(update={"job_kind": "initial_scan"})
+    second_workspace = workspace_record(
+        tmp_path, workspace_id="workspace-2"
+    ).model_copy(update={"state": WorkspaceState.READY})
+    second_job = job(
+        job_id="job-2",
+        workspace_id="workspace-2",
+        idempotency_key="request-1",
+    ).model_copy(update={"job_kind": "initial_scan"})
+    request, claimed = store.claim_creation(
+        "request-1",
+        SourceMode.BROWSER_SNAPSHOT,
+        first_workspace.workspace_id,
+    )
+    assert claimed is True
+
+    created_workspace, created_job, created = store.create_workspace_with_initial_job(
+        first_workspace,
+        first_job,
+        "request-1",
+        owned_root_identity=("7", "22"),
+    )
+    duplicate_workspace, duplicate_job, duplicate_created = (
+        store.create_workspace_with_initial_job(
+            second_workspace,
+            second_job,
+            "request-1",
+            owned_root_identity=("8", "33"),
+        )
+    )
+
+    assert created is True
+    assert duplicate_created is False
+    assert duplicate_workspace == created_workspace
+    assert duplicate_job == created_job
+    assert [item.workspace_id for item in store.list_workspaces()] == [
+        first_workspace.workspace_id
+    ]
+    assert store.get_owned_root_identity(first_workspace.workspace_id) == ("7", "22")
+    assert store.get_creation_job("request-1") == created_job
+
+
+def test_database_rejects_two_active_scans_for_one_workspace(tmp_path: Path):
+    path = tmp_path / "workspace.sqlite3"
+    first = WorkspaceStore(path)
+    second = WorkspaceStore(path)
+    try:
+        ready = workspace_record(tmp_path).model_copy(update={"state": WorkspaceState.READY})
+        first.create_workspace(ready)
+        barrier = Barrier(2)
+
+        def create_active(target: WorkspaceStore, value: WorkspaceJob) -> str:
+            barrier.wait()
+            try:
+                target.create_job(value, value.idempotency_key)
+            except ActiveWorkspaceOperationError:
+                return "blocked"
+            return "created"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = {
+                future.result()
+                for future in (
+                    pool.submit(create_active, first, job()),
+                    pool.submit(
+                        create_active,
+                        second,
+                        job(job_id="job-2", idempotency_key="request-2"),
+                    ),
+                )
+            }
+        assert outcomes == {"blocked", "created"}
+        with first._lock:
+            active_count = first._connection.execute(
+                """SELECT COUNT(*) FROM workspace_jobs
+                   WHERE workspace_id = ? AND status IN ('queued', 'running')""",
+                (ready.workspace_id,),
+            ).fetchone()[0]
+        assert active_count == 1
+    finally:
+        first.close()
+        second.close()
 
 
 def test_missing_workspace_manifest_and_job_errors_are_safe(store: WorkspaceStore):

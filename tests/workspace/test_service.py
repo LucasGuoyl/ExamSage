@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import io
 import shutil
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,11 @@ from exam_predictor.workspace.models import (
     WorkspaceState,
 )
 from exam_predictor.workspace.scanner import WorkspaceScanner
-from exam_predictor.workspace.service import WorkspaceOperationError, WorkspaceService
+from exam_predictor.workspace.service import (
+    OwnedTreeClaim,
+    WorkspaceOperationError,
+    WorkspaceService,
+)
 from exam_predictor.workspace.store import StaleManifestError, WorkspaceStore
 
 
@@ -70,6 +75,22 @@ def _service(
         run_guard=guard,
         remove_owned_tree=remove_owned_tree,
     )
+
+
+def _secure_test_remover(data_root: Path, removed: list[Path] | None = None):
+    def remove(claim: OwnedTreeClaim) -> None:
+        path = data_root / Path(claim.relative_path)
+        validation = WorkspaceScanner().revalidate_entries(path)
+        if (
+            validation.root_device != claim.device_id
+            or validation.root_file_id != claim.file_id
+        ):
+            raise OSError("identity changed")
+        shutil.rmtree(path)
+        if removed is not None:
+            removed.append(path)
+
+    return remove
 
 
 @pytest.fixture
@@ -240,18 +261,94 @@ def test_start_recovers_a_running_scan_once(
         restarted.shutdown()
 
 
+def test_start_recovers_every_durable_queued_scan(
+    tmp_path: Path, store: WorkspaceStore
+):
+    native_root = tmp_path / "native"
+    native_root.mkdir()
+    (native_root / "notes.txt").write_text("notes", encoding="utf-8")
+    first = _service(tmp_path, store, FakePicker([native_root]), FakeRunGuard())
+    job = first.select_folder("pick-queued")
+    assert job is not None
+    assert store.get_job(job.job_id).status is WorkspaceJobStatus.QUEUED
+
+    restarted = _service(tmp_path, store, FakePicker([]), FakeRunGuard())
+    restarted.start()
+    try:
+        _wait_for_job(store, job.job_id)
+        assert [
+            event.event_type for event in store.list_job_events(job.job_id)
+        ].count("approval_required") == 1
+    finally:
+        restarted.shutdown()
+
+
+def test_initial_creation_idempotency_survives_service_restart(
+    tmp_path: Path, store: WorkspaceStore
+):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    (first_root / "notes.txt").write_text("first", encoding="utf-8")
+    (second_root / "notes.txt").write_text("second", encoding="utf-8")
+    first = _service(tmp_path, store, FakePicker([first_root]), FakeRunGuard())
+    original = first.select_folder("durable-create")
+    assert original is not None
+    second_picker = FakePicker([second_root])
+    restarted = _service(tmp_path, store, second_picker, FakeRunGuard())
+
+    duplicate = restarted.select_folder("durable-create")
+
+    assert duplicate == original
+    assert second_picker.selections == [second_root]
+    assert len(store.list_workspaces()) == 1
+
+
+def test_scan_commit_uses_the_identity_returned_by_the_scan_open(
+    tmp_path: Path, store: WorkspaceStore
+):
+    class MismatchingScanner(WorkspaceScanner):
+        def scan_with_identity(self, *args, **kwargs):
+            execution = super().scan_with_identity(*args, **kwargs)
+            return replace(execution, root_file_id=f"{execution.root_file_id}-replacement")
+
+    native_root = tmp_path / "native"
+    native_root.mkdir()
+    (native_root / "notes.txt").write_text("notes", encoding="utf-8")
+    service = _service(
+        tmp_path,
+        store,
+        FakePicker([native_root]),
+        FakeRunGuard(),
+        scanner=MismatchingScanner(),
+    )
+    service.start()
+    try:
+        job = service.select_folder("pick-identity")
+        assert job is not None
+        _wait_for_job(store, job.job_id, WorkspaceJobStatus.FAILED)
+        assert store.get_job(job.job_id).safe_error_code == "source_root_identity_changed"
+        assert store.get_workspace(job.workspace_id).state is WorkspaceState.NEEDS_ATTENTION
+        assert store.get_manifest_entries(job.workspace_id) == ()
+    finally:
+        service.shutdown()
+
+
 def test_partial_browser_cleanup_is_retried_on_start(
     tmp_path: Path, store: WorkspaceStore
 ):
     guard = FakeRunGuard()
     failed_once = False
 
-    def fail_once(path: Path) -> None:
+    secure_remove = _secure_test_remover(store.database_path.parent)
+
+    def fail_once(claim: OwnedTreeClaim) -> None:
         nonlocal failed_once
         if not failed_once:
             failed_once = True
             raise OSError("locked")
-        shutil.rmtree(path)
+        secure_remove(claim)
 
     first = _service(
         tmp_path,
@@ -278,7 +375,13 @@ def test_partial_browser_cleanup_is_retried_on_start(
     finally:
         first.shutdown()
 
-    restarted = _service(tmp_path, store, FakePicker([]), guard)
+    restarted = _service(
+        tmp_path,
+        store,
+        FakePicker([]),
+        guard,
+        remove_owned_tree=fail_once,
+    )
     restarted.start()
     try:
         assert store.get_workspace(job.workspace_id) is None
@@ -287,7 +390,7 @@ def test_partial_browser_cleanup_is_retried_on_start(
         restarted.shutdown()
 
 
-def test_browser_snapshot_orphan_is_durably_cleaned_after_validation_failure(
+def test_unproven_browser_snapshot_orphan_remains_visible_and_is_never_deleted(
     tmp_path: Path, store: WorkspaceStore
 ):
     class RejectSnapshotRoot(WorkspaceScanner):
@@ -315,10 +418,312 @@ def test_browser_snapshot_orphan_is_durably_cleaned_after_validation_failure(
     restarted = _service(tmp_path, store, FakePicker([]), FakeRunGuard())
     restarted.start()
     try:
-        assert not owned_path.exists()
-        assert store.list_cleanup() == ()
+        assert owned_path.exists()
+        [pending] = store.list_cleanup()
+        assert pending.cleanup_id == cleanup.cleanup_id
+        assert pending.deletion_root_device is None
+        assert pending.deletion_root_file_id is None
+        assert pending.attempt_count == 1
     finally:
         restarted.shutdown()
+
+
+def test_cleanup_without_a_proven_identity_never_calls_the_tree_remover(
+    tmp_path: Path, store: WorkspaceStore
+):
+    owned_path = tmp_path / "workspaces" / "orphan-workspace"
+    owned_path.mkdir(parents=True)
+    (owned_path / "marker.txt").write_text("keep", encoding="utf-8")
+    store.queue_cleanup(
+        "orphan-workspace",
+        owned_path,
+        "cleanup_pending",
+    )
+    removed: list[Path] = []
+    service = _service(
+        tmp_path,
+        store,
+        FakePicker([]),
+        FakeRunGuard(),
+        remove_owned_tree=lambda claim: removed.append(
+            store.database_path.parent / Path(claim.relative_path)
+        ),
+    )
+
+    service.start()
+    try:
+        assert removed == []
+        assert owned_path.exists()
+        [record] = store.list_cleanup()
+        assert record.attempt_count == 1
+    finally:
+        service.shutdown()
+
+
+def test_start_discovers_task4_browser_orphans_but_does_not_delete_them(
+    tmp_path: Path, store: WorkspaceStore
+):
+    orphan = (
+        tmp_path
+        / "workspaces"
+        / "browser-workspace"
+        / ".examsage-browser-orphan-0123456789abcdef"
+    )
+    orphan.mkdir(parents=True)
+    (orphan / "marker.txt").write_text("unproven", encoding="utf-8")
+    service = _service(tmp_path, store, FakePicker([]), FakeRunGuard())
+
+    service.start()
+    try:
+        assert orphan.exists()
+        [record] = store.list_cleanup()
+        assert record.workspace_id == "browser-workspace"
+        assert record.owned_relative_path.endswith(orphan.name)
+        assert record.deletion_root_device is None
+        assert record.deletion_root_file_id is None
+    finally:
+        service.shutdown()
+
+
+def test_browser_deletion_refuses_a_replaced_parent_even_when_intake_is_original(
+    tmp_path: Path, store: WorkspaceStore
+):
+    removed: list[Path] = []
+    service = _service(
+        tmp_path,
+        store,
+        FakePicker([]),
+        FakeRunGuard(),
+        remove_owned_tree=_secure_test_remover(
+            store.database_path.parent,
+            removed,
+        ),
+    )
+    service.start()
+    try:
+        job = service.create_browser_snapshot(
+            "Browser",
+            [BrowserUpload("notes.txt", 5, io.BytesIO(b"notes"))],
+            "upload-parent-identity",
+        )
+        _wait_for_job(store, job.job_id)
+        workspace = store.get_workspace(job.workspace_id)
+        assert workspace is not None
+        original_parent = workspace.canonical_root.parent
+        moved_parent = tmp_path / "moved-original-parent"
+        original_parent.rename(moved_parent)
+        original_parent.mkdir()
+        (moved_parent / "browser-intake").rename(
+            original_parent / "browser-intake"
+        )
+        (original_parent / "replacement-marker.txt").write_text(
+            "replacement",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(WorkspaceOperationError) as caught:
+            service.delete_workspace(job.workspace_id)
+
+        assert caught.value.code == "cleanup_pending"
+        assert removed == []
+        assert (original_parent / "replacement-marker.txt").exists()
+        assert store.get_workspace(job.workspace_id).state is WorkspaceState.CLEANUP_PENDING
+    finally:
+        service.shutdown()
+
+
+def test_stale_approval_is_rejected_before_filesystem_revalidation(
+    tmp_path: Path, store: WorkspaceStore
+):
+    class CountingScanner(WorkspaceScanner):
+        def __init__(self):
+            super().__init__()
+            self.revalidations = 0
+
+        def revalidate_entries(self, root, entries=()):
+            self.revalidations += 1
+            return super().revalidate_entries(root, entries)
+
+    native_root = tmp_path / "native"
+    native_root.mkdir()
+    (native_root / "notes.txt").write_text("notes", encoding="utf-8")
+    scanner = CountingScanner()
+    service = _service(
+        tmp_path,
+        store,
+        FakePicker([native_root]),
+        FakeRunGuard(),
+        scanner=scanner,
+    )
+    service.start()
+    try:
+        job = service.select_folder("pick-stale")
+        assert job is not None
+        _wait_for_job(store, job.job_id)
+        original = store.get_manifest(job.workspace_id)
+        [entry] = original.entries
+        service.set_inclusion(
+            job.workspace_id,
+            original.revision_id,
+            entry.entry_id,
+            True,
+        )
+        before = scanner.revalidations
+
+        with pytest.raises(StaleManifestError):
+            service.approve(job.workspace_id, original.revision_id)
+
+        assert scanner.revalidations == before
+    finally:
+        service.shutdown()
+
+
+def test_approval_mismatch_never_marks_a_newer_revision(
+    tmp_path: Path, store: WorkspaceStore
+):
+    native_root = tmp_path / "native"
+    native_root.mkdir()
+    source = native_root / "notes.txt"
+    source.write_text("before", encoding="utf-8")
+
+    class RacingScanner(WorkspaceScanner):
+        raced_revision = None
+
+        def revalidate_entries(self, root, entries=()):
+            if entries and self.raced_revision is None:
+                current = store.get_workspace(entries[0].workspace_id)
+                assert current is not None
+                self.raced_revision = store.set_inclusion(
+                    entries[0].workspace_id,
+                    current.current_draft_revision_id,
+                    (entries[0].entry_id,),
+                    True,
+                )
+            return super().revalidate_entries(root, entries)
+
+    scanner = RacingScanner()
+    service = _service(
+        tmp_path,
+        store,
+        FakePicker([native_root]),
+        FakeRunGuard(),
+        scanner=scanner,
+    )
+    service.start()
+    try:
+        job = service.select_folder("pick-race")
+        assert job is not None
+        _wait_for_job(store, job.job_id)
+        revision = store.get_manifest(job.workspace_id)
+        source.write_text("after", encoding="utf-8")
+
+        with pytest.raises(StaleManifestError):
+            service.approve(job.workspace_id, revision.revision_id)
+
+        assert scanner.raced_revision is not None
+        current = store.get_manifest(job.workspace_id)
+        assert current.revision_id == scanner.raced_revision.revision_id
+        assert current.entries[0].state is SourceState.PENDING_APPROVAL
+        assert store.get_workspace(job.workspace_id).state is WorkspaceState.APPROVAL_REQUIRED
+    finally:
+        service.shutdown()
+
+
+def test_root_failure_marks_every_selected_entry_changed(
+    tmp_path: Path, store: WorkspaceStore
+):
+    native_root = tmp_path / "native"
+    native_root.mkdir()
+    (native_root / "a.txt").write_text("a", encoding="utf-8")
+    (native_root / "b.txt").write_text("b", encoding="utf-8")
+    service = _service(tmp_path, store, FakePicker([native_root]), FakeRunGuard())
+    service.start()
+    try:
+        job = service.select_folder("pick-root-failure")
+        assert job is not None
+        _wait_for_job(store, job.job_id)
+        revision = store.get_manifest(job.workspace_id)
+        native_root.rename(tmp_path / "revoked")
+
+        with pytest.raises(StaleManifestError):
+            service.approve(job.workspace_id, revision.revision_id)
+
+        changed = store.get_manifest(job.workspace_id)
+        assert {entry.state for entry in changed.entries} == {SourceState.CHANGED}
+    finally:
+        service.shutdown()
+
+
+def test_empty_selection_root_failure_still_moves_workspace_to_attention(
+    tmp_path: Path, store: WorkspaceStore
+):
+    native_root = tmp_path / "empty"
+    native_root.mkdir()
+    service = _service(tmp_path, store, FakePicker([native_root]), FakeRunGuard())
+    service.start()
+    try:
+        job = service.select_folder("pick-empty")
+        assert job is not None
+        _wait_for_job(store, job.job_id)
+        revision = store.get_manifest(job.workspace_id)
+        native_root.rename(tmp_path / "revoked-empty")
+
+        with pytest.raises(StaleManifestError):
+            service.approve(job.workspace_id, revision.revision_id)
+
+        workspace = store.get_workspace(job.workspace_id)
+        assert workspace is not None
+        assert workspace.state is WorkspaceState.NEEDS_ATTENTION
+        assert workspace.current_draft_revision_id != revision.revision_id
+    finally:
+        service.shutdown()
+
+
+def test_public_store_errors_are_mapped_to_safe_operation_codes(
+    tmp_path: Path, store: WorkspaceStore
+):
+    service = _service(tmp_path, store, FakePicker([]), FakeRunGuard())
+
+    with pytest.raises(WorkspaceOperationError) as caught:
+        service.rescan("missing-workspace", "missing-rescan")
+
+    assert caught.value.code == "workspace_not_found"
+
+
+def test_shutdown_timeout_keeps_an_owned_store_open_until_worker_exits(tmp_path: Path):
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingScanner(WorkspaceScanner):
+        def scan_with_identity(self, *args, **kwargs):
+            started.set()
+            assert release.wait(5)
+            return super().scan_with_identity(*args, **kwargs)
+
+    native_root = tmp_path / "native"
+    native_root.mkdir()
+    (native_root / "notes.txt").write_text("notes", encoding="utf-8")
+    owned_store = WorkspaceStore(tmp_path / "owned.sqlite3")
+    service = WorkspaceService(
+        store=owned_store,
+        scanner=BlockingScanner(),
+        picker=FakePicker([native_root]),
+        browser_intake=BrowserIntakeWriter(tmp_path / "workspaces"),
+        run_guard=FakeRunGuard(),
+        close_store_on_shutdown=True,
+    )
+    service.start()
+    job = service.select_folder("pick-blocked")
+    assert job is not None
+    assert started.wait(5)
+
+    service.shutdown(timeout_seconds=0.01)
+
+    assert owned_store.get_workspace(job.workspace_id) is not None
+    release.set()
+    _wait_for_job(owned_store, job.job_id)
+    service.shutdown()
+    assert owned_store._closed is True
 
 
 @pytest.mark.parametrize("run_state", ["queued", "running", "stopping", "paused"])
@@ -398,6 +803,7 @@ def test_browser_approval_and_delete_all_remove_only_verified_owned_snapshots(
         store,
         FakePicker([native_a, native_b]),
         guard,
+        remove_owned_tree=_secure_test_remover(store.database_path.parent),
     )
     service.start()
     try:

@@ -77,6 +77,14 @@ class RevalidationResult:
     entries: tuple[RevalidatedEntry, ...]
 
 
+@dataclass(frozen=True)
+class ScanExecution:
+    result: ScanResult
+    canonical_root: Path
+    root_device: str
+    root_file_id: str
+
+
 def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
 
@@ -158,14 +166,37 @@ class WorkspaceScanner:
         previous_entries: Sequence[ManifestEntry] = (),
         emit: Callable[[ScanProgress], None] | None = None,
     ) -> ScanResult:
+        return self.scan_with_identity(
+            workspace_id,
+            root,
+            previous_entries=previous_entries,
+            emit=emit,
+        ).result
+
+    def scan_with_identity(
+        self,
+        workspace_id: str,
+        root: Path,
+        *,
+        previous_entries: Sequence[ManifestEntry] = (),
+        emit: Callable[[ScanProgress], None] | None = None,
+    ) -> ScanExecution:
         with self._directory_opener.anchor_root(root) as root_anchor:
             canonical_root = self._canonical_root(root, root_anchor)
-            return self._scan_anchored(
+            if root_anchor.identity is None:
+                raise SecureOpenError("source_root_identity_unavailable")
+            result = self._scan_anchored(
                 workspace_id,
                 canonical_root,
                 root_anchor,
                 previous_entries=previous_entries,
                 emit=emit,
+            )
+            return ScanExecution(
+                result=result,
+                canonical_root=canonical_root,
+                root_device=str(root_anchor.identity[0]),
+                root_file_id=str(root_anchor.identity[1]),
             )
 
     def revalidate_entries(
@@ -178,7 +209,8 @@ class WorkspaceScanner:
             raise ValueError("revalidation_file_count_limit")
         with self._directory_opener.anchor_root(root) as root_anchor:
             canonical_root = self._canonical_root(root, root_anchor)
-            root_stat = canonical_root.stat(follow_symlinks=False)
+            if root_anchor.identity is None:
+                raise SecureOpenError("source_root_identity_unavailable")
             aggregate_size = 0
             validated: list[RevalidatedEntry] = []
             for entry in entries:
@@ -221,8 +253,8 @@ class WorkspaceScanner:
                 )
             return RevalidationResult(
                 canonical_root=canonical_root,
-                root_device=str(root_stat.st_dev),
-                root_file_id=str(root_stat.st_ino),
+                root_device=str(root_anchor.identity[0]),
+                root_file_id=str(root_anchor.identity[1]),
                 entries=tuple(validated),
             )
 
@@ -249,6 +281,19 @@ class WorkspaceScanner:
         failure_count = 0
         selected_bytes = 0
         file_count = 0
+        emitted_progress = 0
+
+        def bounded_emit(
+            discovered: int,
+            hashed: int,
+            failures: int,
+            relative_path: str,
+        ) -> None:
+            nonlocal emitted_progress
+            if emit is None or emitted_progress >= self._policy.max_files:
+                return
+            self._emit(emit, discovered, hashed, failures, relative_path)
+            emitted_progress += 1
 
         for candidate in candidates:
             if candidate.item_kind != "folder":
@@ -269,8 +314,7 @@ class WorkspaceScanner:
             discovered_count += 1
             if entry.state is SourceState.FAILED:
                 failure_count += 1
-            self._emit(
-                emit,
+            bounded_emit(
                 discovered_count,
                 bytes_hashed,
                 failure_count,
@@ -289,8 +333,7 @@ class WorkspaceScanner:
                 discovered_count += 1
                 if member_entry.state is SourceState.FAILED:
                     failure_count += 1
-                self._emit(
-                    emit,
+                bounded_emit(
                     discovered_count,
                     bytes_hashed,
                     failure_count,
@@ -345,7 +388,7 @@ class WorkspaceScanner:
             raise
         except OSError:
             raise SecureOpenError("source_root_invalid") from None
-        if root_anchor.identity is not None:
+        if root_anchor.identity is not None and root_anchor.platform == "posix":
             if root_anchor.identity != (root_stat.st_dev, root_stat.st_ino):
                 raise SecureOpenError(SOURCE_LINK_OR_REPARSE)
         elif os.path.normcase(os.path.abspath(canonical_root)) != os.path.normcase(
@@ -356,12 +399,17 @@ class WorkspaceScanner:
 
     def _enumerate(self, root: Path, root_anchor: RootAnchor) -> list[_Candidate]:
         candidates: list[_Candidate] = []
+        processed_candidates = 0
+        limit_reached = False
 
         def walk(
             directory: Path,
             parent_parts: tuple[str, ...],
             directory_fd: int | None,
         ) -> None:
+            nonlocal processed_candidates, limit_reached
+            if limit_reached:
+                return
             scan_target = directory if directory_fd is None else directory_fd
             with os.scandir(scan_target) as iterator:
                 directory_entries = sorted(
@@ -369,9 +417,24 @@ class WorkspaceScanner:
                     key=lambda item: (item.name.casefold(), item.name),
                 )
             for directory_entry in directory_entries:
+                if limit_reached:
+                    return
                 parts = (*parent_parts, directory_entry.name)
                 relative_path = PurePosixPath(*parts).as_posix()
                 path = directory / directory_entry.name
+                if processed_candidates >= self._policy.max_files:
+                    candidates.append(
+                        _Candidate(
+                            path,
+                            relative_path,
+                            "file",
+                            None,
+                            SOURCE_FILE_COUNT_LIMIT,
+                        )
+                    )
+                    limit_reached = True
+                    return
+                processed_candidates += 1
                 try:
                     metadata = directory_entry.stat(follow_symlinks=False)
                 except OSError:

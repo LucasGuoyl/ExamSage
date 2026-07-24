@@ -6,7 +6,14 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 from unicodedata import category
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 
 class SourceMode(StrEnum):
@@ -210,8 +217,18 @@ class CleanupRecord(FrozenModel):
     owned_relative_path: str
     safe_error_code: str
     attempt_count: int = Field(ge=0)
+    deletion_root_device: str | None = Field(default=None, max_length=128)
+    deletion_root_file_id: str | None = Field(default=None, max_length=128)
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def validate_deletion_root_identity(self) -> CleanupRecord:
+        if (self.deletion_root_device is None) != (
+            self.deletion_root_file_id is None
+        ):
+            raise ValueError("deletion root identity must be complete")
+        return self
 
 
 class ApprovedSource(FrozenModel):

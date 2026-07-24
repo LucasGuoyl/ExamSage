@@ -170,6 +170,10 @@ class FakeWindowsAdapter:
         self.events.append(f"final:{handle}")
         return self.final_paths[handle]
 
+    def get_file_identity(self, handle: int) -> tuple[int, int]:
+        self.events.append(f"identity:{handle}")
+        return 77, 1_000 + handle
+
     def open_binary(self, handle: int):
         self.events.append(f"wrap:{handle}")
         return _ClosingBytesIO(self.contents, self, handle)
@@ -180,6 +184,17 @@ class FakeWindowsAdapter:
 
 def _windows_opener(adapter: FakeWindowsAdapter) -> SecureFileOpener:
     return SecureFileOpener(platform="windows", windows_adapter=adapter)
+
+
+def test_windows_root_anchor_identity_comes_from_the_held_verified_handle():
+    adapter = FakeWindowsAdapter()
+
+    with _windows_opener(adapter).anchor_root(Path("C:/course")) as anchor:
+        assert anchor.identity == (77, 1_010)
+        assert adapter.closed == []
+
+    assert adapter.closed == [10]
+    assert "identity:10" in adapter.events
 
 
 def test_windows_secure_opener_uses_reparse_point_flags_and_checks_before_wrapping():

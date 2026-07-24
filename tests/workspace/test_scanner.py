@@ -114,14 +114,47 @@ def test_revalidate_entries_reuses_bounded_secure_hashing_and_root_identity(tmp_
 
     validation = scanner.revalidate_entries(root, selected)
 
-    root_stat = root.stat(follow_symlinks=False)
+    with scanner._directory_opener.anchor_root(root) as root_anchor:
+        assert root_anchor.identity is not None
+        expected_identity = root_anchor.identity
     assert validation.canonical_root == root.resolve(strict=True)
-    assert validation.root_device == str(root_stat.st_dev)
-    assert validation.root_file_id == str(root_stat.st_ino)
+    assert validation.root_device == str(expected_identity[0])
+    assert validation.root_file_id == str(expected_identity[1])
     assert len(validation.entries) == 1
     assert validation.entries[0].entry_id == selected[0].entry_id
     assert validation.entries[0].sha256 == hashlib.sha256(b"revision one").hexdigest()
     assert validation.entries[0].failure_code is None
+
+
+def test_scan_with_identity_returns_the_identity_from_the_scan_root_open(tmp_path):
+    (tmp_path / "notes.txt").write_text("notes", encoding="utf-8")
+
+    execution = WorkspaceScanner().scan_with_identity("workspace-1", tmp_path)
+
+    with WorkspaceScanner()._directory_opener.anchor_root(tmp_path) as root_anchor:
+        assert root_anchor.identity is not None
+        expected_identity = root_anchor.identity
+    assert execution.result.workspace_id == "workspace-1"
+    assert execution.canonical_root == tmp_path.resolve(strict=True)
+    assert execution.root_device == str(expected_identity[0])
+    assert execution.root_file_id == str(expected_identity[1])
+
+
+def test_scanner_bounds_candidates_and_progress_events_by_policy(tmp_path):
+    for index in range(20):
+        (tmp_path / f"{index:02}.txt").write_text(str(index), encoding="utf-8")
+    policy = DEFAULT_SCAN_POLICY.model_copy(update={"max_files": 3})
+    progress = []
+
+    result = WorkspaceScanner(policy).scan(
+        "workspace-1",
+        tmp_path,
+        emit=progress.append,
+    )
+
+    assert len(result.entries) <= policy.max_files + 1
+    assert len(progress) <= policy.max_files
+    assert result.entries[-1].failure_code == "source_file_count_limit"
 
 
 def test_scanner_hashes_supported_files_with_stable_sha256_and_progress(tmp_path):
@@ -301,7 +334,12 @@ def test_scanner_anchors_each_directory_during_enumeration(tmp_path):
         @contextmanager
         def anchor_root(self, root):
             platform = "windows" if os.name == "nt" else "posix"
-            yield RootAnchor(canonical_root=root.resolve(), platform=platform)
+            root_stat = root.resolve().stat(follow_symlinks=False)
+            yield RootAnchor(
+                canonical_root=root.resolve(),
+                platform=platform,
+                identity=(root_stat.st_dev, root_stat.st_ino),
+            )
 
         @contextmanager
         def anchor_directory(self, canonical_root, relative_path=None):

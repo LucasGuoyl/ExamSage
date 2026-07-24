@@ -40,6 +40,8 @@ class _WindowsAdapter(Protocol):
 
     def get_file_type(self, handle: int) -> int: ...
 
+    def get_file_identity(self, handle: int) -> tuple[int, int]: ...
+
     def get_final_path(self, handle: int) -> str: ...
 
     def open_binary(self, handle: int) -> BinaryIO: ...
@@ -169,6 +171,17 @@ class _NativeWindowsAdapter:
 
     def get_file_type(self, handle: int) -> int:
         return int(self._kernel32.GetFileType(handle))
+
+    def get_file_identity(self, handle: int) -> tuple[int, int]:
+        information = self._file_information_type()
+        if not self._kernel32.GetFileInformationByHandle(
+            handle, self._ctypes.byref(information)
+        ):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        file_index = (int(information.nFileIndexHigh) << 32) | int(
+            information.nFileIndexLow
+        )
+        return int(information.dwVolumeSerialNumber), file_index
 
     def get_final_path(self, handle: int) -> str:
         required = self._kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0)
@@ -501,7 +514,11 @@ class SecureFileOpener:
             canonical_root = Path(
                 _normalize_windows_final_path(adapter.get_final_path(root_handle))
             )
-            yield RootAnchor(canonical_root=canonical_root, platform="windows")
+            yield RootAnchor(
+                canonical_root=canonical_root,
+                platform="windows",
+                identity=adapter.get_file_identity(root_handle),
+            )
         except SecureOpenError:
             raise
         except OSError:
