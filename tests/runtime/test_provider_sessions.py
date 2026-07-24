@@ -94,3 +94,90 @@ def test_empty_api_key_is_rejected_before_provider_factory(api_key: str):
         ))
 
     assert seen == []
+
+
+def test_restore_uses_the_same_secret_safe_factory_path_and_lists_descriptors():
+    seen: list[dict] = []
+
+    def factory(config: dict):
+        seen.append(config)
+        return FakeProvider()
+
+    registry = ProviderSessionRegistry(factory=factory)
+    profile = ProviderProfile(profile_id="restored", provider="gemini")
+
+    descriptor = registry.restore(profile, "restored-secret")
+
+    assert seen == [{"provider": "gemini", "api_key": "restored-secret"}]
+    assert registry.list_profiles() == [descriptor]
+    assert "restored-secret" not in repr(registry.list_profiles())
+    registry.disconnect("restored")
+    registry.disconnect("restored")
+    assert registry.list_profiles() == []
+    assert registry.has_provider("restored") is False
+
+
+def test_restore_failure_discards_the_provider_exception_chain():
+    sentinel = "restored-secret"
+
+    def failing_factory(config: dict):
+        raise RuntimeError(f"rejected {config['api_key']}")
+
+    registry = ProviderSessionRegistry(factory=failing_factory)
+    with pytest.raises(RuntimeError) as captured:
+        registry.restore(
+            ProviderProfile(profile_id="restored", provider="gemini"),
+            sentinel,
+        )
+
+    assert sentinel not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert registry.list_profiles() == []
+
+
+def test_provider_capability_error_is_bounded_and_cause_free():
+    sentinel = "secret-provider-path-C:/private/course"
+
+    class FailingProvider:
+        @property
+        def capabilities(self):
+            raise RuntimeError(sentinel)
+
+    registry = ProviderSessionRegistry(factory=lambda config: FailingProvider())
+    with pytest.raises(RuntimeError, match="Provider connection failed") as captured:
+        registry.restore(
+            ProviderProfile(profile_id="restored", provider="gemini"),
+            "provider-key",
+        )
+
+    assert sentinel not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://models.example/v1",
+        "https://127.0.0.1/v1",
+        "https://user:password@models.example/v1",
+        "https://models.example/v1?api_key=query-secret",
+    ],
+)
+def test_custom_provider_profiles_reject_unsafe_base_urls(base_url: str):
+    with pytest.raises(ValueError):
+        ProviderProfile(
+            profile_id="custom",
+            provider="custom",
+            base_url=base_url,
+        )
+
+
+@pytest.mark.parametrize(
+    "profile_id",
+    ["profile/name", "profile id", "provider:primary", "a" * 65],
+)
+def test_provider_profile_rejects_ids_that_cannot_be_vault_accounts(profile_id: str):
+    with pytest.raises(ValueError, match="provider profile ID"):
+        ProviderProfile(profile_id=profile_id, provider="gemini")

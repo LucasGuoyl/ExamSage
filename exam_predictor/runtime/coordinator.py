@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,12 +14,14 @@ from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
 
 from .control import RunControlRegistry
+from .credential_vault import CredentialVault, VaultUnavailableError
 from .models import (
     ConnectProviderRequest,
     EventType,
     ProviderDescriptor,
     RunSnapshot,
     RunStatus,
+    SavedProviderProfile,
 )
 from .provider_sessions import ProviderSessionRegistry
 from .store import RuntimeStore
@@ -29,6 +32,11 @@ class ProviderProfileInUseError(RuntimeError):
 
 
 class RuntimeCoordinator:
+    CREDENTIAL_WARNING = (
+        "Provider connected, but the credential could not be saved securely. "
+        "Reconnect after restart."
+    )
+
     def __init__(
         self,
         *,
@@ -36,11 +44,13 @@ class RuntimeCoordinator:
         provider_sessions: ProviderSessionRegistry,
         checkpoints_path: str | Path,
         graph_factory: Callable[..., Any] = build_kernel_graph,
+        vault: CredentialVault | None = None,
     ):
         self.store = store
         self.provider_sessions = provider_sessions
         self.checkpoints_path = Path(checkpoints_path)
         self.graph_factory = graph_factory
+        self.vault = vault
         self.controls = RunControlRegistry()
         self._commands: queue.Queue[tuple[str, str] | None] = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -64,6 +74,7 @@ class RuntimeCoordinator:
             if self._shutdown_requested:
                 raise RuntimeError("A shut down RuntimeCoordinator cannot be restarted.")
             self.store.recover_unfinished()
+            self._restore_saved_profiles()
             self.checkpoints_path.parent.mkdir(parents=True, exist_ok=True)
             self._thread = threading.Thread(
                 target=self._loop,
@@ -112,14 +123,85 @@ class RuntimeCoordinator:
         profile_id = request.profile.profile_id
         with self._lock:
             if self.provider_sessions.has_provider(profile_id):
-                active = self.store.list_by_status(
-                    {RunStatus.RUNNING, RunStatus.STOPPING}
+                self._ensure_profile_replaceable(profile_id)
+            descriptor = self.provider_sessions.connect(request)
+            credential_saved = False
+            if self.vault is not None:
+                save_failed = False
+                try:
+                    self.vault.save(profile_id, request.api_key.get_secret_value())
+                except Exception:
+                    save_failed = True
+                credential_saved = not save_failed
+            warning = None if credential_saved else self.CREDENTIAL_WARNING
+            descriptor = descriptor.model_copy(
+                update={
+                    "credential_saved": credential_saved,
+                    "credential_warning": warning,
+                }
+            )
+            self.store.save_provider_profile(
+                SavedProviderProfile(
+                    profile=descriptor.profile,
+                    capabilities=descriptor.capabilities,
+                    credential_expected=credential_saved,
+                    reconnect_required=not credential_saved,
+                    updated_at=datetime.now(timezone.utc),
                 )
-                if any(run.provider_profile_id == profile_id for run in active):
-                    raise ProviderProfileInUseError(
-                        "Provider profile is currently in use by an active run."
+            )
+            return descriptor
+
+    def forget_provider_credential(self, profile_id: str) -> None:
+        with self._lock:
+            self._ensure_profile_replaceable(profile_id)
+            if self.vault is not None:
+                delete_failed = False
+                try:
+                    self.vault.delete(profile_id)
+                except Exception:
+                    delete_failed = True
+                if delete_failed:
+                    raise VaultUnavailableError(
+                        "Secure credential storage is unavailable"
                     )
-            return self.provider_sessions.connect(request)
+            self.provider_sessions.disconnect(profile_id)
+            self.store.mark_provider_reconnect_required(profile_id)
+
+    def _ensure_profile_replaceable(self, profile_id: str) -> None:
+        active = self.store.list_by_status(
+            {RunStatus.RUNNING, RunStatus.STOPPING}
+        )
+        if any(run.provider_profile_id == profile_id for run in active):
+            raise ProviderProfileInUseError(
+                "Provider profile is currently in use by an active run."
+            )
+
+    def _restore_saved_profiles(self) -> None:
+        for saved in self.store.list_saved_provider_profiles():
+            profile_id = saved.profile.profile_id
+            if (
+                saved.reconnect_required
+                or not saved.credential_expected
+                or self.provider_sessions.has_provider(profile_id)
+            ):
+                continue
+            api_key: str | None = None
+            load_failed = self.vault is None
+            if self.vault is not None:
+                try:
+                    api_key = self.vault.load(profile_id)
+                except Exception:
+                    load_failed = True
+            if load_failed or api_key is None:
+                self.store.mark_provider_reconnect_required(profile_id)
+                continue
+            restore_failed = False
+            try:
+                self.provider_sessions.restore(saved.profile, api_key)
+            except Exception:
+                restore_failed = True
+            if restore_failed:
+                self.store.mark_provider_reconnect_required(profile_id)
 
     def stop(self, run_id: str) -> RunSnapshot:
         with self._lock:

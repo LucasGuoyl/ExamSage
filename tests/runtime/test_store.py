@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import threading
@@ -7,7 +7,12 @@ import threading
 import pytest
 
 import exam_predictor.runtime.store as store_module
-from exam_predictor.runtime.models import EventType, RunStatus
+from exam_predictor.runtime.models import (
+    EventType,
+    ProviderProfile,
+    RunStatus,
+    SavedProviderProfile,
+)
 from exam_predictor.runtime.store import RuntimeStore
 
 
@@ -68,9 +73,98 @@ def test_every_store_operation_explicitly_closes_its_sqlite_connection(
         "complete",
         "Done",
     )
+    store.save_provider_profile(saved_provider_profile())
+    store.list_saved_provider_profiles()
+    store.mark_provider_reconnect_required("primary")
 
     assert connections
     assert all(connection.was_closed for connection in connections)
+
+
+def saved_provider_profile(
+    *,
+    credential_expected: bool = True,
+    reconnect_required: bool = False,
+) -> SavedProviderProfile:
+    return SavedProviderProfile(
+        profile=ProviderProfile(
+            profile_id="primary",
+            provider="custom",
+            base_url="https://models.example/v1",
+            balanced_model="course-model",
+        ),
+        capabilities={"chat": True, "web_search": False},
+        credential_expected=credential_expected,
+        reconnect_required=reconnect_required,
+        updated_at=datetime(2026, 7, 24, 12, tzinfo=timezone.utc),
+    )
+
+
+def test_saved_provider_profile_round_trips_without_credential_material(tmp_path: Path):
+    path = tmp_path / "runtime.sqlite3"
+    sentinel = "vault-secret-not-for-sqlite"
+    store = RuntimeStore(path)
+
+    store.save_provider_profile(saved_provider_profile())
+
+    assert store.list_saved_provider_profiles() == [saved_provider_profile()]
+    serialized = path.read_bytes().decode("latin1")
+    assert "course-model" in serialized
+    assert "web_search" in serialized
+    assert sentinel not in serialized
+    assert "api_key" not in serialized
+
+
+def test_saved_provider_profile_upsert_and_reconnect_marker_are_atomic(tmp_path: Path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    store.save_provider_profile(saved_provider_profile())
+    replacement = saved_provider_profile(
+        credential_expected=False,
+        reconnect_required=True,
+    ).model_copy(
+        update={"capabilities": {"chat": False}, "updated_at": datetime(2026, 7, 24, 13, tzinfo=timezone.utc)}
+    )
+
+    store.save_provider_profile(replacement)
+    assert store.list_saved_provider_profiles() == [replacement]
+
+    store.save_provider_profile(saved_provider_profile())
+    store.mark_provider_reconnect_required("primary")
+    marked = store.list_saved_provider_profiles()[0]
+    assert marked.credential_expected is False
+    assert marked.reconnect_required is True
+    assert marked.updated_at > saved_provider_profile().updated_at
+
+
+def test_mark_provider_reconnect_required_rejects_missing_profile(tmp_path: Path):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+
+    with pytest.raises(KeyError, match="Saved provider profile 'missing' was not found"):
+        store.mark_provider_reconnect_required("missing")
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("profile_json", '{"profile_id": "primary", "provider": "unknown"}'),
+        ("capabilities_json", '{"chat": "not-a-boolean"}'),
+    ],
+)
+def test_saved_provider_profile_rows_are_validated_on_read(
+    tmp_path: Path,
+    column: str,
+    value: str,
+):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    store.save_provider_profile(saved_provider_profile())
+    with store._connection() as connection:
+        connection.execute(
+            f"UPDATE saved_provider_profiles SET {column} = ? WHERE profile_id = ?",
+            (value, "primary"),
+        )
+
+    with pytest.raises(ValueError):
+        store.list_saved_provider_profiles()
 
 
 def test_connect_closes_new_connection_when_pragma_setup_fails(

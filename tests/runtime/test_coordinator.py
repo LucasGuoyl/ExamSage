@@ -10,7 +10,11 @@ from langgraph.types import Command
 
 from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
 from exam_predictor.runtime.control import RunControlRegistry
-from exam_predictor.runtime.coordinator import RuntimeCoordinator
+from exam_predictor.runtime.coordinator import (
+    ProviderProfileInUseError,
+    RuntimeCoordinator,
+)
+from exam_predictor.runtime.credential_vault import VaultUnavailableError
 from exam_predictor.runtime.models import (
     ConnectProviderRequest,
     EventType,
@@ -93,6 +97,33 @@ class GraphHarness:
         return FakeGraph()
 
 
+class FakeVault:
+    def __init__(self) -> None:
+        self.secrets: dict[str, str] = {}
+        self.calls: list[tuple[str, str]] = []
+        self.fail_save = False
+        self.fail_load = False
+
+    def save(self, profile_id: str, api_key: str) -> None:
+        self.calls.append(("save", profile_id))
+        if self.fail_save:
+            raise VaultUnavailableError("Secure credential storage is unavailable")
+        self.secrets[profile_id] = api_key
+
+    def load(self, profile_id: str) -> str | None:
+        self.calls.append(("load", profile_id))
+        if self.fail_load:
+            raise VaultUnavailableError("Secure credential storage is unavailable")
+        return self.secrets.get(profile_id)
+
+    def exists(self, profile_id: str) -> bool:
+        return profile_id in self.secrets
+
+    def delete(self, profile_id: str) -> None:
+        self.calls.append(("delete", profile_id))
+        self.secrets.pop(profile_id, None)
+
+
 def registry() -> ProviderSessionRegistry:
     provider = SimpleNamespace(
         name="fake",
@@ -129,6 +160,235 @@ def provider_request(api_key: str) -> ConnectProviderRequest:
         profile=ProviderProfile(profile_id="primary", provider="gemini"),
         api_key=api_key,
     )
+
+
+def credential_sessions() -> ProviderSessionRegistry:
+    return ProviderSessionRegistry(
+        factory=lambda config: SimpleNamespace(
+            identity=config["api_key"],
+            name="fake",
+            capabilities=SimpleNamespace(chat=True, web_search=False),
+        )
+    )
+
+
+def test_connect_validates_then_saves_credential_and_nonsecret_profile(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    sentinel = "vault-secret-for-connect"
+    vault = FakeVault()
+    sessions = credential_sessions()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+
+    descriptor = runtime.connect_provider(provider_request(sentinel))
+
+    assert sessions.get_provider("primary").identity == sentinel
+    assert vault.secrets == {"primary": sentinel}
+    assert descriptor.credential_saved is True
+    assert descriptor.credential_warning is None
+    saved = store.list_saved_provider_profiles()
+    assert len(saved) == 1
+    assert saved[0].credential_expected is True
+    assert saved[0].reconnect_required is False
+    serialized = "\n".join(
+        [
+            (tmp_path / "runtime.sqlite3").read_bytes().decode("latin1"),
+            descriptor.model_dump_json(),
+            repr(store.list_saved_provider_profiles()),
+            repr(vault.calls),
+            caplog.text,
+        ]
+    )
+    assert sentinel not in serialized
+
+
+def test_vault_save_failure_keeps_validated_memory_session_and_safe_metadata(tmp_path: Path):
+    sentinel = "vault-secret-save-outage"
+    vault = FakeVault()
+    vault.fail_save = True
+    sessions = credential_sessions()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+
+    descriptor = runtime.connect_provider(provider_request(sentinel))
+
+    assert sessions.get_provider("primary").identity == sentinel
+    assert descriptor.credential_saved is False
+    assert descriptor.credential_warning == RuntimeCoordinator.CREDENTIAL_WARNING
+    saved = store.list_saved_provider_profiles()[0]
+    assert saved.credential_expected is False
+    assert saved.reconnect_required is True
+    assert sentinel not in descriptor.model_dump_json()
+    assert sentinel not in (tmp_path / "runtime.sqlite3").read_bytes().decode("latin1")
+
+
+def test_start_restores_saved_provider_without_starting_paused_work(tmp_path: Path):
+    vault = FakeVault()
+    first_sessions = credential_sessions()
+    path = tmp_path / "runtime.sqlite3"
+    store = RuntimeStore(path)
+    first = RuntimeCoordinator(
+        store=store,
+        provider_sessions=first_sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    first.connect_provider(provider_request("restored-vault-secret"))
+    paused = store.create_run("course-1", "primary", "Explain", RunStatus.PAUSED)
+
+    restored_sessions = credential_sessions()
+    restored = RuntimeCoordinator(
+        store=RuntimeStore(path),
+        provider_sessions=restored_sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    restored.start()
+    try:
+        assert restored_sessions.get_provider("primary").identity == "restored-vault-secret"
+        assert store.get_run(paused.run_id).status is RunStatus.PAUSED
+    finally:
+        restored.shutdown()
+
+
+@pytest.mark.parametrize("vault_unavailable", [False, True])
+def test_start_marks_reconnect_when_saved_credential_cannot_be_loaded(
+    tmp_path: Path,
+    vault_unavailable: bool,
+):
+    vault = FakeVault()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    first = RuntimeCoordinator(
+        store=store,
+        provider_sessions=credential_sessions(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    first.connect_provider(provider_request("revoked-secret"))
+    vault.secrets.clear()
+    vault.fail_load = vault_unavailable
+
+    restored_sessions = credential_sessions()
+    restored = RuntimeCoordinator(
+        store=RuntimeStore(store.db_path),
+        provider_sessions=restored_sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    restored.start()
+    try:
+        saved = store.list_saved_provider_profiles()[0]
+        assert saved.credential_expected is False
+        assert saved.reconnect_required is True
+        assert restored_sessions.has_provider("primary") is False
+    finally:
+        restored.shutdown()
+
+
+def test_start_marks_reconnect_when_provider_rejects_restored_credential(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    sentinel = "vault-secret-revoked-by-provider"
+    vault = FakeVault()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    first = RuntimeCoordinator(
+        store=store,
+        provider_sessions=credential_sessions(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    first.connect_provider(provider_request(sentinel))
+
+    def rejecting_factory(config):
+        raise RuntimeError(f"rejected {config['api_key']} at C:/private/course")
+
+    restored_sessions = ProviderSessionRegistry(factory=rejecting_factory)
+    restored = RuntimeCoordinator(
+        store=RuntimeStore(store.db_path),
+        provider_sessions=restored_sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    restored.start()
+    try:
+        saved = store.list_saved_provider_profiles()[0]
+        assert saved.credential_expected is False
+        assert saved.reconnect_required is True
+        assert restored_sessions.has_provider("primary") is False
+        serialized = "\n".join(
+            [
+                store.db_path.read_bytes().decode("latin1"),
+                repr(store.list_saved_provider_profiles()),
+                caplog.text,
+            ]
+        )
+        assert sentinel not in serialized
+        assert "C:/private/course" not in serialized
+    finally:
+        restored.shutdown()
+
+
+def test_forget_disconnects_and_deletes_only_the_credential(tmp_path: Path):
+    vault = FakeVault()
+    sessions = credential_sessions()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    runtime.connect_provider(provider_request("forget-secret"))
+    run = store.create_run("course-1", "primary", "Explain", RunStatus.PAUSED)
+    event = store.append_event(run.run_id, EventType.PAUSED, "paused", "Paused")
+
+    runtime.forget_provider_credential("primary")
+
+    assert sessions.has_provider("primary") is False
+    assert vault.secrets == {}
+    assert store.get_run(run.run_id) == run
+    assert store.list_events(run.run_id) == [event]
+    saved = store.list_saved_provider_profiles()[0]
+    assert saved.credential_expected is False
+    assert saved.reconnect_required is True
+
+
+@pytest.mark.parametrize("status", [RunStatus.RUNNING, RunStatus.STOPPING])
+def test_forget_rejects_profiles_used_by_executing_runs_without_mutation(
+    tmp_path: Path,
+    status: RunStatus,
+):
+    vault = FakeVault()
+    sessions = credential_sessions()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    runtime.connect_provider(provider_request("active-secret"))
+    store.create_run("course-1", "primary", "Explain", status)
+
+    with pytest.raises(ProviderProfileInUseError, match="currently in use"):
+        runtime.forget_provider_credential("primary")
+
+    assert sessions.has_provider("primary") is True
+    assert vault.secrets == {"primary": "active-secret"}
+    assert ("delete", "primary") not in vault.calls
 
 
 def test_second_message_queues_until_first_finishes(tmp_path: Path):

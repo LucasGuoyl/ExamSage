@@ -9,7 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import AgentEvent, EventType, RunSnapshot, RunStatus
+from .models import (
+    AgentEvent,
+    EventType,
+    ProviderProfile,
+    RunSnapshot,
+    RunStatus,
+    SavedProviderProfile,
+)
 
 
 class RuntimeStore:
@@ -68,6 +75,14 @@ class RuntimeStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_events_run_sequence
                   ON agent_events(run_id, sequence);
+                CREATE TABLE IF NOT EXISTS saved_provider_profiles (
+                  profile_id TEXT PRIMARY KEY,
+                  profile_json TEXT NOT NULL,
+                  capabilities_json TEXT NOT NULL,
+                  credential_expected INTEGER NOT NULL CHECK(credential_expected IN (0, 1)),
+                  reconnect_required INTEGER NOT NULL CHECK(reconnect_required IN (0, 1)),
+                  updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -80,6 +95,74 @@ class RuntimeStore:
         item = dict(row)
         item["payload"] = json.loads(item.pop("payload_json"))
         return AgentEvent.model_validate(item)
+
+    @staticmethod
+    def _saved_provider_profile(row: sqlite3.Row) -> SavedProviderProfile:
+        profile = ProviderProfile.model_validate_json(row["profile_json"])
+        capabilities = json.loads(row["capabilities_json"])
+        return SavedProviderProfile.model_validate(
+            {
+                "profile": profile,
+                "capabilities": capabilities,
+                "credential_expected": bool(row["credential_expected"]),
+                "reconnect_required": bool(row["reconnect_required"]),
+                "updated_at": row["updated_at"],
+            }
+        )
+
+    def save_provider_profile(self, profile: SavedProviderProfile) -> None:
+        profile_json = profile.profile.model_dump_json()
+        capabilities_json = json.dumps(
+            profile.capabilities,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self._connection() as db:
+            db.execute(
+                """INSERT INTO saved_provider_profiles(
+                       profile_id, profile_json, capabilities_json,
+                       credential_expected, reconnect_required, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(profile_id) DO UPDATE SET
+                       profile_json = excluded.profile_json,
+                       capabilities_json = excluded.capabilities_json,
+                       credential_expected = excluded.credential_expected,
+                       reconnect_required = excluded.reconnect_required,
+                       updated_at = excluded.updated_at""",
+                (
+                    profile.profile.profile_id,
+                    profile_json,
+                    capabilities_json,
+                    int(profile.credential_expected),
+                    int(profile.reconnect_required),
+                    profile.updated_at.isoformat(),
+                ),
+            )
+
+    def list_saved_provider_profiles(self) -> list[SavedProviderProfile]:
+        with self._connection() as db:
+            rows = db.execute(
+                """SELECT profile_json, capabilities_json, credential_expected,
+                          reconnect_required, updated_at
+                   FROM saved_provider_profiles
+                   ORDER BY profile_id ASC"""
+            ).fetchall()
+        return [self._saved_provider_profile(row) for row in rows]
+
+    def mark_provider_reconnect_required(self, profile_id: str) -> None:
+        with self._connection() as db:
+            cursor = db.execute(
+                """UPDATE saved_provider_profiles
+                   SET credential_expected = 0,
+                       reconnect_required = 1,
+                       updated_at = ?
+                   WHERE profile_id = ?""",
+                (self._now(), profile_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Saved provider profile '{profile_id}' was not found.")
 
     def create_run(
         self,

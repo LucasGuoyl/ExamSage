@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from exam_predictor.security import validate_public_https_url
 
 
 class RunStatus(str, Enum):
@@ -45,6 +49,9 @@ def _strip_required(value: str) -> str:
     return cleaned
 
 
+_PROVIDER_PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
 class ProviderProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -59,7 +66,18 @@ class ProviderProfile(BaseModel):
     @field_validator("profile_id")
     @classmethod
     def validate_profile_id(cls, value: str) -> str:
-        return _strip_required(value)
+        cleaned = _strip_required(value)
+        if _PROVIDER_PROFILE_ID.fullmatch(cleaned) is None:
+            raise ValueError("Invalid provider profile ID.")
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_custom_base_url(self) -> ProviderProfile:
+        if self.provider == "custom" and self.base_url is not None:
+            self.base_url = validate_public_https_url(self.base_url)
+            if urlsplit(self.base_url).query:
+                raise ValueError("Custom provider base URLs cannot contain query parameters.")
+        return self
 
     def provider_config(self) -> dict[str, str]:
         values = self.model_dump(exclude={"profile_id"}, exclude_none=True)
@@ -74,6 +92,16 @@ class ConnectProviderRequest(BaseModel):
 class ProviderDescriptor(BaseModel):
     profile: ProviderProfile
     capabilities: dict[str, bool]
+    credential_saved: bool = False
+    credential_warning: str | None = None
+
+
+class SavedProviderProfile(BaseModel):
+    profile: ProviderProfile
+    capabilities: dict[str, bool]
+    credential_expected: bool
+    reconnect_required: bool
+    updated_at: datetime
 
 
 class SubmitMessageRequest(BaseModel):
