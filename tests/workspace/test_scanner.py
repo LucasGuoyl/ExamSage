@@ -126,6 +126,68 @@ def test_revalidate_entries_reuses_bounded_secure_hashing_and_root_identity(tmp_
     assert validation.entries[0].failure_code is None
 
 
+def test_revalidate_entries_accepts_an_existing_root_anchor(tmp_path):
+    root = tmp_path / "course"
+    root.mkdir()
+    (root / "notes.txt").write_bytes(b"revision one")
+    scanner = WorkspaceScanner()
+    selected = tuple(
+        entry for entry in scanner.scan("workspace-1", root).entries if entry.included
+    )
+
+    with scanner._directory_opener.anchor_root(root) as root_anchor:
+        validation = scanner.revalidate_entries(
+            root,
+            selected,
+            root_anchor=root_anchor,
+        )
+
+    assert validation.root_device == str(root_anchor.identity[0])
+    assert validation.root_file_id == str(root_anchor.identity[1])
+    assert validation.entries[0].failure_code is None
+
+
+def test_open_revalidated_entry_hashes_and_yields_the_same_open_handle(tmp_path):
+    root = tmp_path / "course"
+    root.mkdir()
+    content = b"approved source"
+    (root / "notes.txt").write_bytes(content)
+    scanner = WorkspaceScanner()
+    selected = tuple(
+        entry for entry in scanner.scan("workspace-1", root).entries if entry.included
+    )
+
+    with scanner._directory_opener.anchor_root(root) as root_anchor:
+        with scanner.open_revalidated_entry(
+            root,
+            selected[0],
+            root_anchor=root_anchor,
+        ) as (validation, source):
+            assert validation.sha256 == hashlib.sha256(content).hexdigest()
+            assert source.tell() == 0
+            assert source.read() == content
+
+
+def test_open_revalidated_entry_preserves_the_hash_chunk_callback_contract(tmp_path):
+    root = tmp_path / "course"
+    root.mkdir()
+    (root / "notes.txt").write_bytes(b"abcdef")
+    chunks = []
+    scanner = WorkspaceScanner(
+        DEFAULT_SCAN_POLICY.model_copy(update={"hash_chunk_bytes": 3}),
+        after_hash_chunk=lambda _path, chunk_index: chunks.append(chunk_index),
+    )
+    selected = tuple(
+        entry for entry in scanner.scan("workspace-1", root).entries if entry.included
+    )
+    chunks.clear()
+
+    with scanner.open_revalidated_entry(root, selected[0]):
+        pass
+
+    assert chunks == [0, 1]
+
+
 def test_scan_with_identity_returns_the_identity_from_the_scan_root_open(tmp_path):
     (tmp_path / "notes.txt").write_text("notes", encoding="utf-8")
 

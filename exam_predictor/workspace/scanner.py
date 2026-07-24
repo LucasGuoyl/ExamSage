@@ -6,10 +6,12 @@ import re
 import stat
 import zipfile
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO, Iterator
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from exam_predictor.workspace.archive import ArchiveInspector
@@ -204,13 +206,20 @@ class WorkspaceScanner:
         self,
         root: Path,
         entries: Sequence[ManifestEntry] = (),
+        *,
+        root_anchor: RootAnchor | None = None,
     ) -> RevalidationResult:
         """Securely re-stat and hash an exact, policy-bounded set of native files."""
         if len(entries) > self._policy.max_files:
             raise ValueError("revalidation_file_count_limit")
-        with self._directory_opener.anchor_root(root) as root_anchor:
-            canonical_root = self._canonical_root(root, root_anchor)
-            if root_anchor.identity is None:
+        root_context = (
+            nullcontext(root_anchor)
+            if root_anchor is not None
+            else self._directory_opener.anchor_root(root)
+        )
+        with root_context as anchored_root:
+            canonical_root = self._canonical_root(root, anchored_root)
+            if anchored_root.identity is None:
                 raise SecureOpenError("source_root_identity_unavailable")
             aggregate_size = 0
             validated: list[RevalidatedEntry] = []
@@ -223,7 +232,7 @@ class WorkspaceScanner:
                         metadata = self._secure_file_opener.stat_regular(
                             canonical_root,
                             relative,
-                            root_anchor=root_anchor,
+                            root_anchor=anchored_root,
                         )
                     except SecureOpenError as error:
                         failure_code = error.code
@@ -235,7 +244,7 @@ class WorkspaceScanner:
                             outcome = self._read(
                                 canonical_root / Path(*relative.parts),
                                 canonical_root,
-                                root_anchor,
+                                anchored_root,
                                 entry.relative_path,
                                 False,
                             )
@@ -254,10 +263,74 @@ class WorkspaceScanner:
                 )
             return RevalidationResult(
                 canonical_root=canonical_root,
-                root_device=str(root_anchor.identity[0]),
-                root_file_id=str(root_anchor.identity[1]),
+                root_device=str(anchored_root.identity[0]),
+                root_file_id=str(anchored_root.identity[1]),
                 entries=tuple(validated),
             )
+
+    @contextmanager
+    def open_revalidated_entry(
+        self,
+        root: Path,
+        entry: ManifestEntry,
+        *,
+        root_anchor: RootAnchor | None = None,
+    ) -> Iterator[tuple[RevalidatedEntry, BinaryIO]]:
+        """Bounded-hash and yield the same securely opened native file handle."""
+        if root_anchor is None:
+            with self._directory_opener.anchor_root(root) as opened_anchor:
+                with self.open_revalidated_entry(
+                    root,
+                    entry,
+                    root_anchor=opened_anchor,
+                ) as opened:
+                    yield opened
+            return
+
+        canonical_root = self._canonical_root(root, root_anchor)
+        if root_anchor.identity is None:
+            raise SecureOpenError("source_root_identity_unavailable")
+        if entry.archive_parent_entry_id is not None or entry.item_kind != "file":
+            raise SecureOpenError(SOURCE_NOT_REGULAR)
+
+        relative = PurePosixPath(entry.relative_path)
+        with self._secure_file_opener.open_regular(
+            canonical_root,
+            relative,
+            root_anchor=root_anchor,
+        ) as source:
+            before = self._secure_file_opener.stat_open_file(source)
+            if before.st_size > self._policy.max_workspace_bytes:
+                raise SecureOpenError(SOURCE_WORKSPACE_SIZE_LIMIT)
+            digest = hashlib.sha256()
+            for chunk_index, chunk in enumerate(
+                iter(
+                    lambda: source.read(self._policy.hash_chunk_bytes),
+                    b"",
+                )
+            ):
+                digest.update(chunk)
+                if self._after_hash_chunk is not None:
+                    self._after_hash_chunk(
+                        canonical_root / Path(*relative.parts),
+                        chunk_index,
+                    )
+            after_hash = self._secure_file_opener.stat_open_file(source)
+            if _stat_identity(before) != _stat_identity(after_hash):
+                raise SecureOpenError(SOURCE_CHANGED_DURING_SCAN)
+            source.seek(0)
+            validation = RevalidatedEntry(
+                entry_id=entry.entry_id,
+                sha256=digest.hexdigest(),
+                size_bytes=max(after_hash.st_size, 0),
+                modified_ns=after_hash.st_mtime_ns,
+                device_id=str(after_hash.st_dev),
+                file_id=str(after_hash.st_ino),
+            )
+            yield validation, source
+            after_use = self._secure_file_opener.stat_open_file(source)
+            if _stat_identity(after_hash) != _stat_identity(after_use):
+                raise SecureOpenError(SOURCE_CHANGED_DURING_SCAN)
 
     def _scan_anchored(
         self,
