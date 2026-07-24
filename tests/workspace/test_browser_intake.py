@@ -692,6 +692,134 @@ def test_windows_temp_creation_refuses_a_replacement_before_open(
     assert (candidate / "marker.txt").read_bytes() == b"replacement"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX nested creation identity")
+def test_posix_nested_parent_refuses_ordinary_directory_substitution(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    session = _PosixSnapshotSession(workspace)
+    os.mkdir(".replacement", dir_fd=session._temporary_fd)
+    replacement = session._temporary_name + "/.replacement"
+    with open(workspace / replacement / "marker.txt", "wb") as marker:
+        marker.write(b"replacement")
+    original_open = os.open
+    injected = False
+
+    def replace_before_parent_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal injected
+        if not injected and path == "course" and dir_fd is not None:
+            injected = True
+            os.rename(
+                path,
+                ".original-created-parent",
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            os.rename(
+                ".replacement",
+                path,
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", replace_before_parent_open)
+
+    try:
+        with pytest.raises(BrowserIntakeError) as caught:
+            with session.open_destination(("course", "notes.txt")):
+                pytest.fail("substituted parent must never receive a destination")
+        assert caught.value.code == "browser_intake_write_failed"
+        assert not (workspace / "browser-intake").exists()
+    finally:
+        session.cleanup()
+
+    [orphan] = workspace.glob(".examsage-browser-orphan-*")
+    assert (orphan / "course" / "marker.txt").read_bytes() == b"replacement"
+    assert not (orphan / "course" / "notes.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows nested creation identity")
+def test_windows_nested_parent_refuses_ordinary_directory_substitution(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    session = _WindowsSnapshotSession(workspace)
+    replacement = session._temporary_root / ".replacement"
+    replacement.mkdir()
+    (replacement / "marker.txt").write_bytes(b"replacement")
+    original_open = _WindowsSnapshotSession._open_directory
+    injected = False
+
+    def replace_before_parent_open(
+        self, path, *, delete_access, containment_root
+    ):
+        nonlocal injected
+        if not injected and path.name == "course":
+            injected = True
+            path.rename(session._temporary_root / ".original-created-parent")
+            replacement.rename(path)
+        return original_open(
+            self,
+            path,
+            delete_access=delete_access,
+            containment_root=containment_root,
+        )
+
+    monkeypatch.setattr(
+        _WindowsSnapshotSession, "_open_directory", replace_before_parent_open
+    )
+
+    try:
+        with pytest.raises(BrowserIntakeError) as caught:
+            with session.open_destination(("course", "notes.txt")):
+                pytest.fail("substituted parent must never receive a destination")
+        assert caught.value.code == "browser_intake_write_failed"
+        assert not (workspace / "browser-intake").exists()
+    finally:
+        session.cleanup()
+
+    assert (session._temporary_root / "course" / "marker.txt").read_bytes() == (
+        b"replacement"
+    )
+    assert not (session._temporary_root / "course" / "notes.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle ownership")
+def test_windows_destination_closes_handle_if_descriptor_transfer_fails(
+    tmp_path, monkeypatch
+):
+    import msvcrt
+
+    workspace = tmp_path / "workspace-1"
+    workspace.mkdir()
+    session = _WindowsSnapshotSession(workspace)
+    original_close = session._close_handle
+    closed: list[int] = []
+
+    def recording_close(handle):
+        closed.append(handle)
+        original_close(handle)
+
+    def fail_transfer(handle, flags):
+        del handle, flags
+        raise OSError("descriptor transfer failed")
+
+    monkeypatch.setattr(session, "_close_handle", recording_close)
+    monkeypatch.setattr(msvcrt, "open_osfhandle", fail_transfer)
+
+    try:
+        with pytest.raises(BrowserIntakeError) as caught:
+            with session.open_destination(("notes.txt",)):
+                pytest.fail("failed transfer must never yield a destination")
+        assert caught.value.code == "browser_intake_write_failed"
+        assert len(closed) == 1
+    finally:
+        session.cleanup()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor lifecycle")
 def test_posix_session_closes_workspace_fd_if_workspace_identity_query_fails(
     tmp_path, monkeypatch

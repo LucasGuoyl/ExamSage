@@ -112,6 +112,9 @@ class _PosixSnapshotSession:
             os.close(self._workspace_fd)
             raise
         self._identity = temporary_stat
+        self._directory_fds: dict[tuple[str, ...], int] = {}
+        self._directory_identities: dict[tuple[str, ...], tuple[int, int]] = {}
+        self._cleanup_identity_bound = True
         self._closed = False
 
     def _create_temporary_directory(self) -> tuple[str, tuple[int, int]]:
@@ -136,12 +139,47 @@ class _PosixSnapshotSession:
         parent_fd = os.dup(self._temporary_fd)
         file_descriptor: int | None = None
         try:
+            current_key: tuple[str, ...] = ()
             for part in parts[:-1]:
+                current_key += (part.casefold(),)
+                retained_fd = self._directory_fds.get(current_key)
+                if retained_fd is not None:
+                    child_fd = os.dup(retained_fd)
+                    os.close(parent_fd)
+                    parent_fd = child_fd
+                    continue
+
+                candidate_fd: int | None = None
                 try:
                     os.mkdir(part, mode=0o700, dir_fd=parent_fd)
                 except FileExistsError:
-                    pass
-                child_fd = os.open(part, self._directory_flags, dir_fd=parent_fd)
+                    self._cleanup_identity_bound = False
+                    raise BrowserIntakeError("browser_intake_write_failed") from None
+                try:
+                    created = os.stat(
+                        part,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISDIR(created.st_mode):
+                        raise BrowserIntakeError("browser_intake_write_failed")
+                    creation_identity = (created.st_dev, created.st_ino)
+                    candidate_fd = os.open(
+                        part,
+                        self._directory_flags,
+                        dir_fd=parent_fd,
+                    )
+                    opened = os.fstat(candidate_fd)
+                    if (opened.st_dev, opened.st_ino) != creation_identity:
+                        raise BrowserIntakeError("browser_intake_write_failed")
+                except BaseException:
+                    self._cleanup_identity_bound = False
+                    if candidate_fd is not None:
+                        os.close(candidate_fd)
+                    raise
+                self._directory_fds[current_key] = candidate_fd
+                self._directory_identities[current_key] = creation_identity
+                child_fd = os.dup(candidate_fd)
                 os.close(parent_fd)
                 parent_fd = child_fd
 
@@ -179,6 +217,9 @@ class _PosixSnapshotSession:
                 self._rename_no_replace(destination_name, isolation_name)
             raise BrowserIntakeError("browser_intake_write_failed")
         self._closed = True
+        for parent_fd in self._directory_fds.values():
+            os.close(parent_fd)
+        self._directory_fds.clear()
         os.close(self._temporary_fd)
         if self._lock_fd is not None:
             os.close(self._lock_fd)
@@ -265,6 +306,8 @@ class _PosixSnapshotSession:
             self._rename_no_replace(self._temporary_name, quarantine_name)
             if not self._name_matches_temporary_identity(quarantine_name):
                 return
+            if not self._cleanup_identity_bound:
+                return
             if shutil.rmtree.avoids_symlink_attacks:
                 with contextlib.suppress(OSError):
                     shutil.rmtree(".", dir_fd=self._temporary_fd)
@@ -277,6 +320,9 @@ class _PosixSnapshotSession:
             pass
         finally:
             self._closed = True
+            for parent_fd in self._directory_fds.values():
+                os.close(parent_fd)
+            self._directory_fds.clear()
             os.close(self._temporary_fd)
             if self._lock_fd is not None:
                 os.close(self._lock_fd)
@@ -357,6 +403,7 @@ class _WindowsSnapshotSession:
         }
         self._file_descriptors: list[int] = []
         self._file_records: list[tuple[Path, tuple[int, int]]] = []
+        self._cleanup_identity_bound = True
         self._closed = False
 
     def _configure_functions(self) -> None:
@@ -532,15 +579,28 @@ class _WindowsSnapshotSession:
             try:
                 current_path.mkdir()
             except FileExistsError:
-                pass
-            handle = self._open_directory(
-                current_path,
-                delete_access=True,
-                containment_root=self._temporary_root,
-            )
+                self._cleanup_identity_bound = False
+                raise BrowserIntakeError("browser_intake_write_failed") from None
+            handle: int | None = None
+            try:
+                created = current_path.stat(follow_symlinks=False)
+                creation_file_id = created.st_ino
+                handle = self._open_directory(
+                    current_path,
+                    delete_access=True,
+                    containment_root=self._temporary_root,
+                )
+                identity = self._handle_identity(handle)
+                if identity[1] != creation_file_id:
+                    raise BrowserIntakeError("browser_intake_write_failed")
+            except BaseException:
+                self._cleanup_identity_bound = False
+                if handle is not None:
+                    self._close_handle(handle)
+                raise
             self._directory_handles[current_key] = handle
             self._directory_paths[current_key] = current_path
-            self._directory_identities[current_key] = self._handle_identity(handle)
+            self._directory_identities[current_key] = identity
         return current_path
 
     @contextlib.contextmanager
@@ -549,6 +609,7 @@ class _WindowsSnapshotSession:
 
         parent = self._ensure_parent(parts[:-1])
         target = parent / parts[-1]
+        handle: int | None = None
         try:
             handle = self._create_file_handle(
                 target,
@@ -568,16 +629,22 @@ class _WindowsSnapshotSession:
                 or not self._final_path_beneath(handle, self._temporary_root)
             ):
                 self._close_handle(handle)
+                handle = None
                 raise BrowserIntakeError("browser_intake_path_invalid")
+            identity = self._handle_identity(handle)
             file_descriptor = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+            handle = None
             self._file_descriptors.append(file_descriptor)
-            self._file_records.append((target, self._handle_identity(handle)))
+            self._file_records.append((target, identity))
             with os.fdopen(file_descriptor, "wb", closefd=False) as destination:
                 yield destination
         except BrowserIntakeError:
             raise
         except OSError:
             raise BrowserIntakeError("browser_intake_write_failed") from None
+        finally:
+            if handle is not None:
+                self._close_handle(handle)
 
     def publish(self, destination_name: str) -> None:
         self._close_children_for_publish()
@@ -694,6 +761,16 @@ class _WindowsSnapshotSession:
 
     def cleanup(self) -> None:
         if self._closed:
+            return
+        if not self._cleanup_identity_bound:
+            for file_descriptor in self._file_descriptors:
+                os.close(file_descriptor)
+            self._file_descriptors.clear()
+            for handle in self._directory_handles.values():
+                self._close_handle(handle)
+            self._directory_handles.clear()
+            self._close_handle(self._workspace_handle)
+            self._closed = True
             return
         for file_descriptor in self._file_descriptors:
             self._mark_delete(file_descriptor)
