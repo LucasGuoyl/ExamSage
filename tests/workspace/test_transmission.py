@@ -22,7 +22,11 @@ from exam_predictor.workspace.models import (
     WorkspaceRecord,
     WorkspaceState,
 )
-from exam_predictor.workspace.scanner import WorkspaceScanner
+from exam_predictor.workspace.scanner import (
+    RevalidatedEntry,
+    RevalidationResult,
+    WorkspaceScanner,
+)
 from exam_predictor.workspace.store import WorkspaceStore
 from exam_predictor.workspace.transmission import (
     SourceAuthorizationError,
@@ -246,6 +250,90 @@ def test_archive_preview_member_is_never_authorized(
         WorkspaceTransmissionGate(store).authorize("workspace-1", [member.entry_id])
 
     assert caught.value.code == "source_not_approved"
+
+
+@pytest.mark.parametrize(
+    ("state", "included"),
+    [
+        (SourceState.EXCLUDED, True),
+        (SourceState.FAILED, True),
+        (SourceState.APPROVED, False),
+    ],
+    ids=["excluded", "failed", "unincluded"],
+)
+def test_ineligible_approved_revision_entries_never_reach_downstream(
+    store: WorkspaceStore,
+    tmp_path: Path,
+    state: SourceState,
+    included: bool,
+):
+    _, entry_ids = _approved_workspace(store, tmp_path)
+    entry_id = entry_ids[0]
+    approval = store.get_approval("workspace-1")
+    with store._transaction() as connection:
+        connection.execute(
+            """UPDATE manifest_entries SET state = ?, included = ?
+               WHERE revision_id = ? AND entry_id = ?""",
+            (state.value, int(included), approval.revision_id, entry_id),
+        )
+    gate = WorkspaceTransmissionGate(store)
+    provider_calls = 0
+
+    with pytest.raises(SourceAuthorizationError) as caught:
+        gate.authorize("workspace-1", [entry_id])
+        provider_calls += 1
+
+    assert caught.value.code == "source_not_approved"
+    assert gate._read_grants == {}
+    assert provider_calls == 0
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    ["source_link_or_reparse", "source_not_regular", "source_outside_root"],
+)
+def test_secure_path_failures_are_stable_and_never_issue_tokens_or_call_downstream(
+    store: WorkspaceStore,
+    tmp_path: Path,
+    failure_code: str,
+):
+    _, entry_ids = _approved_workspace(store, tmp_path)
+    entry_id = entry_ids[0]
+    workspace = store.get_workspace("workspace-1")
+    gate = WorkspaceTransmissionGate(store)
+    provider_calls = 0
+
+    class FailingRevalidator:
+        @staticmethod
+        def revalidate_entries(_root, entries, *, root_anchor):
+            return RevalidationResult(
+                canonical_root=root_anchor.canonical_root,
+                root_device=workspace.root_device,
+                root_file_id=workspace.root_file_id,
+                entries=(
+                    RevalidatedEntry(
+                        entry_id=entries[0].entry_id,
+                        sha256=None,
+                        size_bytes=0,
+                        modified_ns=None,
+                        device_id=None,
+                        file_id=None,
+                        failure_code=failure_code,
+                    ),
+                ),
+            )
+
+    gate._scanner = FailingRevalidator()
+
+    with pytest.raises(SourceAuthorizationError) as caught:
+        gate.authorize("workspace-1", [entry_id])
+        provider_calls += 1
+
+    assert caught.value.code == "approved_source_changed"
+    assert caught.value.__cause__ is None
+    assert str(tmp_path) not in str(caught.value)
+    assert gate._read_grants == {}
+    assert provider_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -489,6 +577,45 @@ def test_consume_never_yields_a_native_handle_rewritten_after_its_hash(
         assert error.code == "approved_source_changed"
     else:
         assert delivered == approved
+
+
+def test_growing_stream_stops_at_expected_size_plus_one_before_downstream_use(
+    store: WorkspaceStore, tmp_path: Path
+):
+    root, entry_ids = _approved_workspace(store, tmp_path)
+    gate = WorkspaceTransmissionGate(store)
+    descriptor = gate.authorize("workspace-1", [entry_ids[0]])[0]
+    metadata = (root / "notes.txt").stat()
+    expected_size = descriptor.size_bytes
+    provider_calls = 0
+
+    class CountingGrowingStream(io.BytesIO):
+        bytes_read = 0
+
+        def read(self, size=-1):
+            chunk = super().read(size)
+            type(self).bytes_read += len(chunk)
+            return chunk
+
+    class GrowingOpener:
+        @contextmanager
+        def open_regular(self, *_args, **_kwargs):
+            with CountingGrowingStream(b"x" * (expected_size + 10)) as source:
+                yield source
+
+        @staticmethod
+        def stat_open_file(_source):
+            return metadata
+
+    gate._scanner._secure_file_opener = GrowingOpener()
+
+    with pytest.raises(SourceAuthorizationError) as caught:
+        with gate.open_approved(descriptor.read_token):
+            provider_calls += 1
+
+    assert caught.value.code == "approved_source_changed"
+    assert CountingGrowingStream.bytes_read == expected_size + 1
+    assert provider_calls == 0
 
 
 def test_missing_root_fails_without_leaking_a_path(

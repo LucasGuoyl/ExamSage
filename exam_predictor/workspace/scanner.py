@@ -323,22 +323,34 @@ class WorkspaceScanner:
             root_anchor=root_anchor,
         ) as source:
             before = self._secure_file_opener.stat_open_file(source)
-            if before.st_size > self._policy.max_workspace_bytes:
+            expected_size = entry.size_bytes
+            if expected_size > self._policy.max_workspace_bytes:
                 raise SecureOpenError(SOURCE_WORKSPACE_SIZE_LIMIT)
+            if before.st_size != expected_size:
+                raise SecureOpenError(SOURCE_CHANGED_DURING_SCAN)
             digest = hashlib.sha256()
-            for chunk_index, chunk in enumerate(
-                iter(
-                    lambda: source.read(self._policy.hash_chunk_bytes),
-                    b"",
-                )
-            ):
+            total_bytes = 0
+            chunk_index = 0
+            chunk_limit = max(1, self._policy.hash_chunk_bytes)
+            while True:
+                remaining = expected_size - total_bytes
+                chunk = source.read(min(chunk_limit, remaining + 1))
+                if not chunk:
+                    break
+                if len(chunk) > remaining:
+                    raise SecureOpenError(SOURCE_CHANGED_DURING_SCAN)
                 digest.update(chunk)
-                destination.write(chunk)
+                if destination.write(chunk) != len(chunk):
+                    raise SecureOpenError(SOURCE_OPEN_FAILED)
+                total_bytes += len(chunk)
                 if self._after_hash_chunk is not None:
                     self._after_hash_chunk(
                         canonical_root / Path(*relative.parts),
                         chunk_index,
                     )
+                chunk_index += 1
+            if total_bytes != expected_size:
+                raise SecureOpenError(SOURCE_CHANGED_DURING_SCAN)
             after_hash = self._secure_file_opener.stat_open_file(source)
             if _stat_identity(before) != _stat_identity(after_hash):
                 raise SecureOpenError(SOURCE_CHANGED_DURING_SCAN)
