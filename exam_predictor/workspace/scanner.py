@@ -58,6 +58,25 @@ class _ReadOutcome:
     stat_result: os.stat_result | None = None
 
 
+@dataclass(frozen=True)
+class RevalidatedEntry:
+    entry_id: str
+    sha256: str | None
+    size_bytes: int
+    modified_ns: int | None
+    device_id: str | None
+    file_id: str | None
+    failure_code: str | None = None
+
+
+@dataclass(frozen=True)
+class RevalidationResult:
+    canonical_root: Path
+    root_device: str
+    root_file_id: str
+    entries: tuple[RevalidatedEntry, ...]
+
+
 def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
 
@@ -147,6 +166,64 @@ class WorkspaceScanner:
                 root_anchor,
                 previous_entries=previous_entries,
                 emit=emit,
+            )
+
+    def revalidate_entries(
+        self,
+        root: Path,
+        entries: Sequence[ManifestEntry] = (),
+    ) -> RevalidationResult:
+        """Securely re-stat and hash an exact, policy-bounded set of native files."""
+        if len(entries) > self._policy.max_files:
+            raise ValueError("revalidation_file_count_limit")
+        with self._directory_opener.anchor_root(root) as root_anchor:
+            canonical_root = self._canonical_root(root, root_anchor)
+            root_stat = canonical_root.stat(follow_symlinks=False)
+            aggregate_size = 0
+            validated: list[RevalidatedEntry] = []
+            for entry in entries:
+                failure_code: str | None = None
+                outcome = _ReadOutcome(None, 0, failure_code=SOURCE_NOT_REGULAR)
+                relative = PurePosixPath(entry.relative_path)
+                if entry.archive_parent_entry_id is None and entry.item_kind == "file":
+                    try:
+                        metadata = self._secure_file_opener.stat_regular(
+                            canonical_root,
+                            relative,
+                            root_anchor=root_anchor,
+                        )
+                    except SecureOpenError as error:
+                        failure_code = error.code
+                    else:
+                        aggregate_size += max(metadata.st_size, 0)
+                        if aggregate_size > self._policy.max_workspace_bytes:
+                            failure_code = SOURCE_WORKSPACE_SIZE_LIMIT
+                        else:
+                            outcome = self._read(
+                                canonical_root / Path(*relative.parts),
+                                canonical_root,
+                                root_anchor,
+                                entry.relative_path,
+                                False,
+                            )
+                            failure_code = outcome.failure_code
+                metadata = outcome.stat_result
+                validated.append(
+                    RevalidatedEntry(
+                        entry_id=entry.entry_id,
+                        sha256=outcome.sha256,
+                        size_bytes=max(metadata.st_size, 0) if metadata is not None else 0,
+                        modified_ns=metadata.st_mtime_ns if metadata is not None else None,
+                        device_id=str(metadata.st_dev) if metadata is not None else None,
+                        file_id=str(metadata.st_ino) if metadata is not None else None,
+                        failure_code=failure_code,
+                    )
+                )
+            return RevalidationResult(
+                canonical_root=canonical_root,
+                root_device=str(root_stat.st_dev),
+                root_file_id=str(root_stat.st_ino),
+                entries=tuple(validated),
             )
 
     def _scan_anchored(

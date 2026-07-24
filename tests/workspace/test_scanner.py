@@ -103,6 +103,27 @@ def test_scanner_maps_the_final_root_reparse_probe_to_a_safe_error(tmp_path):
     assert str(tmp_path) not in str(caught.value)
 
 
+def test_revalidate_entries_reuses_bounded_secure_hashing_and_root_identity(tmp_path):
+    root = tmp_path / "course"
+    root.mkdir()
+    source = root / "notes.txt"
+    source.write_bytes(b"revision one")
+    scanner = WorkspaceScanner()
+    scanned = scanner.scan("workspace-1", root)
+    selected = tuple(entry for entry in scanned.entries if entry.included)
+
+    validation = scanner.revalidate_entries(root, selected)
+
+    root_stat = root.stat(follow_symlinks=False)
+    assert validation.canonical_root == root.resolve(strict=True)
+    assert validation.root_device == str(root_stat.st_dev)
+    assert validation.root_file_id == str(root_stat.st_ino)
+    assert len(validation.entries) == 1
+    assert validation.entries[0].entry_id == selected[0].entry_id
+    assert validation.entries[0].sha256 == hashlib.sha256(b"revision one").hexdigest()
+    assert validation.entries[0].failure_code is None
+
+
 def test_scanner_hashes_supported_files_with_stable_sha256_and_progress(tmp_path):
     content = b"bounded hashing"
     (tmp_path / "notes.txt").write_bytes(content)

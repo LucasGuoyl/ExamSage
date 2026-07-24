@@ -1286,3 +1286,78 @@ class WorkspaceStore:
                 "SELECT * FROM cleanup_queue ORDER BY created_at ASC, rowid ASC"
             ).fetchall()
         return tuple(self._cleanup(row) for row in rows)
+
+    def fail_cleanup(
+        self, cleanup_id: str, safe_error_code: str
+    ) -> CleanupRecord | None:
+        self._safe_code(safe_error_code)
+        now = self._now()
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM cleanup_queue WHERE cleanup_id = ?", (cleanup_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """UPDATE cleanup_queue
+                   SET safe_error_code = ?, attempt_count = attempt_count + 1,
+                       updated_at = ? WHERE cleanup_id = ?""",
+                (safe_error_code, self._timestamp(now), cleanup_id),
+            )
+            connection.execute(
+                """UPDATE workspaces SET state = ?, updated_at = ?
+                   WHERE workspace_id = ?""",
+                (
+                    WorkspaceState.CLEANUP_PENDING.value,
+                    self._timestamp(now),
+                    row["workspace_id"],
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM cleanup_queue WHERE cleanup_id = ?", (cleanup_id,)
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("The cleanup record could not be read back.")
+            return self._cleanup(updated)
+
+    def complete_cleanup(self, cleanup_id: str) -> str | None:
+        with self._transaction() as connection:
+            cleanup = connection.execute(
+                "SELECT * FROM cleanup_queue WHERE cleanup_id = ?", (cleanup_id,)
+            ).fetchone()
+            if cleanup is None:
+                return None
+            workspace_id = str(cleanup["workspace_id"])
+            workspace = connection.execute(
+                "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            if workspace is not None:
+                state = WorkspaceState(workspace["state"])
+                if state not in {
+                    WorkspaceState.DELETING,
+                    WorkspaceState.CLEANUP_PENDING,
+                }:
+                    raise ActiveWorkspaceOperationError(
+                        f"Workspace '{workspace_id}' is not pending cleanup."
+                    )
+                active = connection.execute(
+                    """SELECT 1 FROM workspace_jobs
+                       WHERE workspace_id = ? AND status IN (?, ?) LIMIT 1""",
+                    (
+                        workspace_id,
+                        WorkspaceJobStatus.QUEUED.value,
+                        WorkspaceJobStatus.RUNNING.value,
+                    ),
+                ).fetchone()
+                if active is not None:
+                    raise ActiveWorkspaceOperationError(
+                        f"Workspace '{workspace_id}' has an active operation."
+                    )
+            connection.execute(
+                "DELETE FROM cleanup_queue WHERE cleanup_id = ?", (cleanup_id,)
+            )
+            if workspace is not None:
+                connection.execute(
+                    "DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+                )
+        return workspace_id

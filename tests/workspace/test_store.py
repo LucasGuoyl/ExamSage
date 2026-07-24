@@ -1023,6 +1023,51 @@ def test_cleanup_queue_rejects_native_or_escaping_paths_and_survives_restart(
         restarted.close()
 
 
+def test_cleanup_failure_and_completion_are_atomic_and_completion_is_idempotent(
+    store: WorkspaceStore, tmp_path: Path
+):
+    owned_root = tmp_path / "workspaces" / "workspace-1"
+    owned_root.mkdir(parents=True)
+    source = workspace_record(tmp_path).model_copy(
+        update={
+            "source_mode": SourceMode.BROWSER_SNAPSHOT,
+            "canonical_root": owned_root / "browser-intake",
+            "state": WorkspaceState.READY,
+        }
+    )
+    store.create_workspace(source)
+    store.mark_deleting(source.workspace_id)
+    store.queue_cleanup(source.workspace_id, owned_root, "cleanup_failed")
+    [record] = store.list_cleanup()
+
+    failed = store.fail_cleanup(record.cleanup_id, "cleanup_retry_failed")
+
+    assert failed is not None
+    assert failed.attempt_count == 1
+    assert failed.safe_error_code == "cleanup_retry_failed"
+    workspace = store.get_workspace(source.workspace_id)
+    assert workspace is not None
+    assert workspace.state is WorkspaceState.CLEANUP_PENDING
+
+    with store._transaction() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_cleanup_workspace_delete
+               BEFORE DELETE ON workspaces
+               BEGIN SELECT RAISE(ABORT, 'forced cleanup failure'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="forced cleanup failure"):
+        store.complete_cleanup(record.cleanup_id)
+    assert store.get_workspace(source.workspace_id) is not None
+    assert store.list_cleanup() == (failed,)
+    with store._transaction() as connection:
+        connection.execute("DROP TRIGGER reject_cleanup_workspace_delete")
+
+    assert store.complete_cleanup(record.cleanup_id) == source.workspace_id
+    assert store.get_workspace(source.workspace_id) is None
+    assert store.list_cleanup() == ()
+    assert store.complete_cleanup(record.cleanup_id) is None
+
+
 def test_missing_workspace_manifest_and_job_errors_are_safe(store: WorkspaceStore):
     assert store.get_workspace("missing") is None
     assert store.get_approval("missing") is None
