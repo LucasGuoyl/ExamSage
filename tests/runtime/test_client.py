@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,6 +14,11 @@ from exam_predictor.runtime.models import (
     ProviderProfile,
     RunStatus,
     SubmitMessageRequest,
+)
+from exam_predictor.workspace.models import (
+    EntryInclusionRequest,
+    SourceMode,
+    SourceState,
 )
 
 
@@ -345,3 +352,88 @@ def test_closed_client_fails_with_stable_error():
         client.health()
 
     assert WORKER_TOKEN not in str(captured.value)
+
+
+def test_client_exposes_typed_workspace_and_saved_provider_operations(tmp_path: Path):
+    upload = tmp_path / "notes.pdf"
+    upload.write_bytes(b"notes")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/workspaces":
+            if request.method == "GET":
+                return httpx.Response(200, json=[_workspace_summary_json()])
+            assert json.loads(request.content) == {"confirmation": "DELETE ALL"}
+            return httpx.Response(204)
+        if path == "/v1/workspaces/workspace/one":
+            assert request.url.raw_path == b"/v1/workspaces/workspace%2Fone"
+            return httpx.Response(200, json=_workspace_detail_json()) if request.method == "GET" else httpx.Response(204)
+        if path == "/v1/workspaces/workspace/one/manifest":
+            assert dict(request.url.params) == {"state": "pending_approval", "course": "week-1", "offset": "2", "limit": "50"}
+            return httpx.Response(200, json={"items": [], "total": 0, "offset": 2, "limit": 50, "counts": {}})
+        if path == "/v1/workspaces/select-folder":
+            assert request.headers["Idempotency-Key"] == "key-1"
+            return httpx.Response(204)
+        if path == "/v1/workspaces/browser-snapshot":
+            assert request.headers["content-type"].startswith("multipart/form-data")
+            assert b'filename="week-1/notes.pdf"' in request.content
+            return httpx.Response(202, json=_workspace_job_json())
+        if path == "/v1/workspaces/workspace/one/rescan":
+            assert request.headers["Idempotency-Key"] == "key-2"
+            return httpx.Response(202, json=_workspace_job_json())
+        if path == "/v1/workspaces/workspace/one/entries/entry/one":
+            assert json.loads(request.content) == {"revision_id": "revision-1", "included": False, "subtree": True}
+            return httpx.Response(200, json=_manifest_revision_json())
+        if path == "/v1/workspaces/workspace/one/approval":
+            return httpx.Response(200, json=_approval_json())
+        if path == "/v1/workspace-jobs/job/one":
+            return httpx.Response(200, json=_workspace_job_json())
+        if path == "/v1/workspace-jobs/job/one/events":
+            assert dict(request.url.params) == {"after": "4"}
+            return httpx.Response(200, json=[])
+        if path == "/v1/providers/saved":
+            return httpx.Response(200, json=[])
+        if path == "/v1/providers/primary/one/credential":
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected {request.method} {path}")
+
+    client = WorkerClient("http://127.0.0.1:8765", WORKER_TOKEN, transport=httpx.MockTransport(respond))
+    try:
+        assert client.list_workspaces()[0].workspace_id == "workspace/one"
+        assert client.get_workspace("workspace/one").source_mode is SourceMode.BROWSER_SNAPSHOT
+        assert client.get_manifest("workspace/one", state=SourceState.PENDING_APPROVAL, course="week-1", offset=2, limit=50).total == 0
+        assert client.select_folder("key-1") is None
+        assert client.upload_directory("Course", {"week-1/notes.pdf": upload}, "key-1").job_id == "job/one"
+        assert client.rescan("workspace/one", "key-2").workspace_id == "workspace/one"
+        assert client.set_entry_inclusion("workspace/one", "entry/one", EntryInclusionRequest(revision_id="revision-1", included=False, subtree=True)).revision_id == "revision-1"
+        assert client.approve_workspace("workspace/one", "revision-1").approval_id == "approval-1"
+        client.delete_workspace("workspace/one")
+        client.delete_all_workspaces()
+        assert client.get_job("job/one").job_id == "job/one"
+        assert client.workspace_events_after("job/one", after=4) == []
+        assert client.list_saved_providers() == []
+        client.forget_provider_credential("primary/one")
+    finally:
+        client.close()
+
+    upload.unlink()
+
+
+def _workspace_summary_json() -> dict[str, object]:
+    return {"workspace_id": "workspace/one", "display_name": "Course", "source_mode": "browser_snapshot", "state": "ready", "counts": {}, "updated_at": NOW}
+
+
+def _workspace_detail_json() -> dict[str, object]:
+    return {**_workspace_summary_json(), "current_draft_revision_id": "revision-1", "current_approved_revision_id": None, "created_at": NOW, "last_scanned_at": None, "last_access_verified_at": None}
+
+
+def _workspace_job_json() -> dict[str, object]:
+    return {"job_id": "job/one", "workspace_id": "workspace/one", "job_kind": "scan", "status": "queued", "idempotency_key": "key-1", "safe_error_code": None, "created_at": NOW, "started_at": None, "finished_at": None}
+
+
+def _manifest_revision_json() -> dict[str, object]:
+    return {"revision_id": "revision-1", "workspace_id": "workspace/one", "parent_revision_id": None, "scan_job_id": None, "policy_version": "workspace-v1", "entries": [], "created_at": NOW}
+
+
+def _approval_json() -> dict[str, object]:
+    return {"approval_id": "approval-1", "workspace_id": "workspace/one", "revision_id": "revision-1", "entries": [], "policy_version": "workspace-v1", "approved_at": NOW}

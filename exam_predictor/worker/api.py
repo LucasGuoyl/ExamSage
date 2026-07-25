@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import sys
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -18,6 +19,10 @@ from exam_predictor.runtime.coordinator import (
     ProviderProfileInUseError,
     RuntimeCoordinator,
 )
+from exam_predictor.runtime.credential_vault import (
+    KeyringCredentialVault,
+    VaultUnavailableError,
+)
 from exam_predictor.runtime.models import (
     AgentEvent,
     ConnectProviderRequest,
@@ -31,6 +36,13 @@ from exam_predictor.runtime.models import (
 )
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.runtime.store import RuntimeStore
+from exam_predictor.workspace.browser_intake import BrowserIntakeWriter
+from exam_predictor.workspace.picker import SubprocessFolderPicker
+from exam_predictor.workspace.scanner import WorkspaceScanner
+from exam_predictor.workspace.service import WorkspaceService
+from exam_predictor.workspace.store import WorkspaceStore
+
+from .workspace_routes import WorkspaceRouterDependencies, build_workspace_router
 
 
 _MISSING_RUN_DETAIL = "Agent run was not found."
@@ -102,14 +114,35 @@ class SubmitMessageBody(BaseModel):
 def create_worker_app(
     settings: WorkerSettings,
     runtime: RuntimeCoordinator | None = None,
+    workspace_store: WorkspaceStore | None = None,
+    workspace_service: WorkspaceService | None = None,
 ) -> FastAPI:
+    owns_runtime_store = runtime is None
+    runtime_store: RuntimeStore | None = None
+    if workspace_store is None:
+        workspace_store = WorkspaceStore(settings.data_dir / "workspace.sqlite3")
     if runtime is None:
-        store = RuntimeStore(settings.data_dir / "agent-runtime.sqlite3")
+        runtime_store = RuntimeStore(settings.data_dir / "agent-runtime.sqlite3")
         sessions = ProviderSessionRegistry()
+        try:
+            vault = KeyringCredentialVault()
+        except VaultUnavailableError:
+            vault = None
         runtime = RuntimeCoordinator(
-            store=store,
+            store=runtime_store,
             provider_sessions=sessions,
             checkpoints_path=settings.data_dir / "agent-checkpoints.sqlite3",
+            vault=vault,
+            workspace_repository=workspace_store,
+        )
+    if workspace_service is None:
+        workspace_service = WorkspaceService(
+            store=workspace_store,
+            scanner=WorkspaceScanner(),
+            picker=SubprocessFolderPicker(Path(sys.executable)),
+            browser_intake=BrowserIntakeWriter(settings.data_dir / "workspaces"),
+            run_guard=runtime,
+            close_store_on_shutdown=True,
         )
 
     expected_token = settings.token.get_secret_value().encode()
@@ -120,10 +153,14 @@ def create_worker_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         runtime.start()
+        workspace_service.start()
         try:
             yield
         finally:
+            workspace_service.shutdown()
             runtime.shutdown()
+            if owns_runtime_store and runtime_store is not None:
+                runtime_store.close()
 
     app = FastAPI(
         title="ExamSage Agent Worker",
@@ -134,6 +171,8 @@ def create_worker_app(
     )
     app.add_middleware(_V1TokenAuthBoundary, token_matches=token_matches)
     app.state.runtime = runtime
+    app.state.workspace_store = workspace_store
+    app.state.workspace_service = workspace_service
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(_request, _exc) -> JSONResponse:
@@ -355,5 +394,15 @@ def create_worker_app(
     )
     def pause_all() -> None:
         runtime.pause_all()
+
+    app.include_router(
+        build_workspace_router(
+            WorkspaceRouterDependencies(
+                workspace_service=workspace_service,
+                workspace_store=workspace_store,
+                runtime=runtime,
+            )
+        )
+    )
 
     return app

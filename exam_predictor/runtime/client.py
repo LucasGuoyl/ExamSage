@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from contextlib import ExitStack
+from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import quote, urlsplit
 
@@ -12,8 +15,20 @@ from .models import (
     HealthResponse,
     ProviderDescriptor,
     RunSnapshot,
+    SavedProviderProfile,
     SubmitMessageRequest,
     SubmitMessageResponse,
+)
+from exam_predictor.workspace.models import (
+    ApprovalRecord,
+    EntryInclusionRequest,
+    ManifestPage,
+    ManifestRevision,
+    SourceState,
+    WorkspaceDetail,
+    WorkspaceEvent,
+    WorkspaceJob,
+    WorkspaceSummary,
 )
 
 
@@ -110,6 +125,16 @@ class WorkerClient:
             raise WorkerClientError("Agent Worker returned an invalid response.")
         return parsed
 
+    @staticmethod
+    def _models(response: httpx.Response, model: type[ModelT]) -> list[ModelT]:
+        try:
+            parsed = TypeAdapter(list[model]).validate_python(response.json())
+        except (TypeError, ValueError, ValidationError):
+            parsed = None
+        if parsed is None:
+            raise WorkerClientError("Agent Worker returned an invalid response.")
+        return parsed
+
     def health(self) -> HealthResponse:
         return self._model(self._request("GET", "/health"), HealthResponse)
 
@@ -165,6 +190,117 @@ class WorkerClient:
 
     def pause_all(self) -> None:
         self._request("POST", "/v1/runtime/pause-all")
+
+    def list_workspaces(self) -> list[WorkspaceSummary]:
+        return self._models(self._request("GET", "/v1/workspaces"), WorkspaceSummary)
+
+    def get_workspace(self, workspace_id: str) -> WorkspaceDetail:
+        response = self._request("GET", f"/v1/workspaces/{quote(workspace_id, safe='')}")
+        return self._model(response, WorkspaceDetail)
+
+    def get_manifest(
+        self,
+        workspace_id: str,
+        *,
+        state: SourceState | None = None,
+        course: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> ManifestPage:
+        params: dict[str, str | int] = {"offset": offset, "limit": limit}
+        if state is not None:
+            params["state"] = state.value
+        if course is not None:
+            params["course"] = course
+        response = self._request(
+            "GET",
+            f"/v1/workspaces/{quote(workspace_id, safe='')}/manifest",
+            params=params,
+        )
+        return self._model(response, ManifestPage)
+
+    def select_folder(self, idempotency_key: str) -> WorkspaceJob | None:
+        response = self._request(
+            "POST",
+            "/v1/workspaces/select-folder",
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        return None if response.status_code == 204 else self._model(response, WorkspaceJob)
+
+    def upload_directory(
+        self,
+        display_name: str,
+        files: Mapping[str, str | Path],
+        idempotency_key: str,
+    ) -> WorkspaceJob:
+        with ExitStack() as stack:
+            multipart = [
+                (
+                    "files",
+                    (relative_path, stack.enter_context(Path(path).open("rb")), "application/octet-stream"),
+                )
+                for relative_path, path in files.items()
+            ]
+            response = self._request(
+                "POST",
+                "/v1/workspaces/browser-snapshot",
+                data={"display_name": display_name, "idempotency_key": idempotency_key},
+                files=multipart,
+            )
+        return self._model(response, WorkspaceJob)
+
+    def rescan(self, workspace_id: str, idempotency_key: str) -> WorkspaceJob:
+        response = self._request(
+            "POST",
+            f"/v1/workspaces/{quote(workspace_id, safe='')}/rescan",
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        return self._model(response, WorkspaceJob)
+
+    def set_entry_inclusion(
+        self,
+        workspace_id: str,
+        entry_id: str,
+        request: EntryInclusionRequest,
+    ) -> ManifestRevision:
+        response = self._request(
+            "PATCH",
+            f"/v1/workspaces/{quote(workspace_id, safe='')}/entries/{quote(entry_id, safe='')}",
+            json=request.model_dump(),
+        )
+        return self._model(response, ManifestRevision)
+
+    def approve_workspace(self, workspace_id: str, revision_id: str) -> ApprovalRecord:
+        response = self._request(
+            "POST",
+            f"/v1/workspaces/{quote(workspace_id, safe='')}/approval",
+            json={"revision_id": revision_id},
+        )
+        return self._model(response, ApprovalRecord)
+
+    def delete_workspace(self, workspace_id: str) -> None:
+        self._request("DELETE", f"/v1/workspaces/{quote(workspace_id, safe='')}")
+
+    def delete_all_workspaces(self) -> None:
+        self._request("DELETE", "/v1/workspaces", json={"confirmation": "DELETE ALL"})
+
+    def get_job(self, job_id: str) -> WorkspaceJob:
+        response = self._request("GET", f"/v1/workspace-jobs/{quote(job_id, safe='')}")
+        return self._model(response, WorkspaceJob)
+
+    def workspace_events_after(self, job_id: str, after: int = 0) -> list[WorkspaceEvent]:
+        response = self._request(
+            "GET",
+            f"/v1/workspace-jobs/{quote(job_id, safe='')}/events",
+            params={"after": after},
+        )
+        return self._models(response, WorkspaceEvent)
+
+    def list_saved_providers(self) -> list[SavedProviderProfile]:
+        return self._models(self._request("GET", "/v1/providers/saved"), SavedProviderProfile)
+
+    def forget_provider_credential(self, profile_id: str) -> None:
+        self._request("DELETE", f"/v1/providers/{quote(profile_id, safe='')}/credential")
 
     def close(self) -> None:
         self._client.close()
