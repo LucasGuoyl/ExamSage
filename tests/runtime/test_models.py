@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from exam_predictor.runtime.models import (
     ConnectProviderRequest,
     EventType,
@@ -42,9 +45,37 @@ def test_submit_message_normalizes_required_fields():
     request = SubmitMessageRequest(
         thread_id=" calculus ",
         provider_profile_id=" primary ",
+        workspace_id="8d6f8d1f9ed34b3f9228dcd3cb6290c4",
         message=" Explain limits. ",
     )
     assert request.thread_id == "calculus"
     assert request.provider_profile_id == "primary"
+    assert request.workspace_id == "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
     assert request.message == "Explain limits."
     assert EventType.TOOL_STARTED.value == "tool_started"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"thread_id": ""},
+        {"thread_id": "t" * 129},
+        {"provider_profile_id": ""},
+        {"provider_profile_id": "p" * 65},
+        {"workspace_id": "w" * 31},
+        {"workspace_id": "w" * 37},
+        {"message": ""},
+        {"message": "m" * 20_001},
+    ],
+)
+def test_submit_message_enforces_bounded_runtime_fields(updates: dict[str, str]):
+    values = {
+        "thread_id": "calculus",
+        "provider_profile_id": "primary",
+        "workspace_id": None,
+        "message": "Explain limits.",
+    }
+    values.update(updates)
+
+    with pytest.raises(ValidationError):
+        SubmitMessageRequest(**values)

@@ -291,6 +291,44 @@ def test_checkpoint_state_is_json_safe_and_contains_no_runtime_secrets(tmp_path:
     )
 
 
+def test_workspace_id_survives_real_checkpoint_and_durable_resume(tmp_path: Path):
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    config = {"configurable": {"thread_id": f"workspace:{workspace_id}"}}
+    initial_controls = RunControlRegistry()
+    initial_controls.request_stop("workspace-run")
+
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        graph = build_kernel_graph(dependencies([], initial_controls), saver)
+        paused = graph.invoke(
+            {
+                "run_id": "workspace-run",
+                "provider_profile_id": "primary",
+                "workspace_id": workspace_id,
+                "user_message": "Review my sources.",
+                "messages": [{"role": "user", "content": "Review my sources."}],
+            },
+            config,
+        )
+        assert paused["__interrupt__"]
+        checkpoint = saver.get_tuple(config)
+        assert checkpoint is not None
+        assert checkpoint.checkpoint["channel_values"]["workspace_id"] == workspace_id
+
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        graph = build_kernel_graph(dependencies([], RunControlRegistry()), saver)
+        resumed = graph.invoke(Command(resume={"action": "resume"}), config)
+        checkpoint = saver.get_tuple(config)
+        assert checkpoint is not None
+
+    assert resumed["workspace_id"] == workspace_id
+    values = checkpoint.checkpoint["channel_values"]
+    assert values["workspace_id"] == workspace_id
+    serialized = json.dumps(values, ensure_ascii=False, sort_keys=True)
+    assert workspace_id in serialized
+    assert str(tmp_path) not in serialized
+
+
 def _walk(value):
     yield value
     if isinstance(value, dict):

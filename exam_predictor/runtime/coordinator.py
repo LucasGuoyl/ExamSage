@@ -12,6 +12,8 @@ from langgraph.types import Command
 
 from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
+from exam_predictor.workspace.models import WorkspaceState
+from exam_predictor.workspace.transmission import SourceAuthorizationError
 
 from .control import RunControlRegistry
 from .credential_vault import CredentialVault, VaultUnavailableError
@@ -45,12 +47,14 @@ class RuntimeCoordinator:
         checkpoints_path: str | Path,
         graph_factory: Callable[..., Any] = build_kernel_graph,
         vault: CredentialVault | None = None,
+        workspace_repository: Any | None = None,
     ):
         self.store = store
         self.provider_sessions = provider_sessions
         self.checkpoints_path = Path(checkpoints_path)
         self.graph_factory = graph_factory
         self.vault = vault
+        self.workspace_repository = workspace_repository
         self.controls = RunControlRegistry()
         self._commands: queue.Queue[tuple[str, str] | None] = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -90,10 +94,27 @@ class RuntimeCoordinator:
         thread_id: str,
         provider_profile_id: str,
         message: str,
+        workspace_id: str | None = None,
     ) -> RunSnapshot:
         with self._lock:
             self._ensure_accepting_commands()
             self.provider_sessions.get_provider(provider_profile_id)
+            if workspace_id is not None:
+                workspace = (
+                    None
+                    if self.workspace_repository is None
+                    else self.workspace_repository.get_workspace(workspace_id)
+                )
+                if workspace is None:
+                    raise KeyError(f"Workspace '{workspace_id}' was not found.")
+                if workspace.state in {
+                    WorkspaceState.DELETING,
+                    WorkspaceState.CLEANUP_PENDING,
+                }:
+                    raise ValueError(
+                        "Workspace cannot accept new Agent runs."
+                    ) from None
+                thread_id = f"workspace:{workspace_id}"
             active = self.store.active_run()
             queued = self.store.next_queued_run()
             status = RunStatus.QUEUED if active or queued else RunStatus.RUNNING
@@ -102,6 +123,7 @@ class RuntimeCoordinator:
                 provider_profile_id,
                 message,
                 status,
+                workspace_id=workspace_id,
             )
             event_type = EventType.QUEUED if status is RunStatus.QUEUED else EventType.STARTED
             text = (
@@ -115,6 +137,28 @@ class RuntimeCoordinator:
             elif active is None:
                 self._start_next()
             return run
+
+    def has_unsettled_runs(self, workspace_id: str) -> bool:
+        with self._lock:
+            return self.store.has_unsettled_runs(workspace_id)
+
+    def delete_settled_workspace_runs(self, workspace_id: str) -> None:
+        with self._lock:
+            if self.store.has_unsettled_runs(workspace_id):
+                raise ValueError("Workspace has unsettled Agent runs.")
+            thread_ids = self.store.thread_ids_for_workspace(workspace_id)
+            checkpoint_cleanup_failed = False
+            try:
+                with SqliteSaver.from_conn_string(
+                    str(self.checkpoints_path)
+                ) as saver:
+                    for thread_id in thread_ids:
+                        saver.delete_thread(thread_id)
+            except Exception:
+                checkpoint_cleanup_failed = True
+            if checkpoint_cleanup_failed:
+                raise RuntimeError("Agent checkpoint cleanup failed.") from None
+            self.store.delete_settled_workspace_runs(workspace_id)
 
     def connect_provider(
         self,
@@ -341,6 +385,18 @@ class RuntimeCoordinator:
                 result = self._invoke_resume(graph, config, run)
             else:
                 result = graph.invoke(self._initial_state(run), config)
+        except SourceAuthorizationError as exc:
+            with self._lock:
+                self.store.set_status_and_append_event(
+                    run_id,
+                    RunStatus.PAUSED,
+                    EventType.PAUSED,
+                    "source_changed",
+                    "A course source changed. Rescan and approve it before resuming.",
+                    payload={"code": exc.code, "entry_id": exc.entry_id},
+                )
+                self.controls.discard(run_id)
+            return
         except Exception as exc:
             message = f"{type(exc).__name__}: Agent run failed."
             with self._lock:
@@ -387,6 +443,7 @@ class RuntimeCoordinator:
         return {
             "run_id": run.run_id,
             "provider_profile_id": run.provider_profile_id,
+            "workspace_id": run.workspace_id,
             "user_message": run.message,
             "messages": [{"role": "user", "content": run.message}],
         }

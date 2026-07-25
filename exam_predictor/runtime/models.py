@@ -117,9 +117,10 @@ class SavedProviderProfile(BaseModel):
 
 
 class SubmitMessageRequest(BaseModel):
-    thread_id: str
-    provider_profile_id: str
-    message: str
+    thread_id: str = Field(min_length=1, max_length=128)
+    provider_profile_id: str = Field(min_length=1, max_length=64)
+    workspace_id: str | None = Field(default=None, min_length=32, max_length=36)
+    message: str = Field(min_length=1, max_length=20_000)
 
     @field_validator("thread_id", "provider_profile_id", "message")
     @classmethod
@@ -146,6 +147,7 @@ class RunSnapshot(BaseModel):
     run_id: str
     thread_id: str
     provider_profile_id: str
+    workspace_id: str | None = None
     message: str
     status: RunStatus
     error: str | None = None

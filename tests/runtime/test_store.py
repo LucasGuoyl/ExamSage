@@ -376,7 +376,172 @@ def test_store_indexes_match_global_queue_and_event_cursor_queries(tmp_path: Pat
         }
 
     assert ("status", "created_at") in run_indexes.values()
+    assert ("workspace_id", "status", "created_at") in run_indexes.values()
+    assert ("workspace_id", "thread_id") in run_indexes.values()
     assert ("run_id", "sequence") in event_indexes.values()
+
+
+def test_existing_agent_runs_table_migrates_additively_and_preserves_rows(
+    tmp_path: Path,
+):
+    path = tmp_path / "runtime.sqlite3"
+    timestamp = "2026-07-21T12:00:00+00:00"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE agent_runs (
+              run_id TEXT PRIMARY KEY,
+              thread_id TEXT NOT NULL,
+              provider_profile_id TEXT NOT NULL,
+              message TEXT NOT NULL,
+              status TEXT NOT NULL,
+              error TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            """INSERT INTO agent_runs(
+                   run_id, thread_id, provider_profile_id, message,
+                   status, error, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)""",
+            (
+                "legacy-run",
+                "legacy-thread",
+                "primary",
+                "Legacy message",
+                RunStatus.COMPLETED.value,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    store = RuntimeStore(path)
+
+    assert store.get_run("legacy-run").workspace_id is None
+    with store._connection() as connection:
+        columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(agent_runs)")
+        }
+    assert "workspace_id" in columns
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (RunStatus.QUEUED, True),
+        (RunStatus.RUNNING, True),
+        (RunStatus.STOPPING, True),
+        (RunStatus.PAUSED, True),
+        (RunStatus.COMPLETED, False),
+        (RunStatus.FAILED, False),
+    ],
+)
+def test_workspace_run_guard_classifies_unsettled_statuses(
+    tmp_path: Path,
+    status: RunStatus,
+    expected: bool,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    run = store.create_run(
+        thread_id=f"workspace:{workspace_id}",
+        provider_profile_id="primary",
+        workspace_id=workspace_id,
+        message="Review my sources",
+        status=status,
+    )
+
+    assert store.has_unsettled_runs(workspace_id) is expected
+    assert store.thread_ids_for_workspace(workspace_id) == (run.thread_id,)
+
+
+def test_workspace_run_thread_cannot_be_associated_with_another_workspace(
+    tmp_path: Path,
+):
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+
+    with pytest.raises(ValueError, match="checkpoint thread"):
+        store.create_run(
+            thread_id="workspace:8d6f8d1f9ed34b3f9228dcd3cb6290c4",
+            provider_profile_id="primary",
+            workspace_id="f31dc0ae239d4055bd18abb20d96cf7f",
+            message="Review my sources",
+            status=RunStatus.COMPLETED,
+        )
+
+
+def test_deleting_settled_workspace_runs_cascades_events_and_preserves_legacy_runs(
+    tmp_path: Path,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    completed = store.create_run(
+        thread_id=f"workspace:{workspace_id}",
+        provider_profile_id="primary",
+        workspace_id=workspace_id,
+        message="Review my sources",
+        status=RunStatus.COMPLETED,
+    )
+    failed = store.create_run(
+        thread_id=f"workspace:{workspace_id}",
+        provider_profile_id="primary",
+        workspace_id=workspace_id,
+        message="Try again",
+        status=RunStatus.FAILED,
+    )
+    legacy = store.create_run(
+        "legacy-thread",
+        "primary",
+        "Legacy message",
+        RunStatus.COMPLETED,
+    )
+    for run in (completed, failed, legacy):
+        store.append_event(run.run_id, EventType.COMPLETED, "complete", "Done")
+
+    store.delete_settled_workspace_runs(workspace_id)
+
+    for run in (completed, failed):
+        with pytest.raises(KeyError):
+            store.get_run(run.run_id)
+    assert store.get_run(legacy.run_id) == legacy
+    assert store.list_events(legacy.run_id)[0].message == "Done"
+    with store._connection() as connection:
+        workspace_event_count = connection.execute(
+            """SELECT COUNT(*)
+               FROM agent_events
+               WHERE run_id IN (?, ?)""",
+            (completed.run_id, failed.run_id),
+        ).fetchone()[0]
+    assert workspace_event_count == 0
+
+
+def test_workspace_run_deletion_rejects_unsettled_rows_without_partial_deletion(
+    tmp_path: Path,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    settled = store.create_run(
+        f"workspace:{workspace_id}",
+        "primary",
+        "Done",
+        RunStatus.COMPLETED,
+        workspace_id=workspace_id,
+    )
+    unsettled = store.create_run(
+        f"workspace:{workspace_id}",
+        "primary",
+        "Paused",
+        RunStatus.PAUSED,
+        workspace_id=workspace_id,
+    )
+
+    with pytest.raises(ValueError, match="unsettled"):
+        store.delete_settled_workspace_runs(workspace_id)
+
+    assert store.get_run(settled.run_id) == settled
+    assert store.get_run(unsettled.run_id) == unsettled
 
 
 def test_event_payload_round_trips_json_safely(tmp_path: Path):

@@ -25,6 +25,8 @@ from exam_predictor.runtime.models import (
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.runtime.store import RuntimeStore
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
+from exam_predictor.workspace.models import WorkspaceState
+from exam_predictor.workspace.transmission import SourceAuthorizationError
 
 
 def wait_for_status(store: RuntimeStore, run_id: str, status: RunStatus) -> None:
@@ -54,6 +56,7 @@ class GraphHarness:
         self.initial_calls = 0
         self.resume_calls = 0
         self.configs: list[dict] = []
+        self.initial_values: list[dict] = []
         self.run_id: str | None = None
 
     def factory(self, dependencies, saver):
@@ -74,6 +77,7 @@ class GraphHarness:
                     )
                     return {"assistant_message": "resumed answer"}
                 harness.initial_calls += 1
+                harness.initial_values.append(dict(value))
                 harness.run_id = value["run_id"]
                 if harness.initial_calls == 1:
                     harness.first_started.set()
@@ -1220,6 +1224,227 @@ def test_failed_run_is_safe_and_starts_next_queued_run(tmp_path: Path):
         assert secret.encode() not in (tmp_path / "runtime.sqlite3").read_bytes()
         assert harness.initial_calls == 2
     finally:
+        runtime.shutdown()
+
+
+def test_workspace_submission_derives_owned_checkpoint_thread_and_json_safe_state(
+    tmp_path: Path,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    repository = SimpleNamespace(
+        get_workspace=lambda candidate: (
+            SimpleNamespace(state=WorkspaceState.APPROVED)
+            if candidate == workspace_id
+            else None
+        )
+    )
+    harness = GraphHarness()
+    harness.release_first.set()
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=registry(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        graph_factory=harness.factory,
+        workspace_repository=repository,
+    )
+
+    runtime.start()
+    try:
+        run = runtime.submit_message(
+            "client-supplied-thread",
+            "primary",
+            "Review my sources",
+            workspace_id=workspace_id,
+        )
+        wait_for_status(store, run.run_id, RunStatus.COMPLETED)
+
+        assert run.thread_id == f"workspace:{workspace_id}"
+        assert run.workspace_id == workspace_id
+        assert harness.configs == [
+            {"configurable": {"thread_id": f"workspace:{workspace_id}"}}
+        ]
+        assert harness.initial_values[0]["workspace_id"] == workspace_id
+        serialized_state = json.dumps(harness.initial_values[0])
+        assert workspace_id in serialized_state
+        assert str(tmp_path) not in serialized_state
+    finally:
+        runtime.shutdown()
+
+
+def test_workspace_submission_requires_repository_to_find_workspace(tmp_path: Path):
+    runtime = RuntimeCoordinator(
+        store=RuntimeStore(tmp_path / "runtime.sqlite3"),
+        provider_sessions=registry(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        workspace_repository=SimpleNamespace(get_workspace=lambda _workspace_id: None),
+    )
+
+    with pytest.raises(KeyError, match="Workspace"):
+        runtime.submit_message(
+            "client-thread",
+            "primary",
+            "Review my sources",
+            workspace_id="8d6f8d1f9ed34b3f9228dcd3cb6290c4",
+        )
+
+
+@pytest.mark.parametrize(
+    "workspace_state",
+    [WorkspaceState.DELETING, WorkspaceState.CLEANUP_PENDING],
+)
+def test_workspace_submission_cannot_recreate_run_during_deletion(
+    tmp_path: Path,
+    workspace_state: WorkspaceState,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=registry(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        workspace_repository=SimpleNamespace(
+            get_workspace=lambda _workspace_id: SimpleNamespace(
+                state=workspace_state
+            )
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^Workspace cannot accept new Agent runs\\.$",
+    ) as captured:
+        runtime.submit_message(
+            "client-thread",
+            "primary",
+            "Review my sources",
+            workspace_id=workspace_id,
+        )
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert store.list_by_status(set(RunStatus)) == []
+
+
+def test_coordinator_workspace_cleanup_deletes_owned_checkpoints_then_run_metadata(
+    tmp_path: Path,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    workspace_thread = f"workspace:{workspace_id}"
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    associated = store.create_run(
+        workspace_thread,
+        "primary",
+        "Review",
+        RunStatus.COMPLETED,
+        workspace_id=workspace_id,
+    )
+    legacy = store.create_run(
+        "legacy-thread",
+        "primary",
+        "Legacy",
+        RunStatus.COMPLETED,
+    )
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        saver.setup()
+        for thread_id in (workspace_thread, legacy.thread_id):
+            saver.conn.execute(
+                """INSERT INTO checkpoints(
+                       thread_id, checkpoint_ns, checkpoint_id, checkpoint, metadata
+                   ) VALUES (?, '', 'checkpoint-1', X'01', X'01')""",
+                (thread_id,),
+            )
+        saver.conn.commit()
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=registry(),
+        checkpoints_path=checkpoint_path,
+    )
+
+    runtime.delete_settled_workspace_runs(workspace_id)
+
+    with pytest.raises(KeyError):
+        store.get_run(associated.run_id)
+    assert store.get_run(legacy.run_id) == legacy
+    with sqlite3.connect(checkpoint_path) as connection:
+        remaining_threads = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT thread_id FROM checkpoints ORDER BY thread_id"
+            )
+        )
+    assert remaining_threads == ("legacy-thread",)
+
+
+def test_checkpoint_cleanup_failure_preserves_workspace_run_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    run = store.create_run(
+        f"workspace:{workspace_id}",
+        "primary",
+        "Review",
+        RunStatus.COMPLETED,
+        workspace_id=workspace_id,
+    )
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=registry(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+    )
+
+    def fail_checkpoint_open(_path):
+        raise OSError("C:/private/checkpoint-secret")
+
+    monkeypatch.setattr(SqliteSaver, "from_conn_string", fail_checkpoint_open)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^Agent checkpoint cleanup failed\\.$",
+    ) as captured:
+        runtime.delete_settled_workspace_runs(workspace_id)
+
+    assert store.get_run(run.run_id) == run
+    assert "private" not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_source_authorization_failure_pauses_safely_without_starting_queued_work(
+    tmp_path: Path,
+):
+    error = SourceAuthorizationError(
+        "approved_source_changed",
+        "8d6f8d1f9ed34b3f9228dcd3cb6290c4",
+        "entry-7",
+    )
+    harness = GraphHarness(fail_first=error)
+    store, runtime = runtime_for(tmp_path, harness)
+    runtime.start()
+    try:
+        run = runtime.submit_message("course-1", "primary", "Review")
+        assert harness.first_started.wait(timeout=2)
+        queued = runtime.submit_message("course-2", "primary", "Wait")
+        harness.release_first.set()
+        wait_for_status(store, run.run_id, RunStatus.PAUSED)
+
+        paused_event = store.list_events(run.run_id)[-1]
+        assert paused_event.event_type is EventType.PAUSED
+        assert paused_event.stage == "source_changed"
+        assert paused_event.message == (
+            "A course source changed. Rescan and approve it before resuming."
+        )
+        assert paused_event.payload == {
+            "code": "approved_source_changed",
+            "entry_id": "entry-7",
+        }
+        assert store.get_run(queued.run_id).status is RunStatus.QUEUED
+        assert not runtime.controls.is_stop_requested(run.run_id)
+    finally:
+        harness.release_first.set()
         runtime.shutdown()
 
 

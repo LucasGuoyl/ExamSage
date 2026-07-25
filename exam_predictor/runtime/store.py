@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +55,7 @@ class RuntimeStore:
                   run_id TEXT PRIMARY KEY,
                   thread_id TEXT NOT NULL,
                   provider_profile_id TEXT NOT NULL,
+                  workspace_id TEXT,
                   message TEXT NOT NULL,
                   status TEXT NOT NULL,
                   error TEXT,
@@ -86,6 +87,20 @@ class RuntimeStore:
                   updated_at TEXT NOT NULL
                 );
                 """
+            )
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(agent_runs)")
+            }
+            if "workspace_id" not in columns:
+                db.execute("ALTER TABLE agent_runs ADD COLUMN workspace_id TEXT")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_runs_workspace_status "
+                "ON agent_runs(workspace_id, status, created_at)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_runs_workspace_thread "
+                "ON agent_runs(workspace_id, thread_id)"
             )
 
     @staticmethod
@@ -183,16 +198,33 @@ class RuntimeStore:
         provider_profile_id: str,
         message: str,
         status: RunStatus,
+        workspace_id: str | None = None,
     ) -> RunSnapshot:
+        if (
+            workspace_id is not None
+            and thread_id != f"workspace:{workspace_id}"
+        ):
+            raise ValueError(
+                "Workspace checkpoint thread does not match its workspace."
+            )
         run_id = uuid.uuid4().hex
         now = self._now()
         with self._connection() as db:
             db.execute(
                 """INSERT INTO agent_runs(
-                       run_id, thread_id, provider_profile_id, message,
-                       status, error, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?)""",
-                (run_id, thread_id, provider_profile_id, message, status.value, now, now),
+                       run_id, thread_id, provider_profile_id, workspace_id,
+                       message, status, error, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+                (
+                    run_id,
+                    thread_id,
+                    provider_profile_id,
+                    workspace_id,
+                    message,
+                    status.value,
+                    now,
+                    now,
+                ),
             )
         return self.get_run(run_id)
 
@@ -321,6 +353,70 @@ class RuntimeStore:
                 values,
             ).fetchall()
         return [self._run(row) for row in rows]
+
+    def list_for_workspace(
+        self,
+        workspace_id: str,
+        *,
+        statuses: set[RunStatus] | None = None,
+    ) -> list[RunSnapshot]:
+        values = sorted(status.value for status in statuses or ())
+        status_clause = ""
+        parameters: list[str] = [workspace_id]
+        if statuses is not None:
+            if not values:
+                return []
+            placeholders = ",".join("?" for _ in values)
+            status_clause = f" AND status IN ({placeholders})"
+            parameters.extend(values)
+        with self._connection() as db:
+            rows = db.execute(
+                f"""SELECT * FROM agent_runs
+                    WHERE workspace_id = ?{status_clause}
+                    ORDER BY created_at ASC, rowid ASC""",
+                parameters,
+            ).fetchall()
+        return [self._run(row) for row in rows]
+
+    def has_unsettled_runs(self, workspace_id: str) -> bool:
+        statuses = {
+            RunStatus.QUEUED,
+            RunStatus.RUNNING,
+            RunStatus.STOPPING,
+            RunStatus.PAUSED,
+        }
+        return bool(self.list_for_workspace(workspace_id, statuses=statuses))
+
+    def thread_ids_for_workspace(self, workspace_id: str) -> Sequence[str]:
+        """Return distinct checkpoint thread IDs in stable order."""
+        with self._connection() as db:
+            rows = db.execute(
+                """SELECT thread_id
+                   FROM agent_runs
+                   WHERE workspace_id = ?
+                   GROUP BY thread_id
+                   ORDER BY MIN(created_at) ASC, MIN(rowid) ASC""",
+                (workspace_id,),
+            ).fetchall()
+        return tuple(str(row["thread_id"]) for row in rows)
+
+    def delete_settled_workspace_runs(self, workspace_id: str) -> None:
+        """Raise on an unsettled run, otherwise delete linked run/event rows atomically."""
+        settled = (RunStatus.COMPLETED.value, RunStatus.FAILED.value)
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            unsettled = db.execute(
+                """SELECT 1 FROM agent_runs
+                   WHERE workspace_id = ? AND status NOT IN (?, ?)
+                   LIMIT 1""",
+                (workspace_id, *settled),
+            ).fetchone()
+            if unsettled is not None:
+                raise ValueError("Workspace has unsettled Agent runs.")
+            db.execute(
+                "DELETE FROM agent_runs WHERE workspace_id = ?",
+                (workspace_id,),
+            )
 
     def recover_unfinished(self) -> list[str]:
         unfinished = (RunStatus.RUNNING.value, RunStatus.STOPPING.value)

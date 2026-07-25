@@ -16,6 +16,7 @@ from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
 class KernelState(TypedDict, total=False):
     run_id: str
     provider_profile_id: str
+    workspace_id: str | None
     user_message: str
     messages: Annotated[list[dict[str, str]], operator.add]
     selected_tool: str
