@@ -166,6 +166,21 @@ def provider_request(api_key: str) -> ConnectProviderRequest:
     )
 
 
+def custom_provider_request(
+    api_key: str,
+    *,
+    base_url: str,
+) -> ConnectProviderRequest:
+    return ConnectProviderRequest(
+        profile=ProviderProfile(
+            profile_id="primary",
+            provider="custom",
+            base_url=base_url,
+        ),
+        api_key=api_key,
+    )
+
+
 def credential_sessions() -> ProviderSessionRegistry:
     return ProviderSessionRegistry(
         factory=lambda config: SimpleNamespace(
@@ -380,11 +395,17 @@ def test_store_failure_after_vault_save_compensates_and_keeps_memory_only(
         vault=vault,
     )
     runtime.connect_provider(provider_request("original-secret"))
+    original_save = store.save_provider_profile
+    save_calls = 0
 
-    def fail_save(_profile):
-        raise sqlite3.OperationalError(f"database C:/private/{sentinel}")
+    def fail_final_save(profile):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise sqlite3.OperationalError(f"database C:/private/{sentinel}")
+        original_save(profile)
 
-    monkeypatch.setattr(store, "save_provider_profile", fail_save)
+    monkeypatch.setattr(store, "save_provider_profile", fail_final_save)
 
     descriptor = runtime.connect_provider(provider_request(sentinel))
 
@@ -393,13 +414,16 @@ def test_store_failure_after_vault_save_compensates_and_keeps_memory_only(
     assert sessions.get_provider("primary").identity == sentinel
     assert sessions.list_profiles() == [descriptor]
     assert vault.secrets == {}
+    guarded = store.list_saved_provider_profiles()[0]
+    assert guarded.credential_expected is False
+    assert guarded.reconnect_required is True
 
 
-def test_failed_store_and_compensation_disconnects_and_blocks_stale_restore(
+def test_guard_failure_never_overwrites_existing_vault_secret(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    sentinel = "unsafe-replacement-secret"
+    sentinel = "guard-failure-new-secret"
     vault = FakeVault()
     sessions = credential_sessions()
     store = RuntimeStore(tmp_path / "runtime.sqlite3")
@@ -409,27 +433,131 @@ def test_failed_store_and_compensation_disconnects_and_blocks_stale_restore(
         checkpoints_path=tmp_path / "checkpoints.sqlite3",
         vault=vault,
     )
-    runtime.connect_provider(provider_request("original-secret"))
-    vault.fail_delete = True
+    runtime.connect_provider(
+        custom_provider_request(
+            "original-secret",
+            base_url="https://old.example/v1",
+        )
+    )
+    vault.calls.clear()
 
-    def fail_save(_profile):
+    def fail_guard(_profile):
         raise sqlite3.OperationalError(f"database C:/private/{sentinel}")
 
-    monkeypatch.setattr(store, "save_provider_profile", fail_save)
+    monkeypatch.setattr(store, "save_provider_profile", fail_guard)
 
     with pytest.raises(
         RuntimeError,
-        match="^Provider credential state could not be persisted safely\\.$",
+        match="^Provider credential state could not be prepared safely\\.$",
     ) as captured:
-        runtime.connect_provider(provider_request(sentinel))
+        runtime.connect_provider(
+            custom_provider_request(
+                sentinel,
+                base_url="https://new.example/v1",
+            )
+        )
 
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
     assert sentinel not in str(captured.value)
     assert sessions.has_provider("primary") is False
+    assert vault.calls == []
+    assert vault.secrets == {"primary": "original-secret"}
     saved = store.list_saved_provider_profiles()[0]
-    assert saved.credential_expected is False
-    assert saved.reconnect_required is True
+    assert saved.profile.base_url == "https://old.example/v1"
+    assert saved.credential_expected is True
+
+
+def test_three_failures_never_restore_new_secret_with_old_custom_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sentinel = "three-failure-new-secret"
+    vault = FakeVault()
+    initial_endpoints: list[str] = []
+
+    def initial_factory(config):
+        initial_endpoints.append(config["base_url"])
+        return SimpleNamespace(
+            identity=config["api_key"],
+            name="fake",
+            capabilities=SimpleNamespace(chat=True),
+        )
+
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    sessions = ProviderSessionRegistry(factory=initial_factory)
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        vault=vault,
+    )
+    runtime.connect_provider(
+        custom_provider_request(
+            "old-secret",
+            base_url="https://old.example/v1",
+        )
+    )
+    original_save = store.save_provider_profile
+    save_calls = 0
+
+    def fail_final_save(profile):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise sqlite3.OperationalError(f"finalize C:/private/{sentinel}")
+        original_save(profile)
+
+    monkeypatch.setattr(store, "save_provider_profile", fail_final_save)
+    monkeypatch.setattr(
+        store,
+        "mark_provider_reconnect_required",
+        lambda _profile_id: (_ for _ in ()).throw(
+            sqlite3.OperationalError(f"marker C:/private/{sentinel}")
+        ),
+    )
+    vault.fail_delete = True
+
+    with pytest.raises(
+        RuntimeError,
+        match="^Provider credential state could not be persisted safely\\.$",
+    ) as captured:
+        runtime.connect_provider(
+            custom_provider_request(
+                sentinel,
+                base_url="https://new.example/v1",
+            )
+        )
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert sentinel not in str(captured.value)
+    assert sessions.has_provider("primary") is False
+    guarded = store.list_saved_provider_profiles()[0]
+    assert guarded.profile.base_url == "https://new.example/v1"
+    assert guarded.credential_expected is False
+    assert guarded.reconnect_required is True
+
+    restored_endpoints: list[str] = []
+    restored = RuntimeCoordinator(
+        store=RuntimeStore(store.db_path),
+        provider_sessions=ProviderSessionRegistry(
+            factory=lambda config: restored_endpoints.append(config["base_url"])
+            or SimpleNamespace(
+                name="fake",
+                capabilities=SimpleNamespace(chat=True),
+            )
+        ),
+        checkpoints_path=tmp_path / "restored-checkpoints.sqlite3",
+        vault=vault,
+    )
+    vault.calls.clear()
+    restored.start()
+    try:
+        assert restored_endpoints == []
+        assert vault.calls == []
+    finally:
+        restored.shutdown()
 
 
 @pytest.mark.parametrize("vault_unavailable", [False, True])
