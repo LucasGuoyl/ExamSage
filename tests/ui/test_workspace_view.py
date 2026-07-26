@@ -331,6 +331,16 @@ render_workspace_panel(WidgetClient(
 ))
 """
 
+PENDING_REASON_SCRIPT = """
+from exam_predictor.ui.workspace_view import render_workspace_panel
+from exam_predictor.workspace.models import WorkspaceState
+from tests.ui.test_workspace_view import WidgetClient, entry, page, workspace
+render_workspace_panel(WidgetClient(
+    workspace(WorkspaceState.APPROVAL_REQUIRED),
+    page(entry()),
+))
+"""
+
 
 def test_workspace_panel_uses_public_fields_and_shows_action_reason():
     app = AppTest.from_string(WIDGET_SCRIPT).run()
@@ -348,6 +358,13 @@ def test_workspace_panel_uses_public_fields_and_shows_action_reason():
     assert "C:/private/course-folder" not in visible
     assert "a" * 64 not in visible
     assert any(item.label == "Approve current draft" and item.disabled for item in app.button)
+
+
+def test_workspace_panel_gives_every_manifest_row_a_visible_reason_fallback():
+    app = AppTest.from_string(PENDING_REASON_SCRIPT).run()
+
+    assert not app.exception
+    assert app.dataframe[0].value.loc[0, "Reason"] == "pending approval"
 
 
 def test_workspace_panel_exposes_navigation_after_loading_multiple_worker_pages():

@@ -172,15 +172,17 @@ The provider still receives uploaded content and applies its own retention, abus
 |---|---|
 | Documents | PDF, DOC/DOCX, PPT/PPTX |
 | Data | XLS/XLSX, CSV, TSV, JSON, YAML |
-| Text/web | MD, TXT, HTML, HTTPS webpages via grounded research |
+| Local text/web files | MD, TXT, HTML |
 | Images | PNG, JPEG, WebP, GIF, BMP, TIFF; printed scans and handwriting |
 | Bundles | ZIP with safe extraction |
+| Deferred web research | HTTPS webpages through a later grounded-research provider tool |
 
-The secure workspace can catalog and hash the formats above, subject to the 1 GiB aggregate limit. This
-release does not yet connect workspace sources to cloud OCR, parsing, embeddings, grounded research, or
-report generation; those provider tools arrive in later subprojects. Audio, video, executables, and
-other unsupported extensions remain excluded. Legacy builds retain their existing direct-upload
-analysis behavior and provider-specific request limits.
+The secure workspace can catalog and hash the local file formats above, including local `.html` files,
+subject to the 1 GiB aggregate limit. HTTPS webpages are not workspace files; grounded web research is
+deferred to a later provider tool. This release does not yet connect workspace sources to cloud OCR,
+parsing, embeddings, grounded research, or report generation. Audio, video, executables, and other
+unsupported extensions remain excluded. Legacy builds retain their existing direct-upload analysis
+behavior and provider-specific request limits.
 
 ## Workspace troubleshooting
 

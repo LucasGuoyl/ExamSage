@@ -326,7 +326,7 @@ def _render_manifest_controls(
             "Reason": entry.safe_message
             or entry.failure_code
             or entry.inclusion_reason
-            or "",
+            or entry.state.value.replace("_", " "),
         }
         for entry in manifest.items
     ]

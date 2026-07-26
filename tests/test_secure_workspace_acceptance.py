@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import httpx
 import pytest
@@ -33,10 +34,59 @@ WORKER_TOKEN = "secure-workspace-acceptance-token"
 AUTH = {"X-ExamSage-Token": WORKER_TOKEN}
 pytestmark = pytest.mark.anyio
 
+SecretSurface = Literal[
+    "database bytes",
+    "checkpoint bytes",
+    "workspace events",
+    "HTTP responses",
+    "captured logs",
+    "exception chains",
+    "temporary artifacts",
+    "Git diff stdout",
+    "Git diff stderr",
+]
+
 
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+def _assert_secret_absent(
+    secret: str,
+    surface: SecretSurface,
+    payload: bytes | str,
+) -> None:
+    detected = (
+        secret.encode() in payload
+        if isinstance(payload, bytes)
+        else secret in payload
+    )
+    if detected:
+        pytest.fail(
+            f"Secret sentinel detected in {surface}.",
+            pytrace=False,
+        )
+
+
+def _assert_fake_vault_is_only_secret_container(
+    vault: FakeVault,
+    profile_id: str,
+    secret: str,
+) -> None:
+    if tuple(vault.secrets) != (profile_id,):
+        pytest.fail("Fake vault profile set was not the expected test container.", pytrace=False)
+    stored = vault.secrets.get(profile_id)
+    if not isinstance(stored, str) or not secrets.compare_digest(stored, secret):
+        pytest.fail("Fake vault did not retain the expected test credential.", pytrace=False)
+
+
+def _snapshot_source_files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 @dataclass
@@ -87,9 +137,15 @@ class FakeProviderFactory:
 
     def __call__(self, config: dict[str, object]) -> FakeProvider:
         supplied = config.get("api_key")
-        assert isinstance(supplied, str) and supplied
+        if not isinstance(supplied, str) or not supplied:
+            pytest.fail("Provider factory did not receive a test credential.", pytrace=False)
         if self.vault.secrets:
-            assert supplied in self.vault.secrets.values()
+            matched = any(
+                secrets.compare_digest(supplied, stored)
+                for stored in self.vault.secrets.values()
+            )
+            if not matched:
+                pytest.fail("Provider factory received an unexpected test credential.", pytrace=False)
         self.creations += 1
         return FakeProvider(self)
 
@@ -204,6 +260,20 @@ def _exception_chain(error: BaseException) -> bytes:
     return "\n".join(parts).encode()
 
 
+async def test_secret_audit_failure_message_is_fixed_and_nonrevealing() -> None:
+    test_sentinel = "focused-secret-audit-sentinel"
+    with pytest.raises(pytest.fail.Exception) as caught:
+        _assert_secret_absent(
+            test_sentinel,
+            "HTTP responses",
+            f"contaminated={test_sentinel}",
+        )
+
+    expected = "Secret sentinel detected in HTTP responses."
+    if not secrets.compare_digest(str(caught.value), expected):
+        pytest.fail("Secret audit helper did not emit its fixed category message.", pytrace=False)
+
+
 async def test_secure_course_workspace_vertical_slice(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -221,7 +291,7 @@ async def test_secure_course_workspace_vertical_slice(
     for path, content in sources.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
-    initial_bytes = {path: path.read_bytes() for path in sources}
+    initial_snapshot = _snapshot_source_files(native_root)
 
     fake_secret = f"acceptance-{secrets.token_urlsafe(32)}"
     vault = FakeVault()
@@ -295,7 +365,15 @@ async def test_secure_course_workspace_vertical_slice(
             "course/private-notes.md": ("pending_approval", True, None),
             "course/recording.mp4": ("excluded", False, "unsupported_format"),
         }
-        assert all("state" in item and "inclusion_reason" in item for item in manifest["items"])
+        visible_reasons = tuple(
+            item["safe_message"]
+            or item["failure_code"]
+            or item["inclusion_reason"]
+            or str(item["state"]).replace("_", " ")
+            for item in manifest["items"]
+        )
+        assert all(reason.strip() for reason in visible_reasons)
+        assert str(native_root) not in "\n".join(visible_reasons)
         workspace_response = await _request(
             client,
             http_bodies,
@@ -342,7 +420,9 @@ async def test_secure_course_workspace_vertical_slice(
         )
         assert approval_response.status_code == 200
         approval = approval_response.json()
-        expected_hash = hashlib.sha256(initial_bytes[native_root / "course" / "lecture.txt"]).hexdigest()
+        expected_hash = hashlib.sha256(
+            initial_snapshot["course/lecture.txt"]
+        ).hexdigest()
         assert approval["entries"] == [
             {"entry_id": lecture["entry_id"], "sha256": expected_hash}
         ]
@@ -359,6 +439,8 @@ async def test_secure_course_workspace_vertical_slice(
         assert provider_factory.source_calls == 1
 
         approved_path = native_root / "course" / "lecture.txt"
+        pre_mutation_snapshot = _snapshot_source_files(native_root)
+        assert pre_mutation_snapshot == initial_snapshot
         approved_path.write_bytes(b"mutated after exact-hash approval")
         calls_before_denial = provider_factory.source_calls
         with pytest.raises(SourceAuthorizationError) as changed:
@@ -367,9 +449,9 @@ async def test_secure_course_workspace_vertical_slice(
         assert provider_factory.source_calls == calls_before_denial
         exception_artifacts.append(_exception_chain(changed.value))
 
-        approved_path.write_bytes(initial_bytes[approved_path])
-        before_delete_bytes = {path: path.read_bytes() for path in sources}
-        assert before_delete_bytes == initial_bytes
+        approved_path.write_bytes(initial_snapshot["course/lecture.txt"])
+        pre_delete_snapshot = _snapshot_source_files(native_root)
+        assert pre_delete_snapshot == initial_snapshot
 
     restarted = _compose_worker(
         data_dir,
@@ -416,32 +498,34 @@ async def test_secure_course_workspace_vertical_slice(
         assert deleted.status_code == 204
         assert (await _request(client, http_bodies, "GET", "/v1/workspaces")).json() == []
 
-    assert {path: path.read_bytes() for path in sources} == before_delete_bytes == initial_bytes
-    assert vault.secrets == {"primary": fake_secret}
+    assert _snapshot_source_files(native_root) == pre_delete_snapshot == initial_snapshot
+    _assert_fake_vault_is_only_secret_container(vault, "primary", fake_secret)
 
     database_paths = sorted(data_dir.glob("*.sqlite3*"))
     assert data_dir / "workspace.sqlite3" in database_paths
     assert data_dir / "agent-runtime.sqlite3" in database_paths
     checkpoint_paths = sorted(data_dir.glob("agent-checkpoints.sqlite3*"))
     assert data_dir / "agent-checkpoints.sqlite3" in checkpoint_paths
-    sentinel = fake_secret.encode()
     for path in database_paths:
-        assert sentinel not in path.read_bytes()
+        _assert_secret_absent(fake_secret, "database bytes", path.read_bytes())
     for path in checkpoint_paths:
-        assert sentinel not in path.read_bytes()
-    assert all(sentinel not in payload for payload in event_artifacts)
-    assert all(sentinel not in payload for payload in http_bodies)
-    assert fake_secret not in caplog.text
-    assert all(sentinel not in payload for payload in exception_artifacts)
+        _assert_secret_absent(fake_secret, "checkpoint bytes", path.read_bytes())
+    for payload in event_artifacts:
+        _assert_secret_absent(fake_secret, "workspace events", payload)
+    for payload in http_bodies:
+        _assert_secret_absent(fake_secret, "HTTP responses", payload)
+    _assert_secret_absent(fake_secret, "captured logs", caplog.text)
+    for payload in exception_artifacts:
+        _assert_secret_absent(fake_secret, "exception chains", payload)
 
     artifact_paths = sorted(path for path in tmp_path.rglob("*") if path.is_file())
     assert artifact_paths
     for path in artifact_paths:
-        assert sentinel not in path.read_bytes()
+        _assert_secret_absent(fake_secret, "temporary artifacts", path.read_bytes())
     git_diff = subprocess.run(
         ["git", "-C", str(repository_root), "diff", "--binary", "--no-ext-diff"],
         check=True,
         capture_output=True,
     )
-    assert sentinel not in git_diff.stdout
-    assert sentinel not in git_diff.stderr
+    _assert_secret_absent(fake_secret, "Git diff stdout", git_diff.stdout)
+    _assert_secret_absent(fake_secret, "Git diff stderr", git_diff.stderr)

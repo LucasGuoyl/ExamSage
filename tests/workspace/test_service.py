@@ -184,6 +184,12 @@ def test_rescan_preserves_a_supported_source_excluded_by_the_user(
     native_root = tmp_path / "native"
     native_root.mkdir()
     (native_root / "notes.txt").write_text("notes", encoding="utf-8")
+    (native_root / "recording.mp4").write_bytes(b"unsupported recording")
+    initial_source_snapshot = {
+        path.relative_to(native_root).as_posix(): path.read_bytes()
+        for path in sorted(native_root.rglob("*"))
+        if path.is_file()
+    }
     service = _service(
         tmp_path, store, FakePicker([native_root]), FakeRunGuard()
     )
@@ -193,22 +199,36 @@ def test_rescan_preserves_a_supported_source_excluded_by_the_user(
         assert initial_job is not None
         _wait_for_job(store, initial_job.job_id)
         initial = store.get_manifest(initial_job.workspace_id)
+        notes = next(
+            entry for entry in initial.entries if entry.relative_path == "notes.txt"
+        )
         excluded = service.set_inclusion(
             initial_job.workspace_id,
             initial.revision_id,
-            initial.entries[0].entry_id,
+            notes.entry_id,
             False,
         )
-        assert excluded.entries[0].state is SourceState.EXCLUDED
-        assert excluded.entries[0].inclusion_reason == "user_excluded"
+        excluded_notes = next(
+            entry for entry in excluded.entries if entry.relative_path == "notes.txt"
+        )
+        assert excluded_notes.state is SourceState.EXCLUDED
+        assert excluded_notes.inclusion_reason == "user_excluded"
 
         rescan_job = service.rescan(initial_job.workspace_id, "rescan-1")
         _wait_for_job(store, rescan_job.job_id)
         rescanned = store.get_manifest(initial_job.workspace_id)
+        rescanned_notes = next(
+            entry for entry in rescanned.entries if entry.relative_path == "notes.txt"
+        )
 
-        assert rescanned.entries[0].state is SourceState.EXCLUDED
-        assert rescanned.entries[0].included is False
-        assert rescanned.entries[0].inclusion_reason == "user_excluded"
+        assert rescanned_notes.state is SourceState.EXCLUDED
+        assert rescanned_notes.included is False
+        assert rescanned_notes.inclusion_reason == "user_excluded"
+        assert {
+            path.relative_to(native_root).as_posix(): path.read_bytes()
+            for path in sorted(native_root.rglob("*"))
+            if path.is_file()
+        } == initial_source_snapshot
     finally:
         service.shutdown()
 
