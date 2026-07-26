@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, BinaryIO, TypeVar
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -230,17 +230,21 @@ class WorkerClient:
     def upload_directory(
         self,
         display_name: str,
-        files: Mapping[str, str | Path],
+        files: Mapping[str, str | Path | BinaryIO],
         idempotency_key: str,
     ) -> WorkspaceJob:
         with ExitStack() as stack:
-            multipart = [
-                (
-                    "files",
-                    (relative_path, stack.enter_context(Path(path).open("rb")), "application/octet-stream"),
+            multipart = []
+            for relative_path, path in files.items():
+                stream: BinaryIO
+                if isinstance(path, (str, Path)):
+                    stream = stack.enter_context(Path(path).open("rb"))
+                else:
+                    stream = path
+                    stream.seek(0)
+                multipart.append(
+                    ("files", (relative_path, stream, "application/octet-stream"))
                 )
-                for relative_path, path in files.items()
-            ]
             response = self._request(
                 "POST",
                 "/v1/workspaces/browser-snapshot",

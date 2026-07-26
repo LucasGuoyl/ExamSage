@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from io import BytesIO
 import json
 from pathlib import Path
 
@@ -459,6 +460,29 @@ def test_upload_directory_closes_opened_files_for_every_request_outcome(
 
     assert len(opened) == 1
     assert opened[0].closed
+
+
+def test_upload_directory_accepts_a_caller_owned_binary_stream_without_closing_it():
+    upload = BytesIO(b"course notes")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert b'filename="week-1/notes.pdf"' in request.content
+        assert b"course notes" in request.content
+        return httpx.Response(202, json=_workspace_job_json())
+
+    client = WorkerClient(
+        "http://127.0.0.1:8765",
+        WORKER_TOKEN,
+        transport=httpx.MockTransport(respond),
+    )
+    try:
+        assert client.upload_directory(
+            "Course", {"week-1/notes.pdf": upload}, "key-1"
+        ).job_id == "job/one"
+    finally:
+        client.close()
+
+    assert not upload.closed
 
 
 def _workspace_summary_json() -> dict[str, object]:
