@@ -24,6 +24,7 @@ from exam_predictor.workspace.models import (
     WorkspaceDetail,
     WorkspaceEvent,
     WorkspaceJob,
+    WorkspaceRecord,
     WorkspaceSummary,
 )
 from exam_predictor.workspace.service import WorkspaceOperationError
@@ -72,6 +73,28 @@ def _domain_error(error: BaseException) -> HTTPException:
 
 def _summary_counts(entries: Sequence[ManifestEntry]) -> dict[SourceState, int]:
     return dict(Counter(entry.state for entry in entries))
+
+
+def _workspace_summary(
+    dependencies: WorkspaceRouterDependencies,
+    workspace: WorkspaceRecord | WorkspaceSummary,
+) -> WorkspaceSummary:
+    if isinstance(workspace, WorkspaceSummary):
+        return workspace
+    try:
+        entries = dependencies.workspace_store.get_manifest_entries(
+            workspace.workspace_id
+        )
+    except (WorkspaceNotFoundError, ManifestNotFoundError):
+        entries = ()
+    return WorkspaceSummary(
+        workspace_id=workspace.workspace_id,
+        display_name=workspace.display_name,
+        source_mode=workspace.source_mode,
+        state=workspace.state,
+        counts=_summary_counts(entries),
+        updated_at=workspace.updated_at,
+    )
 
 
 def _workspace_detail(dependencies: WorkspaceRouterDependencies, workspace_id: str) -> WorkspaceDetail:
@@ -135,7 +158,10 @@ def build_workspace_router(dependencies: WorkspaceRouterDependencies) -> APIRout
 
     @router.get("/workspaces", response_model=list[WorkspaceSummary])
     def list_workspaces() -> Sequence[WorkspaceSummary]:
-        return dependencies.workspace_store.list_workspaces()
+        return tuple(
+            _workspace_summary(dependencies, workspace)
+            for workspace in dependencies.workspace_store.list_workspaces()
+        )
 
     @router.get("/workspaces/{workspace_id}", response_model=WorkspaceDetail)
     def get_workspace(workspace_id: str) -> WorkspaceDetail:
