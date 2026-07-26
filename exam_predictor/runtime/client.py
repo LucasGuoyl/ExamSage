@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, BinaryIO, TypeVar
+from typing import Any, BinaryIO, Protocol, TypeVar
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -38,6 +38,16 @@ _SAFE_URL_ERROR = "The Agent Worker URL must be http://127.0.0.1:<port>."
 
 class WorkerClientError(RuntimeError):
     """A secret-safe failure while communicating with the local Agent Worker."""
+
+
+class SeekableBinaryStream(Protocol):
+    """Caller-owned upload stream whose cursor can be restored after use."""
+
+    def read(self, size: int = -1) -> bytes: ...
+
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+
+    def tell(self) -> int: ...
 
 
 class WorkerClient:
@@ -230,18 +240,37 @@ class WorkerClient:
     def upload_directory(
         self,
         display_name: str,
-        files: Mapping[str, str | Path | BinaryIO],
+        files: Mapping[str, str | Path | SeekableBinaryStream],
         idempotency_key: str,
     ) -> WorkspaceJob:
         with ExitStack() as stack:
             multipart = []
             for relative_path, path in files.items():
-                stream: BinaryIO
+                stream: BinaryIO | SeekableBinaryStream
                 if isinstance(path, (str, Path)):
                     stream = stack.enter_context(Path(path).open("rb"))
                 else:
                     stream = path
-                    stream.seek(0)
+                    try:
+                        original_position = stream.tell()
+                        stream.seek(0)
+                    except (AttributeError, OSError, TypeError, ValueError):
+                        raise WorkerClientError(
+                            "Caller-owned upload streams must be seekable."
+                        ) from None
+
+                    def restore_cursor(
+                        upload: SeekableBinaryStream = stream,
+                        position: int = original_position,
+                    ) -> None:
+                        try:
+                            upload.seek(position)
+                        except (AttributeError, OSError, TypeError, ValueError):
+                            raise WorkerClientError(
+                                "The caller-owned upload stream cursor could not be restored."
+                            ) from None
+
+                    stack.callback(restore_cursor)
                 multipart.append(
                     ("files", (relative_path, stream, "application/octet-stream"))
                 )

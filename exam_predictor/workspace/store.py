@@ -56,6 +56,10 @@ class InvalidApprovalError(ValueError):
     pass
 
 
+class TransmissionAuthorityRevokedError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class CreationRequest:
     idempotency_key: str
@@ -64,6 +68,13 @@ class CreationRequest:
     workspace_id: str
     job_id: str | None = None
     safe_error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class TransmissionAuthoritySnapshot:
+    workspace: WorkspaceRecord
+    approval: ApprovalRecord | None
+    revision: ManifestRevision | None
 
 
 _SCHEMA = (
@@ -1265,6 +1276,85 @@ class WorkspaceStore:
                 (workspace_id, workspace["current_approved_revision_id"]),
             ).fetchone()
         return self._approval(row) if row is not None else None
+
+    def transmission_authority_snapshot(
+        self,
+        workspace_id: str,
+    ) -> TransmissionAuthoritySnapshot | None:
+        """Load workspace state, current approval, and its revision atomically."""
+        with self._transaction() as connection:
+            return self._transmission_authority_snapshot(connection, workspace_id)
+
+    @contextmanager
+    def hold_transmission_authority(
+        self,
+        workspace_id: str,
+        *,
+        approval_id: str,
+        revision_id: str,
+        verified_at: datetime | None = None,
+    ) -> Iterator[TransmissionAuthoritySnapshot]:
+        """Hold current approval authority stable through a bounded source read."""
+        with self._transaction() as connection:
+            snapshot = self._transmission_authority_snapshot(
+                connection,
+                workspace_id,
+            )
+            if (
+                snapshot is None
+                or snapshot.approval is None
+                or snapshot.revision is None
+                or snapshot.workspace.state is not WorkspaceState.APPROVED
+                or snapshot.workspace.current_draft_revision_id != revision_id
+                or snapshot.workspace.current_approved_revision_id != revision_id
+                or snapshot.approval.approval_id != approval_id
+                or snapshot.approval.revision_id != revision_id
+                or snapshot.revision.revision_id != revision_id
+            ):
+                raise TransmissionAuthorityRevokedError(
+                    "Workspace source approval is no longer current."
+                )
+            if verified_at is not None:
+                connection.execute(
+                    """UPDATE workspaces
+                       SET last_access_verified_at = ?, updated_at = ?
+                       WHERE workspace_id = ?""",
+                    (
+                        self._timestamp(verified_at),
+                        self._timestamp(verified_at),
+                        workspace_id,
+                    ),
+                )
+            yield snapshot
+
+    def _transmission_authority_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        workspace_id: str,
+    ) -> TransmissionAuthoritySnapshot | None:
+        workspace_row = connection.execute(
+            "SELECT * FROM workspaces WHERE workspace_id = ?",
+            (workspace_id,),
+        ).fetchone()
+        if workspace_row is None:
+            return None
+        workspace = self._workspace(workspace_row)
+        revision_id = workspace.current_approved_revision_id
+        if revision_id is None:
+            return TransmissionAuthoritySnapshot(workspace, None, None)
+        approval_row = connection.execute(
+            """SELECT * FROM approvals
+               WHERE workspace_id = ? AND revision_id = ?
+               ORDER BY approved_at DESC, rowid DESC LIMIT 1""",
+            (workspace_id, revision_id),
+        ).fetchone()
+        if approval_row is None:
+            return TransmissionAuthoritySnapshot(workspace, None, None)
+        return TransmissionAuthoritySnapshot(
+            workspace=workspace,
+            approval=self._approval(approval_row),
+            revision=self._revision(connection, workspace_id, revision_id),
+        )
 
     def create_job(self, job: WorkspaceJob, idempotency_key: str) -> WorkspaceJob:
         try:

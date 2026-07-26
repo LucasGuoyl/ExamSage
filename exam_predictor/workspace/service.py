@@ -23,6 +23,7 @@ from exam_predictor.workspace.models import (
     ManifestEntry,
     ManifestRevision,
     SourceMode,
+    SourceState,
     WorkspaceJob,
     WorkspaceJobStatus,
     WorkspaceRecord,
@@ -308,12 +309,49 @@ class WorkspaceService:
                     raise WorkspaceOperationError("manifest_not_found") from None
             entry_ids = (entry_id,)
             if subtree:
-                prefix = f"{target.relative_path.rstrip('/')}/"
+                source_target = target
+                if target.archive_parent_entry_id is not None:
+                    source_target = next(
+                        (
+                            entry
+                            for entry in revision.entries
+                            if entry.entry_id == target.archive_parent_entry_id
+                        ),
+                        target,
+                    )
+                relative_prefix = (
+                    source_target.relative_path.rstrip("/")
+                    if source_target.item_kind == "folder"
+                    else source_target.relative_path.rpartition("/")[0]
+                )
+
+                def belongs_to_subtree(entry: ManifestEntry) -> bool:
+                    if entry.archive_parent_entry_id is not None:
+                        return False
+                    if not relative_prefix:
+                        return True
+                    return (
+                        entry.relative_path == relative_prefix
+                        or entry.relative_path.startswith(f"{relative_prefix}/")
+                    )
+
+                def can_set_inclusion(entry: ManifestEntry) -> bool:
+                    if entry.state in {
+                        SourceState.PENDING_APPROVAL,
+                        SourceState.APPROVED,
+                        SourceState.CHANGED,
+                    }:
+                        return not included or entry.sha256 is not None
+                    return (
+                        entry.state is SourceState.EXCLUDED
+                        and entry.inclusion_reason == "user_excluded"
+                        and (not included or entry.sha256 is not None)
+                    )
+
                 entry_ids = tuple(
                     entry.entry_id
                     for entry in revision.entries
-                    if entry.entry_id == entry_id
-                    or entry.relative_path.startswith(prefix)
+                    if belongs_to_subtree(entry) and can_set_inclusion(entry)
                 )
             try:
                 return self._store.set_inclusion(

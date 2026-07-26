@@ -673,7 +673,15 @@ class WorkspaceScanner:
         if format_category is None:
             return self._excluded_entry(base, "unsupported_format"), (), 0, 0
 
-        if selected_bytes + metadata.st_size > self._policy.max_workspace_bytes:
+        preserve_user_exclusion = (
+            previous is not None
+            and previous.state is SourceState.EXCLUDED
+            and previous.inclusion_reason == "user_excluded"
+        )
+        if (
+            not preserve_user_exclusion
+            and selected_bytes + metadata.st_size > self._policy.max_workspace_bytes
+        ):
             return self._failed_entry(base, SOURCE_WORKSPACE_SIZE_LIMIT), (), 0, 0
 
         if (
@@ -713,7 +721,10 @@ class WorkspaceScanner:
             return self._failed_entry(base, outcome.failure_code), (), outcome.bytes_hashed, 0
         base.update(_metadata_fields(outcome.stat_result))
         actual_size = outcome.stat_result.st_size if outcome.stat_result is not None else 0
-        if selected_bytes + actual_size > self._policy.max_workspace_bytes:
+        if (
+            not preserve_user_exclusion
+            and selected_bytes + actual_size > self._policy.max_workspace_bytes
+        ):
             return (
                 self._failed_entry(base, SOURCE_WORKSPACE_SIZE_LIMIT),
                 (),
@@ -733,10 +744,7 @@ class WorkspaceScanner:
                 )
             elif previous.state is SourceState.CHANGED:
                 state = SourceState.CHANGED
-            elif (
-                previous.state is SourceState.EXCLUDED
-                and previous.inclusion_reason == "user_excluded"
-            ):
+            elif preserve_user_exclusion:
                 state = SourceState.EXCLUDED
                 included = False
                 inclusion_reason = "user_excluded"
@@ -750,7 +758,7 @@ class WorkspaceScanner:
             ),
             outcome.archive_members,
             outcome.bytes_hashed,
-            actual_size,
+            0 if preserve_user_exclusion else actual_size,
         )
 
     def _read(

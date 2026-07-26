@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
@@ -496,6 +496,141 @@ def test_two_racing_consumers_have_exactly_one_success(
     assert outcomes.count("read_token_invalid") == 1
 
 
+def test_concurrent_exclusion_before_token_publication_revokes_authority(
+    store: WorkspaceStore,
+    tmp_path: Path,
+):
+    _, entry_ids = _approved_workspace(store, tmp_path)
+    entry_id = entry_ids[0]
+    gate = WorkspaceTransmissionGate(store)
+    original_revalidate = gate._scanner.revalidate_entries
+    barrier = Barrier(2)
+
+    def pause_after_file_validation(*args, **kwargs):
+        result = original_revalidate(*args, **kwargs)
+        barrier.wait()
+        barrier.wait()
+        return result
+
+    gate._scanner.revalidate_entries = pause_after_file_validation
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        authorization = executor.submit(gate.authorize, "workspace-1", [entry_id])
+        barrier.wait()
+        current = store.get_manifest("workspace-1")
+        store.set_inclusion(
+            "workspace-1",
+            current.revision_id,
+            (entry_id,),
+            False,
+        )
+        barrier.wait()
+
+        with pytest.raises(SourceAuthorizationError) as caught:
+            authorization.result()
+
+    assert caught.value.code == "source_approval_revoked"
+    assert gate._read_grants == {}
+
+
+def test_open_approved_rejects_a_token_after_its_revision_is_excluded(
+    store: WorkspaceStore,
+    tmp_path: Path,
+):
+    _, entry_ids = _approved_workspace(store, tmp_path)
+    entry_id = entry_ids[0]
+    gate = WorkspaceTransmissionGate(store)
+    descriptor = gate.authorize("workspace-1", [entry_id])[0]
+    current = store.get_manifest("workspace-1")
+    store.set_inclusion(
+        "workspace-1",
+        current.revision_id,
+        (entry_id,),
+        False,
+    )
+
+    with pytest.raises(SourceAuthorizationError) as caught:
+        with gate.open_approved(descriptor.read_token):
+            pass
+
+    assert caught.value.code == "source_approval_revoked"
+    assert gate._read_grants == {}
+
+
+def test_open_approved_rejects_a_token_after_a_new_scan_revision(
+    store: WorkspaceStore,
+    tmp_path: Path,
+):
+    root, entry_ids = _approved_workspace(store, tmp_path)
+    entry_id = entry_ids[0]
+    gate = WorkspaceTransmissionGate(store)
+    descriptor = gate.authorize("workspace-1", [entry_id])[0]
+    execution = WorkspaceScanner().scan_with_identity(
+        "workspace-1",
+        root,
+        previous_entries=store.get_manifest_entries("workspace-1"),
+    )
+    job = WorkspaceJob(
+        job_id="rescan-workspace-1",
+        workspace_id="workspace-1",
+        job_kind="scan",
+        status=WorkspaceJobStatus.QUEUED,
+        idempotency_key="rescan-request",
+        created_at=datetime.now(UTC),
+    )
+    store.create_job(job, job.idempotency_key)
+    store.start_job(job.job_id)
+    store.commit_scan("workspace-1", execution.result, job.job_id)
+
+    with pytest.raises(SourceAuthorizationError) as caught:
+        with gate.open_approved(descriptor.read_token):
+            pass
+
+    assert caught.value.code == "source_approval_revoked"
+
+
+def test_consent_mutation_waits_until_the_approved_read_context_closes(
+    store: WorkspaceStore,
+    tmp_path: Path,
+):
+    _, entry_ids = _approved_workspace(store, tmp_path)
+    entry_id = entry_ids[0]
+    revision_id = store.get_manifest("workspace-1").revision_id
+    gate = WorkspaceTransmissionGate(store)
+    descriptor = gate.authorize("workspace-1", [entry_id])[0]
+    reading = Event()
+    release_read = Event()
+    mutation_started = Event()
+    mutation_finished = Event()
+
+    def consume() -> bytes:
+        with gate.open_approved(descriptor.read_token) as source:
+            reading.set()
+            assert release_read.wait(timeout=2)
+            return source.read()
+
+    def exclude() -> None:
+        mutation_started.set()
+        store.set_inclusion(
+            "workspace-1",
+            revision_id,
+            (entry_id,),
+            False,
+        )
+        mutation_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        consumed = executor.submit(consume)
+        assert reading.wait(timeout=2)
+        excluded = executor.submit(exclude)
+        assert mutation_started.wait(timeout=2)
+        assert mutation_finished.wait(timeout=0.1) is False
+        release_read.set()
+        assert consumed.result(timeout=2) == b"approved revision"
+        excluded.result(timeout=2)
+
+    assert mutation_finished.is_set()
+
+
 def test_root_substitution_marks_attention_without_rewriting_the_grant(
     store: WorkspaceStore, tmp_path: Path
 ):
@@ -656,10 +791,10 @@ def test_deletion_race_during_consume_is_stable_and_consumes_the_token(
     gate = WorkspaceTransmissionGate(store)
     token = gate.authorize("workspace-1", [entry_ids[0]])[0].read_token
 
-    def fail_source_root(_workspace_id):
+    def fail_authority(*_args, **_kwargs):
         raise RuntimeError(str(tmp_path / "private-root"))
 
-    monkeypatch.setattr(store, "source_root", fail_source_root)
+    monkeypatch.setattr(store, "hold_transmission_authority", fail_authority)
 
     with pytest.raises(SourceAuthorizationError) as caught:
         with gate.open_approved(token):

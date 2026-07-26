@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 import threading
 from math import isfinite
 from collections.abc import Callable, Iterator, Sequence
@@ -30,7 +31,11 @@ from exam_predictor.workspace.models import (
 )
 from exam_predictor.workspace.policy import DEFAULT_SCAN_POLICY
 from exam_predictor.workspace.scanner import RevalidatedEntry, WorkspaceScanner
-from exam_predictor.workspace.store import WorkspaceStore
+from exam_predictor.workspace.store import (
+    TransmissionAuthorityRevokedError,
+    TransmissionAuthoritySnapshot,
+    WorkspaceStore,
+)
 
 
 _T = TypeVar("_T")
@@ -47,6 +52,8 @@ class SourceAuthorizationError(RuntimeError):
 @dataclass(frozen=True)
 class _ReadGrant:
     workspace_id: str
+    approval_id: str
+    revision_id: str
     entry_id: str
     relative_path: str
     size_bytes: int
@@ -151,22 +158,19 @@ class WorkspaceTransmissionGate:
                 requested[0] if requested else "",
             )
 
-        workspace = self._store_call(
+        authority = self._store_call(
             workspace_id,
             requested[0],
-            lambda: self._store.get_workspace(workspace_id),
+            lambda: self._store.transmission_authority_snapshot(workspace_id),
         )
-        if workspace is None:
+        if authority is None:
             raise SourceAuthorizationError(
                 "workspace_not_found",
                 workspace_id,
                 requested[0],
             )
-        approval = self._store_call(
-            workspace_id,
-            requested[0],
-            lambda: self._store.get_approval(workspace_id),
-        )
+        workspace = authority.workspace
+        approval = authority.approval
         if approval is None or workspace.state is not WorkspaceState.APPROVED:
             raise SourceAuthorizationError(
                 "source_approval_required",
@@ -180,11 +184,13 @@ class WorkspaceTransmissionGate:
                 requested[0],
             )
 
-        revision = self._store_call(
-            workspace_id,
-            requested[0],
-            lambda: self._store.get_manifest(workspace_id, approval.revision_id),
-        )
+        revision = authority.revision
+        if revision is None:
+            raise SourceAuthorizationError(
+                "source_approval_required",
+                workspace_id,
+                requested[0],
+            )
         if revision.policy_version != self._policy.policy_version:
             raise SourceAuthorizationError(
                 "source_approval_stale_policy",
@@ -228,11 +234,7 @@ class WorkspaceTransmissionGate:
                 )
             selected.append((entry, approved_sha256))
 
-        root = self._store_call(
-            workspace_id,
-            requested[0],
-            lambda: self._store.source_root(workspace_id),
-        )
+        root = workspace.canonical_root
         changed_entry_ids: tuple[str, ...] = ()
         failure_code: str | None = None
         failure_entry_id = requested[0]
@@ -297,14 +299,6 @@ class WorkspaceTransmissionGate:
                 failure_entry_id,
             ) from None
 
-        self._store_call(
-            workspace_id,
-            requested[0],
-            lambda: self._store.record_access_verified(
-                workspace_id,
-                datetime.now(UTC),
-            ),
-        )
         issued_at = monotonic()
         expires_at = issued_at + self._token_ttl_seconds
         descriptors: list[ApprovedSource] = []
@@ -317,6 +311,8 @@ class WorkspaceTransmissionGate:
                     token,
                     _ReadGrant(
                         workspace_id=workspace_id,
+                        approval_id=approval.approval_id,
+                        revision_id=revision.revision_id,
                         entry_id=entry.entry_id,
                         relative_path=entry.relative_path,
                         size_bytes=current.size_bytes,
@@ -340,9 +336,32 @@ class WorkspaceTransmissionGate:
                     read_token=SecretStr(token),
                 )
             )
-        with self._lock:
-            self._purge_expired_locked(issued_at)
-            self._read_grants.update(grants)
+        published_tokens = tuple(token for token, _grant in grants)
+        try:
+            with self._store.hold_transmission_authority(
+                workspace_id,
+                approval_id=approval.approval_id,
+                revision_id=revision.revision_id,
+                verified_at=datetime.now(UTC),
+            ):
+                with self._lock:
+                    self._purge_expired_locked(issued_at)
+                    self._read_grants.update(grants)
+        except TransmissionAuthorityRevokedError:
+            raise SourceAuthorizationError(
+                "source_approval_revoked",
+                workspace_id,
+                requested[0],
+            ) from None
+        except Exception:
+            with self._lock:
+                for token in published_tokens:
+                    self._read_grants.pop(token, None)
+            raise SourceAuthorizationError(
+                "source_store_unavailable",
+                workspace_id,
+                requested[0],
+            ) from None
         return tuple(descriptors)
 
     @contextmanager
@@ -368,65 +387,161 @@ class WorkspaceTransmissionGate:
                 grant.entry_id,
             )
 
-        workspace = self._store_call(
-            grant.workspace_id,
-            grant.entry_id,
-            lambda: self._store.get_workspace(grant.workspace_id),
-        )
         failure_code: str | None = None
-        if workspace is None:
-            failure_code = "source_root_invalid"
-        elif (
-            workspace.root_device != grant.root_device
-            or workspace.root_file_id != grant.root_file_id
-        ):
-            failure_code = "source_root_identity_changed"
-
-        if failure_code is None and workspace is not None:
-            root = self._store_call(
-                grant.workspace_id,
-                grant.entry_id,
-                lambda: self._store.source_root(grant.workspace_id),
-            )
-            try:
-                with self._opener.anchor_root(root) as root_anchor:
-                    if not _root_matches(workspace, root_anchor):
-                        failure_code = "source_root_identity_changed"
-                    else:
-                        max_spool_bytes = max(
-                            1,
-                            min(self._policy.hash_chunk_bytes * 4, 8 * 1024 * 1024),
-                        )
-                        with SpooledTemporaryFile(
-                            max_size=max_spool_bytes,
-                            mode="w+b",
-                        ) as spool:
-                            current = self._scanner.copy_revalidated_entry(
-                                root,
-                                _grant_entry(grant),
-                                spool,
-                                root_anchor=root_anchor,
+        workspace: WorkspaceRecord | None = None
+        with self._hold_current_authority(grant) as authority:
+            workspace = authority.workspace
+            if not self._grant_remains_authorized(authority, grant):
+                failure_code = "source_approval_revoked"
+            elif (
+                workspace.root_device != grant.root_device
+                or workspace.root_file_id != grant.root_file_id
+            ):
+                failure_code = "source_root_identity_changed"
+            else:
+                root = workspace.canonical_root
+                try:
+                    with self._opener.anchor_root(root) as root_anchor:
+                        if not _root_matches(workspace, root_anchor):
+                            failure_code = "source_root_identity_changed"
+                        else:
+                            max_spool_bytes = max(
+                                1,
+                                min(
+                                    self._policy.hash_chunk_bytes * 4,
+                                    8 * 1024 * 1024,
+                                ),
                             )
-                            if not _entry_matches(
-                                _grant_entry(grant),
-                                current,
-                                grant.sha256,
-                            ):
-                                failure_code = "approved_source_changed"
-                            else:
-                                spool.seek(0)
-                                yield spool
-            except SecureOpenError:
-                failure_code = "approved_source_changed"
+                            with SpooledTemporaryFile(
+                                max_size=max_spool_bytes,
+                                mode="w+b",
+                            ) as spool:
+                                current = self._scanner.copy_revalidated_entry(
+                                    root,
+                                    _grant_entry(grant),
+                                    spool,
+                                    root_anchor=root_anchor,
+                                )
+                                if not _entry_matches(
+                                    _grant_entry(grant),
+                                    current,
+                                    grant.sha256,
+                                ):
+                                    failure_code = "approved_source_changed"
+                                else:
+                                    spool.seek(0)
+                                    yield spool
+                                    return
+                except SecureOpenError:
+                    failure_code = "approved_source_changed"
 
         if failure_code is not None:
-            if workspace is not None:
+            if workspace is not None and failure_code != "source_approval_revoked":
                 self._mark_changed(workspace, (grant.entry_id,))
             raise SourceAuthorizationError(
                 failure_code,
                 grant.workspace_id,
                 grant.entry_id,
             ) from None
+
+    @contextmanager
+    def _hold_current_authority(
+        self,
+        grant: _ReadGrant,
+    ) -> Iterator[TransmissionAuthoritySnapshot]:
+        authority_revoked = False
+        store_failed = False
+        manager = None
+        authority = None
+        try:
+            manager = self._store.hold_transmission_authority(
+                grant.workspace_id,
+                approval_id=grant.approval_id,
+                revision_id=grant.revision_id,
+            )
+            authority = manager.__enter__()
+        except TransmissionAuthorityRevokedError:
+            authority_revoked = True
+        except Exception:
+            store_failed = True
+        if authority_revoked:
+            raise SourceAuthorizationError(
+                "source_approval_revoked",
+                grant.workspace_id,
+                grant.entry_id,
+            ) from None
+        if store_failed or manager is None or authority is None:
+            raise SourceAuthorizationError(
+                "source_store_unavailable",
+                grant.workspace_id,
+                grant.entry_id,
+            ) from None
+        try:
+            yield authority
+        except BaseException:
+            exception_type, exception, traceback = sys.exc_info()
+            try:
+                suppressed = manager.__exit__(
+                    exception_type,
+                    exception,
+                    traceback,
+                )
+            except BaseException:
+                suppressed = False
+            if not suppressed:
+                raise
+        else:
+            authority_revoked = False
+            store_failed = False
+            try:
+                manager.__exit__(None, None, None)
+            except TransmissionAuthorityRevokedError:
+                authority_revoked = True
+            except Exception:
+                store_failed = True
+            if authority_revoked:
+                raise SourceAuthorizationError(
+                    "source_approval_revoked",
+                    grant.workspace_id,
+                    grant.entry_id,
+                ) from None
+            if store_failed:
+                raise SourceAuthorizationError(
+                    "source_store_unavailable",
+                    grant.workspace_id,
+                    grant.entry_id,
+                ) from None
+
+    @staticmethod
+    def _grant_remains_authorized(
+        authority: TransmissionAuthoritySnapshot,
+        grant: _ReadGrant,
+    ) -> bool:
+        if authority.approval is None or authority.revision is None:
+            return False
+        approved_hash = next(
+            (
+                item.sha256
+                for item in authority.approval.entries
+                if item.entry_id == grant.entry_id
+            ),
+            None,
+        )
+        entry = next(
+            (
+                item
+                for item in authority.revision.entries
+                if item.entry_id == grant.entry_id
+            ),
+            None,
+        )
+        return (
+            approved_hash == grant.sha256
+            and entry is not None
+            and entry.state is SourceState.APPROVED
+            and entry.included
+            and entry.sha256 == grant.sha256
+        )
 
     def _mark_changed(
         self,

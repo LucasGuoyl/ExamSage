@@ -15,7 +15,7 @@ from exam_predictor.runtime.control import RunControlRegistry
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
 
 
-TEST_API_KEY = "sk-task-3-checkpoint-secret"
+TEST_CREDENTIAL_SENTINEL = "checkpoint-credential-sentinel"
 
 
 class FakeProvider:
@@ -25,7 +25,7 @@ class FakeProvider:
 
     def __init__(self):
         self.calls = 0
-        self.api_key = TEST_API_KEY
+        self.api_key = TEST_CREDENTIAL_SENTINEL
         self.requests: list[dict[str, Any]] = []
 
     def create_chat_completion(self, **kwargs):
@@ -283,8 +283,8 @@ def test_checkpoint_state_is_json_safe_and_contains_no_runtime_secrets(tmp_path:
         values = checkpoint.checkpoint["channel_values"]
 
     serialized = json.dumps(values, ensure_ascii=False, sort_keys=True)
-    assert TEST_API_KEY not in serialized
-    assert TEST_API_KEY.encode() not in checkpoint_path.read_bytes()
+    assert TEST_CREDENTIAL_SENTINEL not in serialized
+    assert TEST_CREDENTIAL_SENTINEL.encode() not in checkpoint_path.read_bytes()
     assert not any(
         isinstance(value, (FakeProvider, RunControlRegistry, Event)) or callable(value)
         for value in _walk(values)

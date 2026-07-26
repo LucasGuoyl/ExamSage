@@ -543,6 +543,72 @@ def test_scanner_applies_aggregate_selected_size_without_large_fixtures(tmp_path
     assert result.bytes_hashed == 4
 
 
+def test_user_excluded_file_is_scanned_without_consuming_selected_byte_budget(
+    tmp_path,
+):
+    (tmp_path / "a.txt").write_bytes(b"1234")
+    (tmp_path / "b.txt").write_bytes(b"5678")
+    first = WorkspaceScanner().scan("workspace-1", tmp_path)
+    previous = tuple(
+        entry.model_copy(
+            update={
+                "state": SourceState.EXCLUDED,
+                "included": False,
+                "inclusion_reason": "user_excluded",
+            }
+        )
+        if entry.relative_path == "a.txt"
+        else entry
+        for entry in first.entries
+    )
+    policy = DEFAULT_SCAN_POLICY.model_copy(update={"max_workspace_bytes": 4})
+
+    result = WorkspaceScanner(policy).scan(
+        "workspace-1", tmp_path, previous_entries=previous
+    )
+
+    excluded = _entry(result, "a.txt")
+    assert excluded.state is SourceState.EXCLUDED
+    assert excluded.included is False
+    assert excluded.sha256 == hashlib.sha256(b"1234").hexdigest()
+    assert _entry(result, "b.txt").state is SourceState.PENDING_APPROVAL
+    assert result.bytes_hashed == 4
+
+
+def test_user_excluded_archive_is_inspected_without_consuming_selected_byte_budget(
+    tmp_path,
+):
+    _write_zip(tmp_path / "a.zip", ("notes.txt", b"archive notes"))
+    (tmp_path / "b.txt").write_bytes(b"safe")
+    first = WorkspaceScanner().scan("workspace-1", tmp_path)
+    previous = tuple(
+        entry.model_copy(
+            update={
+                "state": SourceState.EXCLUDED,
+                "included": False,
+                "inclusion_reason": "user_excluded",
+            }
+        )
+        if entry.relative_path == "a.zip" and entry.archive_parent_entry_id is None
+        else entry
+        for entry in first.entries
+    )
+    policy = DEFAULT_SCAN_POLICY.model_copy(update={"max_workspace_bytes": 4})
+
+    result = WorkspaceScanner(policy).scan(
+        "workspace-1", tmp_path, previous_entries=previous
+    )
+
+    excluded = _entry(result, "a.zip")
+    assert excluded.state is SourceState.EXCLUDED
+    assert excluded.included is False
+    assert excluded.sha256 is not None
+    assert _entry(result, "b.txt").state is SourceState.PENDING_APPROVAL
+    assert _entry(
+        result, "a.zip", archive_member_path="notes.txt"
+    ).archive_parent_entry_id == excluded.entry_id
+
+
 def test_scanner_applies_aggregate_limit_to_the_metadata_of_the_file_actually_hashed(
     tmp_path,
 ):

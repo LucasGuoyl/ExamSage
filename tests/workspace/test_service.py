@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -11,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from exam_predictor.workspace.browser_intake import BrowserIntakeWriter, BrowserUpload
+from exam_predictor.ui.workspace_view import subtree_authority
 from exam_predictor.workspace.filesystem import SecureOpenError
 from exam_predictor.workspace.models import (
     SourceMode,
@@ -18,6 +22,7 @@ from exam_predictor.workspace.models import (
     WorkspaceJobStatus,
     WorkspaceState,
 )
+from exam_predictor.workspace.picker import SubprocessFolderPicker
 from exam_predictor.workspace.scanner import WorkspaceScanner
 from exam_predictor.workspace.service import (
     OwnedTreeClaim,
@@ -102,6 +107,23 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
         pytest.skip(f"symlinks unavailable: {error}")
 
 
+def _directory_link_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as symlink_error:
+        if os.name != "nt":
+            pytest.skip(f"directory links unavailable: {symlink_error}")
+
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/j", str(link), str(target)],
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip("directory links unavailable")
+
+
 @pytest.fixture
 def store(tmp_path: Path):
     value = WorkspaceStore(tmp_path / "workspace.sqlite3")
@@ -118,6 +140,43 @@ def test_folder_cancel_does_not_create_workspace(
 
     assert service.select_folder("pick-1") is None
     assert store.list_workspaces() == ()
+
+
+def test_picker_to_service_rejects_a_selected_link_root_before_granting_it(
+    tmp_path: Path,
+    store: WorkspaceStore,
+    monkeypatch,
+):
+    target = tmp_path / "private-course"
+    target.mkdir()
+    (target / "notes.txt").write_text("private", encoding="utf-8")
+    selected_link = tmp_path / "selected-course"
+    _directory_link_or_skip(selected_link, target)
+
+    def fake_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(str(selected_link)).encode(),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    service = WorkspaceService(
+        store=store,
+        scanner=WorkspaceScanner(),
+        picker=SubprocessFolderPicker(Path(sys.executable)),
+        browser_intake=BrowserIntakeWriter(tmp_path / "workspaces"),
+        run_guard=FakeRunGuard(),
+    )
+
+    with pytest.raises(WorkspaceOperationError) as caught:
+        service.select_folder("link-root")
+
+    assert caught.value.code == "folder_picker_selection_invalid"
+    assert store.list_workspaces() == ()
+    assert selected_link.exists()
+    assert (target / "notes.txt").read_text(encoding="utf-8") == "private"
 
 
 def test_initial_scan_emits_progress_and_preserves_one_unreadable_file(
@@ -229,6 +288,58 @@ def test_rescan_preserves_a_supported_source_excluded_by_the_user(
             for path in sorted(native_root.rglob("*"))
             if path.is_file()
         } == initial_source_snapshot
+    finally:
+        service.shutdown()
+
+
+def test_real_scan_ui_authority_and_service_expand_a_file_parent_subtree(
+    tmp_path: Path,
+    store: WorkspaceStore,
+):
+    native_root = tmp_path / "native"
+    (native_root / "week-1").mkdir(parents=True)
+    (native_root / "week-2").mkdir()
+    (native_root / "week-1" / "notes.txt").write_bytes(b"notes")
+    (native_root / "week-1" / "slides.txt").write_bytes(b"slides")
+    (native_root / "week-2" / "other.txt").write_bytes(b"other")
+    service = _service(
+        tmp_path, store, FakePicker([native_root]), FakeRunGuard()
+    )
+    service.start()
+    try:
+        job = service.select_folder("pick-subtree")
+        assert job is not None
+        _wait_for_job(store, job.job_id)
+        manifest = store.get_manifest(job.workspace_id)
+        assert all(entry.item_kind != "folder" for entry in manifest.entries)
+        notes = next(
+            entry
+            for entry in manifest.entries
+            if entry.relative_path == "week-1/notes.txt"
+        )
+
+        authority = subtree_authority(manifest.entries, notes)
+
+        assert authority is not None
+        assert authority.entry_id == notes.entry_id
+        assert authority.relative_prefix == "week-1"
+        updated = service.set_inclusion(
+            job.workspace_id,
+            manifest.revision_id,
+            authority.entry_id,
+            False,
+            subtree=True,
+        )
+        included_by_path = {
+            entry.relative_path: entry.included
+            for entry in updated.entries
+            if entry.archive_parent_entry_id is None
+        }
+        assert included_by_path == {
+            "week-1/notes.txt": False,
+            "week-1/slides.txt": False,
+            "week-2/other.txt": True,
+        }
     finally:
         service.shutdown()
 

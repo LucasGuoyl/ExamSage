@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 
 import httpx
@@ -285,6 +287,122 @@ async def test_browser_snapshot_closes_uploaded_stream_after_success_or_service_
     assert response.status_code == (422 if service_fails else 202)
     upload = workspace_service.calls[-1][2][0]
     assert upload.stream.closed
+
+
+async def test_default_worker_composition_deletes_only_its_browser_snapshot(
+    tmp_path,
+    auth_headers,
+):
+    app = create_worker_app(
+        WorkerSettings(port=8765, token=TOKEN, data_dir=tmp_path)
+    )
+    service = app.state.workspace_service
+    store = app.state.workspace_store
+    service.start()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as test_client:
+            created = await test_client.post(
+                "/v1/workspaces/browser-snapshot",
+                data={
+                    "display_name": "Browser course",
+                    "idempotency_key": "production-upload",
+                },
+                files={"files": ("week-1/notes.txt", b"notes")},
+                headers=auth_headers,
+            )
+            assert created.status_code == 202
+            job_id = created.json()["job_id"]
+            for _ in range(500):
+                job = store.get_job(job_id)
+                if job.status is WorkspaceJobStatus.SUCCEEDED:
+                    break
+                await asyncio.sleep(0.01)
+            assert job.status is WorkspaceJobStatus.SUCCEEDED
+            workspace = store.get_workspace(job.workspace_id)
+            assert workspace is not None
+            owned_root = workspace.canonical_root.parent
+
+            deleted = await test_client.delete(
+                f"/v1/workspaces/{job.workspace_id}",
+                headers=auth_headers,
+            )
+
+        assert deleted.status_code == 204
+        assert not os.path.lexists(owned_root)
+        assert store.get_workspace(job.workspace_id) is None
+        assert store.list_cleanup() == ()
+    finally:
+        service.shutdown()
+        app.state.runtime.shutdown()
+
+
+async def test_default_worker_composition_retries_identity_bound_cleanup_after_restart(
+    tmp_path,
+    auth_headers,
+):
+    settings = WorkerSettings(port=8765, token=TOKEN, data_dir=tmp_path)
+    first_app = create_worker_app(settings)
+    first_service = first_app.state.workspace_service
+    first_store = first_app.state.workspace_store
+    first_service.start()
+    owned_root = None
+    workspace_id = None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first_app),
+            base_url="http://testserver",
+        ) as test_client:
+            created = await test_client.post(
+                "/v1/workspaces/browser-snapshot",
+                data={
+                    "display_name": "Browser course",
+                    "idempotency_key": "restart-upload",
+                },
+                files={"files": ("week-1/notes.txt", b"notes")},
+                headers=auth_headers,
+            )
+            job_id = created.json()["job_id"]
+            for _ in range(500):
+                job = first_store.get_job(job_id)
+                if job.status is WorkspaceJobStatus.SUCCEEDED:
+                    break
+                await asyncio.sleep(0.01)
+            workspace = first_store.get_workspace(job.workspace_id)
+            assert workspace is not None
+            workspace_id = workspace.workspace_id
+            owned_root = workspace.canonical_root.parent
+
+            def fail_first_cleanup(_claim):
+                raise OSError("simulated lock")
+
+            first_service._remove_owned_tree = fail_first_cleanup
+            failed = await test_client.delete(
+                f"/v1/workspaces/{workspace_id}",
+                headers=auth_headers,
+            )
+
+        assert failed.status_code == 422
+        assert owned_root.exists()
+        assert first_store.list_cleanup()
+    finally:
+        first_service.shutdown()
+        first_app.state.runtime.shutdown()
+
+    restarted_app = create_worker_app(settings)
+    restarted_service = restarted_app.state.workspace_service
+    restarted_store = restarted_app.state.workspace_store
+    try:
+        restarted_service.start()
+        assert workspace_id is not None and owned_root is not None
+        assert not os.path.lexists(owned_root)
+        assert restarted_store.get_workspace(workspace_id) is None
+        assert restarted_store.list_cleanup() == ()
+    finally:
+        restarted_service.shutdown()
+        restarted_app.state.runtime.shutdown()
 
 
 async def test_workspace_routes_return_safe_models_and_delegate_mutations(

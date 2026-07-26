@@ -4,12 +4,16 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import BinaryIO, Protocol
+from typing import Protocol
 from uuid import uuid4
 
 import streamlit as st
 
-from exam_predictor.runtime.client import WorkerClient, WorkerClientError
+from exam_predictor.runtime.client import (
+    SeekableBinaryStream,
+    WorkerClient,
+    WorkerClientError,
+)
 from exam_predictor.workspace.models import (
     EntryInclusionRequest,
     ManifestEntry,
@@ -36,6 +40,12 @@ class WorkspaceActionState:
     can_approve: bool
     can_delete: bool
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SubtreeAuthority:
+    entry_id: str
+    relative_prefix: str
 
 
 def manifest_counts(entries: Sequence[ManifestEntry]) -> dict[SourceState, int]:
@@ -76,18 +86,37 @@ def can_delete_all_workspaces(
 
 def subtree_authority(
     entries: Sequence[ManifestEntry], entry: ManifestEntry
-) -> ManifestEntry | None:
-    """Return the folder entry that exactly represents an entry's visible parent."""
-    prefix, _, _ = entry.relative_path.rpartition("/")
-    if not prefix:
-        return None
-    return next(
+) -> SubtreeAuthority | None:
+    """Return server-expandable authority for the source entry's parent tree."""
+    source = entry
+    if entry.archive_parent_entry_id is not None:
+        source = next(
+            (
+                candidate
+                for candidate in entries
+                if candidate.entry_id == entry.archive_parent_entry_id
+            ),
+            entry,
+        )
+    prefix = (
+        source.relative_path.rstrip("/")
+        if source.item_kind == "folder"
+        else source.relative_path.rpartition("/")[0]
+    )
+    folder = next(
         (
             candidate
             for candidate in entries
-            if candidate.item_kind == "folder" and candidate.relative_path == prefix
+            if prefix
+            and candidate.archive_parent_entry_id is None
+            and candidate.item_kind == "folder"
+            and candidate.relative_path == prefix
         ),
         None,
+    )
+    return SubtreeAuthority(
+        entry_id=folder.entry_id if folder is not None else source.entry_id,
+        relative_prefix=prefix,
     )
 
 
@@ -98,6 +127,8 @@ class NamedBinaryUpload(Protocol):
 
     def seek(self, offset: int, whence: int = 0) -> int: ...
 
+    def tell(self) -> int: ...
+
 
 def upload_directory(
     client: WorkerClient,
@@ -106,7 +137,7 @@ def upload_directory(
     idempotency_key: str,
 ) -> WorkspaceJob:
     """Forward browser-uploaded streams to Worker without a local write boundary."""
-    files: dict[str, BinaryIO] = {
+    files: dict[str, SeekableBinaryStream] = {
         str(uploaded.name): uploaded for uploaded in uploaded_files
     }
     return client.upload_directory(display_name, files, idempotency_key)
@@ -142,9 +173,13 @@ def action_state(
             can_delete,
             "Review all manifest entries before approval.",
         )
+    approval_eligible_states = {
+        SourceState.PENDING_APPROVAL,
+        SourceState.APPROVED,
+    }
     if any(
-        entry.state
-        in {SourceState.CHANGED, SourceState.FAILED, SourceState.REMOVED}
+        entry.included
+        and (entry.state not in approval_eligible_states or not entry.sha256)
         for entry in manifest.items
     ):
         return WorkspaceActionState(
@@ -154,7 +189,12 @@ def action_state(
             can_delete,
             "The manifest needs attention before approval.",
         )
-    if not any(entry.included and entry.sha256 for entry in manifest.items):
+    if not any(
+        entry.included
+        and entry.sha256
+        and entry.state in approval_eligible_states
+        for entry in manifest.items
+    ):
         return WorkspaceActionState(
             can_rescan,
             can_edit,
@@ -356,7 +396,8 @@ def _render_manifest_controls(
                     st.rerun()
             authority = subtree_authority(approval_manifest.items, entry)
             if authority is not None and st.button(
-                f"Apply inclusion to {authority.relative_path}",
+                "Apply inclusion to "
+                f"{authority.relative_prefix or 'workspace root'}",
                 key=f"workspace-subtree-{entry.entry_id}",
                 disabled=not state.can_edit_inclusion,
             ):

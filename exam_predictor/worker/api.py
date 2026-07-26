@@ -36,7 +36,10 @@ from exam_predictor.runtime.models import (
 )
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.runtime.store import RuntimeStore
-from exam_predictor.workspace.browser_intake import BrowserIntakeWriter
+from exam_predictor.workspace.browser_intake import (
+    BrowserIntakeWriter,
+    OwnedTreeRemover,
+)
 from exam_predictor.workspace.picker import SubprocessFolderPicker
 from exam_predictor.workspace.scanner import WorkspaceScanner
 from exam_predictor.workspace.service import WorkspaceService
@@ -108,6 +111,7 @@ class WorkerSettings(BaseModel):
 
 class SubmitMessageBody(BaseModel):
     provider_profile_id: str
+    workspace_id: str | None = None
     message: str
 
 
@@ -117,8 +121,6 @@ def create_worker_app(
     workspace_store: WorkspaceStore | None = None,
     workspace_service: WorkspaceService | None = None,
 ) -> FastAPI:
-    owns_runtime_store = runtime is None
-    runtime_store: RuntimeStore | None = None
     if workspace_store is None:
         workspace_store = WorkspaceStore(settings.data_dir / "workspace.sqlite3")
     if runtime is None:
@@ -142,6 +144,7 @@ def create_worker_app(
             picker=SubprocessFolderPicker(Path(sys.executable)),
             browser_intake=BrowserIntakeWriter(settings.data_dir / "workspaces"),
             run_guard=runtime,
+            remove_owned_tree=OwnedTreeRemover(settings.data_dir),
             close_store_on_shutdown=True,
         )
 
@@ -160,11 +163,7 @@ def create_worker_app(
             finally:
                 workspace_service.shutdown()
         finally:
-            try:
-                runtime.shutdown()
-            finally:
-                if owns_runtime_store and runtime_store is not None:
-                    runtime_store.close()
+            runtime.shutdown()
 
     app = FastAPI(
         title="ExamSage Agent Worker",
@@ -252,6 +251,7 @@ def create_worker_app(
             request = SubmitMessageRequest(
                 thread_id=thread_id,
                 provider_profile_id=body.provider_profile_id,
+                workspace_id=body.workspace_id,
                 message=body.message,
             )
         except ValidationError:
@@ -264,6 +264,7 @@ def create_worker_app(
                 request.thread_id,
                 request.provider_profile_id,
                 request.message,
+                request.workspace_id,
             )
         except KeyError:
             raise provider_required() from None

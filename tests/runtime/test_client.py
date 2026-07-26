@@ -86,6 +86,11 @@ def test_client_parses_authenticated_worker_contracts_and_quotes_path_segments()
         if path == "/v1/threads/course/one/messages":
             assert request.method == "POST"
             assert request.url.raw_path == b"/v1/threads/course%2Fone/messages"
+            assert json.loads(request.content) == {
+                "provider_profile_id": "primary",
+                "workspace_id": "8d6f8d1f9ed34b3f9228dcd3cb6290c4",
+                "message": "Explain limits.",
+            }
             return httpx.Response(202, json={"run_id": "run/one", "status": "running"})
         if path == "/v1/runs/run/one/events":
             assert request.url.raw_path.startswith(b"/v1/runs/run%2Fone/events?")
@@ -133,6 +138,7 @@ def test_client_parses_authenticated_worker_contracts_and_quotes_path_segments()
             SubmitMessageRequest(
                 thread_id="course/one",
                 provider_profile_id="primary",
+                workspace_id="8d6f8d1f9ed34b3f9228dcd3cb6290c4",
                 message="Explain limits.",
             )
         )
@@ -483,6 +489,74 @@ def test_upload_directory_accepts_a_caller_owned_binary_stream_without_closing_i
         client.close()
 
     assert not upload.closed
+
+
+@pytest.mark.parametrize("outcome", ["success", "http-failure", "transport-failure"])
+def test_upload_directory_restores_a_caller_owned_stream_cursor_for_every_outcome(
+    outcome: str,
+):
+    upload = BytesIO(b"xxcourse notes")
+    upload.seek(2)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert b"xxcourse notes" in request.content
+        if outcome == "transport-failure":
+            raise httpx.ConnectError("worker unavailable", request=request)
+        if outcome == "http-failure":
+            return httpx.Response(503, text="worker unavailable")
+        return httpx.Response(202, json=_workspace_job_json())
+
+    client = WorkerClient(
+        "http://127.0.0.1:8765",
+        WORKER_TOKEN,
+        transport=httpx.MockTransport(respond),
+    )
+    try:
+        if outcome == "success":
+            client.upload_directory(
+                "Course", {"week-1/notes.pdf": upload}, "key-1"
+            )
+        else:
+            with pytest.raises(WorkerClientError):
+                client.upload_directory(
+                    "Course", {"week-1/notes.pdf": upload}, "key-1"
+                )
+    finally:
+        client.close()
+
+    assert upload.tell() == 2
+    assert not upload.closed
+
+
+def test_upload_directory_rejects_a_nonseekable_caller_stream_before_request():
+    requested = False
+
+    class NonSeekableStream:
+        def read(self, size: int = -1) -> bytes:
+            del size
+            return b"course notes"
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal requested
+        requested = True
+        return httpx.Response(202, json=_workspace_job_json())
+
+    client = WorkerClient(
+        "http://127.0.0.1:8765",
+        WORKER_TOKEN,
+        transport=httpx.MockTransport(respond),
+    )
+    try:
+        with pytest.raises(WorkerClientError, match="seekable"):
+            client.upload_directory(
+                "Course",
+                {"week-1/notes.pdf": NonSeekableStream()},  # type: ignore[dict-item]
+                "key-1",
+            )
+    finally:
+        client.close()
+
+    assert requested is False
 
 
 def _workspace_summary_json() -> dict[str, object]:

@@ -126,6 +126,45 @@ def test_action_state_blocks_approval_for_changed_failed_or_removed_entries():
         assert state.reason is not None and "attention" in state.reason.lower()
 
 
+def test_action_state_allows_safe_included_files_with_excluded_attention_rows():
+    manifest = page(
+        entry(entry_id="safe", relative_path="safe.txt"),
+        entry(
+            SourceState.CHANGED,
+            entry_id="changed",
+            relative_path="changed.txt",
+            included=False,
+            reason="Modified since approval",
+        ),
+        entry(
+            SourceState.FAILED,
+            entry_id="failed",
+            relative_path="failed.txt",
+            included=False,
+            sha256=None,
+            reason="Unreadable file",
+        ),
+        entry(
+            SourceState.REMOVED,
+            entry_id="removed",
+            relative_path="removed.txt",
+            included=False,
+            sha256=None,
+            reason="Removed from folder",
+        ),
+    )
+
+    state = action_state(workspace(WorkspaceState.APPROVAL_REQUIRED), manifest)
+
+    assert state.can_approve
+    assert {item.relative_path for item in manifest.items} == {
+        "safe.txt",
+        "changed.txt",
+        "failed.txt",
+        "removed.txt",
+    }
+
+
 def test_action_state_allows_rescan_for_an_approved_workspace_but_not_approval():
     state = action_state(
         workspace(
@@ -187,8 +226,9 @@ def test_subtree_authority_uses_the_folder_entry_for_the_displayed_parent_prefix
 
     target = subtree_authority((folder, first, second), first)
 
-    assert target == folder
-    assert target.entry_id != first.entry_id
+    assert target is not None
+    assert target.entry_id == folder.entry_id
+    assert target.relative_prefix == "week-1"
 
 
 def test_delete_all_is_disabled_when_any_workspace_has_an_active_deletion_or_scan():

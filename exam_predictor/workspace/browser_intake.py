@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Protocol, Sequence
 
-from exam_predictor.workspace.filesystem import is_reparse_point
+from exam_predictor.workspace.filesystem import SecureFileOpener, is_reparse_point
 from exam_predictor.workspace.models import ScanPolicy
 from exam_predictor.workspace.policy import DEFAULT_SCAN_POLICY
 
@@ -29,6 +29,18 @@ class BrowserIntakeError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class OwnedTreeRemovalError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class OwnedTreeClaimLike(Protocol):
+    relative_path: str
+    device_id: str
+    file_id: str
 
 
 @dataclass(frozen=True)
@@ -992,3 +1004,264 @@ class BrowserIntakeWriter:
     @staticmethod
     def _is_link_or_reparse(path: Path) -> bool:
         return path.is_symlink() or is_reparse_point(path)
+
+
+class OwnedTreeRemover:
+    """Remove one identity-bound tree below the ExamSage-owned data root."""
+
+    def __init__(self, data_root: Path) -> None:
+        self._data_root = Path(data_root).absolute()
+
+    def __call__(self, claim: OwnedTreeClaimLike) -> None:
+        parts = self._validated_parts(claim.relative_path)
+        try:
+            if os.name == "nt":
+                _WindowsOwnedTreeRemover(self._data_root).remove(parts, claim)
+            else:
+                self._remove_posix(parts, claim)
+        except OwnedTreeRemovalError:
+            raise
+        except OSError:
+            raise OwnedTreeRemovalError("cleanup_failed") from None
+
+    @staticmethod
+    def _validated_parts(relative_path: str) -> tuple[str, ...]:
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or "\\" in relative_path
+            or "\x00" in relative_path
+            or relative_path.startswith("/")
+        ):
+            raise OwnedTreeRemovalError("cleanup_path_invalid")
+        parts = tuple(relative_path.split("/"))
+        if (
+            len(parts) < 2
+            or parts[0] != "workspaces"
+            or any(part in {"", ".", ".."} or ":" in part for part in parts)
+        ):
+            raise OwnedTreeRemovalError("cleanup_path_invalid")
+        return parts
+
+    def _remove_posix(
+        self,
+        parts: tuple[str, ...],
+        claim: OwnedTreeClaimLike,
+    ) -> None:
+        opener = SecureFileOpener(platform="posix")
+        with contextlib.ExitStack() as stack:
+            root_anchor = stack.enter_context(opener.anchor_root(self._data_root))
+            if root_anchor.directory_fd is None:
+                raise OwnedTreeRemovalError("cleanup_identity_unavailable")
+            directory_fds = [root_anchor.directory_fd]
+            for part in parts:
+                directory_fds.append(
+                    stack.enter_context(
+                        opener.anchor_child_directory(directory_fds[-1], part)
+                    )
+                )
+            target_fd = directory_fds[-1]
+            target_stat = os.fstat(target_fd)
+            if (
+                str(target_stat.st_dev) != claim.device_id
+                or str(target_stat.st_ino) != claim.file_id
+            ):
+                raise OwnedTreeRemovalError("cleanup_identity_changed")
+            self._remove_posix_contents(target_fd, opener)
+            current = os.stat(
+                parts[-1],
+                dir_fd=directory_fds[-2],
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(
+                target_stat, current
+            ):
+                raise OwnedTreeRemovalError("cleanup_identity_changed")
+            os.rmdir(parts[-1], dir_fd=directory_fds[-2])
+
+    def _remove_posix_contents(
+        self,
+        directory_fd: int,
+        opener: SecureFileOpener,
+    ) -> None:
+        with os.scandir(directory_fd) as iterator:
+            names = sorted((entry.name for entry in iterator), key=str.casefold)
+        for name in names:
+            try:
+                named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError:
+                raise OwnedTreeRemovalError("cleanup_identity_changed") from None
+            if stat.S_ISLNK(named.st_mode) or bool(
+                getattr(named, "st_file_attributes", 0) & 0x400
+            ):
+                raise OwnedTreeRemovalError("cleanup_link_or_reparse")
+            if stat.S_ISDIR(named.st_mode):
+                with opener.anchor_child_directory(directory_fd, name) as child_fd:
+                    opened = os.fstat(child_fd)
+                    if not os.path.samestat(named, opened):
+                        raise OwnedTreeRemovalError("cleanup_identity_changed")
+                    self._remove_posix_contents(child_fd, opener)
+                current = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(
+                    named, current
+                ):
+                    raise OwnedTreeRemovalError("cleanup_identity_changed")
+                os.rmdir(name, dir_fd=directory_fd)
+                continue
+            if not stat.S_ISREG(named.st_mode):
+                raise OwnedTreeRemovalError("cleanup_special_file")
+            descriptor: int | None = None
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(name, flags, dir_fd=directory_fd)
+                opened = os.fstat(descriptor)
+                current = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or not os.path.samestat(named, opened)
+                    or not os.path.samestat(opened, current)
+                ):
+                    raise OwnedTreeRemovalError("cleanup_identity_changed")
+                os.unlink(name, dir_fd=directory_fd)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+
+
+class _WindowsOwnedTreeRemover(_WindowsSnapshotSession):
+    """Reuse intake's no-reparse handles for identity-bound Windows deletion."""
+
+    def __init__(self, data_root: Path) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Windows owned-tree handles are unavailable")
+        from ctypes import wintypes
+
+        self._wintypes = wintypes
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._configure_functions()
+        self._data_root = data_root
+        self._claimed_root = data_root
+
+    def remove(
+        self,
+        parts: tuple[str, ...],
+        claim: OwnedTreeClaimLike,
+    ) -> None:
+        handles: list[int] = []
+        try:
+            data_handle = self._open_directory(
+                self._data_root,
+                delete_access=False,
+                containment_root=self._data_root,
+            )
+            handles.append(data_handle)
+            canonical_data_root = Path(self._final_path(data_handle))
+            current = canonical_data_root
+            for index, part in enumerate(parts):
+                current /= part
+                handle = self._open_directory(
+                    current,
+                    delete_access=index == len(parts) - 1,
+                    containment_root=canonical_data_root,
+                )
+                handles.append(handle)
+            target_handle = handles[-1]
+            target_identity = self._handle_identity(target_handle)
+            if (
+                str(target_identity[0]) != claim.device_id
+                or str(target_identity[1]) != claim.file_id
+            ):
+                raise OwnedTreeRemovalError("cleanup_identity_changed")
+            expected = ntpath.normcase(ntpath.abspath(str(current)))
+            if self._final_path(target_handle) != expected:
+                raise OwnedTreeRemovalError("cleanup_path_invalid")
+            self._claimed_root = current
+            self._remove_open_directory(current, target_handle)
+            self._mark_delete_checked(target_handle)
+        except BrowserIntakeError:
+            raise OwnedTreeRemovalError("cleanup_link_or_reparse") from None
+        finally:
+            for handle in reversed(handles):
+                self._close_handle(handle)
+
+    def _remove_open_directory(self, path: Path, directory_handle: int) -> None:
+        if not self._final_path_beneath(directory_handle, self._claimed_root):
+            raise OwnedTreeRemovalError("cleanup_path_invalid")
+        try:
+            with os.scandir(path) as iterator:
+                entries = sorted(
+                    tuple(iterator),
+                    key=lambda entry: (entry.name.casefold(), entry.name),
+                )
+        except OSError:
+            raise OwnedTreeRemovalError("cleanup_failed") from None
+        for entry in entries:
+            child = path / entry.name
+            try:
+                named = child.stat(follow_symlinks=False)
+            except OSError:
+                raise OwnedTreeRemovalError("cleanup_identity_changed") from None
+            attributes = getattr(named, "st_file_attributes", 0)
+            if child.is_symlink() or attributes & self._FILE_ATTRIBUTE_REPARSE_POINT:
+                raise OwnedTreeRemovalError("cleanup_link_or_reparse")
+            if stat.S_ISDIR(named.st_mode):
+                child_handle = self._open_directory(
+                    child,
+                    delete_access=True,
+                    containment_root=self._claimed_root,
+                )
+                try:
+                    if self._handle_identity(child_handle)[1] != named.st_ino:
+                        raise OwnedTreeRemovalError("cleanup_identity_changed")
+                    self._remove_open_directory(child, child_handle)
+                    self._mark_delete_checked(child_handle)
+                finally:
+                    self._close_handle(child_handle)
+                continue
+            if not stat.S_ISREG(named.st_mode):
+                raise OwnedTreeRemovalError("cleanup_special_file")
+            handle = self._create_file_handle(
+                child,
+                access=self._GENERIC_READ | self._DELETE,
+                share_mode=self._FILE_SHARE_READ | self._FILE_SHARE_WRITE,
+                disposition=self._OPEN_EXISTING,
+                flags=self._FILE_ATTRIBUTE_NORMAL | self._FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            try:
+                handle_attributes = self._attributes(handle)
+                if (
+                    handle_attributes
+                    & (
+                        self._FILE_ATTRIBUTE_DIRECTORY
+                        | self._FILE_ATTRIBUTE_REPARSE_POINT
+                    )
+                    or self._kernel32.GetFileType(handle) != self._FILE_TYPE_DISK
+                    or not self._final_path_beneath(handle, self._claimed_root)
+                    or self._handle_identity(handle)[1] != named.st_ino
+                ):
+                    raise OwnedTreeRemovalError("cleanup_identity_changed")
+                self._mark_delete_checked(handle)
+            finally:
+                self._close_handle(handle)
+
+    def _mark_delete_checked(self, handle: int) -> None:
+        class FileDispositionInformation(ctypes.Structure):
+            _fields_ = [("DeleteFile", self._wintypes.BOOL)]
+
+        information = FileDispositionInformation(True)
+        if not self._kernel32.SetFileInformationByHandle(
+            handle,
+            self._FILE_DISPOSITION_INFO,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())

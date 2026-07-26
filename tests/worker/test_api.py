@@ -3,18 +3,33 @@ from __future__ import annotations
 import asyncio
 import sys
 from contextlib import suppress
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from exam_predictor.runtime.coordinator import ProviderProfileInUseError
-from exam_predictor.runtime.models import EventType, RunStatus
+from exam_predictor.runtime.coordinator import (
+    ProviderProfileInUseError,
+    RuntimeCoordinator,
+)
+from exam_predictor.runtime.models import (
+    ConnectProviderRequest,
+    EventType,
+    ProviderProfile,
+    RunStatus,
+)
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.runtime.store import RuntimeStore
 import exam_predictor.worker.api as worker_api
 from exam_predictor.worker.api import WorkerSettings, create_worker_app
 from exam_predictor.worker.main import main
+from exam_predictor.workspace.models import (
+    SourceMode,
+    WorkspaceRecord,
+    WorkspaceState,
+)
+from exam_predictor.workspace.store import WorkspaceStore
 
 
 WORKER_TOKEN = "local-worker-token"
@@ -41,13 +56,20 @@ class FakeRuntime:
     def connect_provider(self, request):
         return self.provider_sessions.connect(request)
 
-    def submit_message(self, thread_id, provider_profile_id, message):
+    def submit_message(
+        self,
+        thread_id,
+        provider_profile_id,
+        message,
+        workspace_id=None,
+    ):
         self.provider_sessions.get_provider(provider_profile_id)
         run = self.store.create_run(
             thread_id,
             provider_profile_id,
             message,
             RunStatus.RUNNING,
+            workspace_id=workspace_id,
         )
         self.store.append_event(
             run.run_id,
@@ -421,6 +443,72 @@ async def test_valid_message_run_event_stop_resume_and_pause_all_routes(
     ]
     assert pause_response.status_code == 204
     assert runtime.lifecycle_calls.count("pause_all") == 1
+
+
+async def test_authenticated_message_submission_persists_server_workspace_authority(
+    tmp_path,
+    auth_headers,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    source_root = tmp_path / "course"
+    source_root.mkdir()
+    now = datetime.now(UTC)
+    workspace_store = WorkspaceStore(tmp_path / "workspace.sqlite3")
+    workspace_store.create_workspace(
+        WorkspaceRecord(
+            workspace_id=workspace_id,
+            display_name="Course",
+            source_mode=SourceMode.NATIVE_FOLDER,
+            canonical_root=source_root.resolve(),
+            root_device=str(source_root.stat().st_dev),
+            root_file_id=str(source_root.stat().st_ino),
+            state=WorkspaceState.READY,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    sessions = ProviderSessionRegistry(factory=lambda _config: FakeProvider())
+    sessions.connect(
+        ConnectProviderRequest(
+            profile=ProviderProfile(profile_id="primary", provider="gemini"),
+            api_key="workspace-route-credential-sentinel",
+        )
+    )
+    runtime_store = RuntimeStore(tmp_path / "agent-runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=runtime_store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "agent-checkpoints.sqlite3",
+        workspace_repository=workspace_store,
+    )
+    app = create_worker_app(
+        WorkerSettings(port=8765, token=WORKER_TOKEN, data_dir=tmp_path),
+        runtime=runtime,
+        workspace_store=workspace_store,
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as test_client:
+            response = await test_client.post(
+                "/v1/threads/client-selected-thread/messages",
+                headers=auth_headers,
+                json={
+                    "provider_profile_id": "primary",
+                    "workspace_id": workspace_id,
+                    "message": "Review my approved sources.",
+                },
+            )
+
+        assert response.status_code == 202
+        run = runtime_store.get_run(response.json()["run_id"])
+        assert run.workspace_id == workspace_id
+        assert run.thread_id == f"workspace:{workspace_id}"
+        assert runtime_store.has_unsettled_runs(workspace_id) is True
+    finally:
+        runtime.shutdown()
+        workspace_store.close()
 
 
 @pytest.mark.parametrize(
@@ -830,6 +918,17 @@ async def test_lifespan_starts_then_pauses_and_shuts_down_runtime(tmp_path, runt
     assert runtime.lifecycle_calls == ["start", "shutdown"]
 
 
+async def test_default_worker_lifespan_shuts_down_without_a_store_close_contract(
+    tmp_path,
+):
+    app = create_worker_app(
+        WorkerSettings(port=8765, token=WORKER_TOKEN, data_dir=tmp_path)
+    )
+
+    async with app.router.lifespan_context(app):
+        assert app.state.runtime is not None
+
+
 class RecordingLifecycleRuntime:
     def __init__(self, *, store, calls, failure=None, **_kwargs):
         self.store = store
@@ -862,14 +961,8 @@ class RecordingLifecycleService:
 
 
 class RecordingRuntimeStore:
-    def __init__(self, _path, calls, failure=None):
-        self._calls = calls
-        self._failure = failure
-
-    def close(self):
-        self._calls.append("runtime-store.close")
-        if self._failure == "runtime-store.close":
-            raise RuntimeError("runtime store close failed")
+    def __init__(self, _path, _calls, _failure=None):
+        pass
 
 
 def _app_with_recording_lifecycle(monkeypatch, tmp_path, calls, failure=None):
@@ -910,13 +1003,12 @@ async def test_lifespan_cleans_up_every_owned_layer_when_workspace_start_fails(
         "workspace.start",
         "workspace.shutdown",
         "runtime.shutdown",
-        "runtime-store.close",
     ]
 
 
 @pytest.mark.parametrize(
     "failure",
-    ["workspace.shutdown", "runtime.shutdown", "runtime-store.close"],
+    ["workspace.shutdown", "runtime.shutdown"],
 )
 async def test_lifespan_attempts_later_cleanup_when_a_shutdown_layer_fails(
     monkeypatch, tmp_path, failure
@@ -933,7 +1025,6 @@ async def test_lifespan_attempts_later_cleanup_when_a_shutdown_layer_fails(
         "workspace.start",
         "workspace.shutdown",
         "runtime.shutdown",
-        "runtime-store.close",
     ]
 
 
