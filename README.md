@@ -32,7 +32,7 @@ ExamSage is designed for undergraduate courses across mathematics, physics, chem
 2. Download or clone this repository.
 3. Control-click `launch_macos.command`, choose **Open**, and accept the first-run warning.
 
-The launcher creates an isolated environment, installs dependencies, and opens `localhost` in the browser. In the page, choose OpenAI or Google Gemini and enter **one API key**. The key stays in that browser session.
+The launcher creates an isolated environment, installs dependencies, and opens `localhost` in the browser. In the page, choose OpenAI or Google Gemini and enter **one API key**. The legacy build flow keeps the key in the browser session. In the optional Agent route, the authenticated local Worker saves it through the operating-system credential vault when that vault is available; it never writes a plaintext fallback.
 
 Manual launch:
 
@@ -89,27 +89,44 @@ In agent terminology:
 
 ExamSage is an agent because it follows a conditional multi-step workflow, uses tools, maintains course state, and can continue acting in response to student questions. It is not just a single prompt.
 
-## Agent kernel alpha
+## Agent kernel and secure course workspace alpha
 
-The LangGraph Agent route is a hidden internal alpha and remains disabled by default. Developers can
-enable it with `EXAMSAGE_AGENT_V2=1`; the standard launchers then start Streamlit and an authenticated
-local Worker, with the Worker bound only to `127.0.0.1`. The legacy build flow remains the default, and
-its cost-estimate and build controls apply only to that legacy route.
+The LangGraph Agent route remains disabled by default. Developers can enable it with
+`EXAMSAGE_AGENT_V2=1`; the standard launchers then start Streamlit and an authenticated local Worker
+bound only to `127.0.0.1`. The legacy build flow remains the default, and its cost estimate and build
+controls apply only to that legacy route.
 
-The kernel demonstrates provider-backed planning that selects one bounded kernel tool, durable ordered
-activity events and answers, a globally serialized message queue, cooperative Stop at safe graph
-boundaries, SQLite checkpoints, and explicit Resume. Provider sessions stay in memory: after a restart,
-reconnect the provider before resuming paused work. On startup, unfinished `running` or `stopping`
-metadata is recovered as `paused` so work never resumes implicitly.
+The Agent workspace uses a native folder picker first. A development fallback can upload a browser
+directory snapshot when native selection is unavailable. Scanning is deterministic and local. The UI
+shows every discovered item as `pending approval`, `approved`, `excluded`, `failed`, `changed`, or
+`removed`, together with a safe reason when action is required. The aggregate workspace limit is
+1 GiB (1,073,741,824 bytes).
 
-Launcher shutdown requests a safe pause before terminating its child processes, but it does not wait for
-a new checkpoint to be durably written before termination. Resume therefore continues from the latest
-durable graph boundary.
+Before approval, no course source is eligible to cross the provider boundary. Approval binds the exact
+manifest revision and SHA-256 hashes of the included files. Excluding a supported file keeps it local.
+A rescan preserves unchanged approved entries, while new, changed, moved, removed, substituted, or
+link-like sources require review. The transmission gate revalidates path containment, file identity,
+metadata, and content immediately before issuing a short-lived, single-use read token.
 
-This alpha does not yet include course-folder selection, complete file manifests, approval before
-transmission, multimodal evidence extraction, grounded web research, adaptive practice, an operating-
-system credential vault, or the final three-pane interface. Those capabilities remain future
-implementation subprojects.
+Approved files are sent to the configured provider only when a later user task invokes a provider tool
+that needs them. The secure-workspace subproject itself performs no cloud source analysis, OCR,
+embedding, grounded research, or report generation.
+
+In the Agent route, one provider key is stored through Windows Credential Manager or macOS Keychain via
+the operating-system vault abstraction. If secure storage is unavailable, ExamSage does not create a
+plaintext credential file; reconnect after the vault is restored. `Forget API key` disconnects that
+provider profile and deletes its vault credential while leaving course workspaces intact.
+
+Deleting a native workspace removes ExamSage's manifest, approval, run, event, and checkpoint metadata;
+it never deletes or edits the selected native folder. Deleting a browser snapshot may remove only the
+identity-verified snapshot below ExamSage's own data directory. Incomplete owned cleanup remains visibly
+`cleanup pending` for retry rather than widening the deletion target.
+
+The kernel also provides durable ordered activity events, a globally serialized message queue,
+cooperative Stop at safe graph boundaries, SQLite checkpoints, and explicit Resume. Startup restores
+saved provider sessions from the OS vault and recovers unfinished `running` or `stopping` metadata as
+`paused`; work never resumes implicitly. Launcher shutdown requests a safe pause, but Resume still
+continues from the latest durable graph boundary.
 
 ## Scoring and question allocation
 
@@ -139,7 +156,7 @@ ExamSage has no developer-operated backend. The browser UI runs on the user's ow
 - Raw files travel directly to the selected provider over its official SDK.
 - No local AI model is downloaded or executed.
 - Deterministic local operations—validation, safe ZIP extraction, chunking, SQLite storage, and export—do not infer content.
-- API keys are kept in Streamlit session memory and are never written to the course database, report, manifest, logs, or backup.
+- Legacy-flow API keys stay in Streamlit session memory. Agent credentials use the OS vault only and are never written to SQLite, checkpoints, reports, manifests, logs, exceptions, HTTP responses, or backups.
 - OpenAI requests use `store: false` where the Responses API supports it.
 - Gemini uploads are deleted on a best-effort basis immediately after analysis.
 - ZIP traversal, symlinks, extreme compression ratios, unsupported executable content, private-network URLs, and common prompt-injection phrases are blocked or flagged.
@@ -159,7 +176,24 @@ The provider still receives uploaded content and applies its own retention, abus
 | Images | PNG, JPEG, WebP, GIF, BMP, TIFF; printed scans and handwriting |
 | Bundles | ZIP with safe extraction |
 
-The local course workspace is limited to 1 GB. A provider may impose a lower per-request file limit; large PDFs are split into safe page batches. Audio and video are intentionally out of scope for the first release.
+The secure workspace can catalog and hash the formats above, subject to the 1 GiB aggregate limit. This
+release does not yet connect workspace sources to cloud OCR, parsing, embeddings, grounded research, or
+report generation; those provider tools arrive in later subprojects. Audio, video, executables, and
+other unsupported extensions remain excluded. Legacy builds retain their existing direct-upload
+analysis behavior and provider-specific request limits.
+
+## Workspace troubleshooting
+
+- **Folder moved, renamed, or replaced:** the stored canonical path or root identity no longer matches.
+  Choose the folder again to create a new workspace. ExamSage will not silently follow a replacement.
+- **Vault unavailable:** no plaintext fallback is created. Restore Windows Credential Manager or macOS
+  Keychain access, then reconnect the provider.
+- **Cleanup pending:** ExamSage could not prove or remove an owned browser snapshot safely. Keep the data
+  directory available and retry deletion; do not manually repoint the workspace record.
+- **Approval stale or source changed:** rescan, review every changed/new/removed item, adjust inclusion,
+  and approve the current revision again. Old revision IDs and hashes are never reused automatically.
+- **Native picker unavailable:** use the browser directory fallback in the Agent workspace panel. It
+  creates an ExamSage-owned snapshot; deleting that workspace does not affect the original directory.
 
 ## Cost controls
 
@@ -181,8 +215,10 @@ python -m ruff check exam_predictor tests scripts app.py
 python -m compileall -q exam_predictor scripts app.py
 ```
 
-The automated Agent-kernel acceptance test uses a complete fake provider at the provider boundary. It
-does not use a real API key, contact a provider, open a browser, or launch application child processes.
+The automated Agent-kernel and secure-workspace acceptance tests use fake providers and an in-memory
+fake vault at the external boundaries. They do not use a real API key, contact a provider, open a native
+picker or browser, access a real keyring, or launch application child processes. Live platform evidence
+is tracked separately under `docs/manual-tests/`.
 
 Key modules:
 

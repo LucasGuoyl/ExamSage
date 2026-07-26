@@ -722,6 +722,8 @@ class WorkspaceScanner:
             )
 
         state = SourceState.PENDING_APPROVAL
+        included = True
+        inclusion_reason: str | None = None
         if previous is not None:
             if previous.state is SourceState.APPROVED:
                 state = (
@@ -731,12 +733,20 @@ class WorkspaceScanner:
                 )
             elif previous.state is SourceState.CHANGED:
                 state = SourceState.CHANGED
+            elif (
+                previous.state is SourceState.EXCLUDED
+                and previous.inclusion_reason == "user_excluded"
+            ):
+                state = SourceState.EXCLUDED
+                included = False
+                inclusion_reason = "user_excluded"
         return (
             ManifestEntry(
                 **base,
                 sha256=outcome.sha256,
                 state=state,
-                included=True,
+                included=included,
+                inclusion_reason=inclusion_reason,
             ),
             outcome.archive_members,
             outcome.bytes_hashed,

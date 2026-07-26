@@ -398,11 +398,27 @@ def test_set_inclusion_clones_current_revision_and_expands_archive_subtree(
 
     assert clone.parent_revision_id == original.revision_id
     assert [item.included for item in clone.entries] == [False, False]
+    assert [item.state for item in clone.entries] == [
+        SourceState.EXCLUDED,
+        SourceState.EXCLUDED,
+    ]
+    assert [item.inclusion_reason for item in clone.entries] == [
+        "user_excluded",
+        "user_excluded",
+    ]
     assert store.get_manifest("workspace-1", original.revision_id).entries[0].included is True
     with pytest.raises(StaleManifestError):
         store.set_inclusion("workspace-1", original.revision_id, ["archive"], True)
     with pytest.raises(ManifestNotFoundError):
         store.set_inclusion("workspace-1", clone.revision_id, ["missing"], True)
+
+    restored = store.set_inclusion(
+        "workspace-1", clone.revision_id, ["archive"], True
+    )
+
+    assert restored.entries[0].included is True
+    assert restored.entries[0].state is SourceState.PENDING_APPROVAL
+    assert restored.entries[0].inclusion_reason is None
 
 
 def test_approval_is_atomic_and_rejects_a_stale_revision(

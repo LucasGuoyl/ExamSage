@@ -1106,6 +1106,36 @@ class WorkspaceStore:
         requested = set(entry_ids)
         new_revision_id = uuid4().hex
         now = self._now()
+
+        def update_inclusion(item: ManifestEntry) -> ManifestEntry:
+            if item.entry_id not in requested:
+                return item
+            if not included and item.state in {
+                SourceState.PENDING_APPROVAL,
+                SourceState.APPROVED,
+                SourceState.CHANGED,
+            }:
+                return item.model_copy(
+                    update={
+                        "state": SourceState.EXCLUDED,
+                        "included": False,
+                        "inclusion_reason": "user_excluded",
+                        "failure_code": None,
+                        "safe_message": None,
+                    }
+                )
+            if included and item.inclusion_reason == "user_excluded":
+                return item.model_copy(
+                    update={
+                        "state": SourceState.PENDING_APPROVAL,
+                        "included": True,
+                        "inclusion_reason": None,
+                        "failure_code": None,
+                        "safe_message": None,
+                    }
+                )
+            return item.model_copy(update={"included": included})
+
         with self._transaction() as connection:
             workspace = self._workspace_row(connection, workspace_id)
             if workspace["current_draft_revision_id"] != revision_id:
@@ -1124,11 +1154,7 @@ class WorkspaceStore:
                 current,
                 new_revision_id,
                 now,
-                lambda item: (
-                    item.model_copy(update={"included": included})
-                    if item.entry_id in requested
-                    else item
-                ),
+                update_inclusion,
             )
             connection.execute(
                 """UPDATE workspaces

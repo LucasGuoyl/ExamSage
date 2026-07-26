@@ -1,6 +1,6 @@
 """ExamSage: a web-grounded university exam revision agent."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .agent import ExamSageAgent
 from .pipeline import ExamPredictor

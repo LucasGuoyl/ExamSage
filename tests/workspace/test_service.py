@@ -175,7 +175,42 @@ def test_rescan_is_idempotent_and_rejects_a_duplicate_active_mutation(
     assert service.rescan(initial.workspace_id, "pick-1") == initial
     with pytest.raises(WorkspaceOperationError) as caught:
         service.rescan(initial.workspace_id, "pick-2")
-    assert caught.value.code == "workspace_operation_active"
+        assert caught.value.code == "workspace_operation_active"
+
+
+def test_rescan_preserves_a_supported_source_excluded_by_the_user(
+    tmp_path: Path, store: WorkspaceStore
+):
+    native_root = tmp_path / "native"
+    native_root.mkdir()
+    (native_root / "notes.txt").write_text("notes", encoding="utf-8")
+    service = _service(
+        tmp_path, store, FakePicker([native_root]), FakeRunGuard()
+    )
+    service.start()
+    try:
+        initial_job = service.select_folder("pick-1")
+        assert initial_job is not None
+        _wait_for_job(store, initial_job.job_id)
+        initial = store.get_manifest(initial_job.workspace_id)
+        excluded = service.set_inclusion(
+            initial_job.workspace_id,
+            initial.revision_id,
+            initial.entries[0].entry_id,
+            False,
+        )
+        assert excluded.entries[0].state is SourceState.EXCLUDED
+        assert excluded.entries[0].inclusion_reason == "user_excluded"
+
+        rescan_job = service.rescan(initial_job.workspace_id, "rescan-1")
+        _wait_for_job(store, rescan_job.job_id)
+        rescanned = store.get_manifest(initial_job.workspace_id)
+
+        assert rescanned.entries[0].state is SourceState.EXCLUDED
+        assert rescanned.entries[0].included is False
+        assert rescanned.entries[0].inclusion_reason == "user_excluded"
+    finally:
+        service.shutdown()
 
 
 def test_stale_and_changed_approval_never_partially_approve(
