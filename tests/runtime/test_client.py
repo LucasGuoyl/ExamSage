@@ -419,6 +419,48 @@ def test_client_exposes_typed_workspace_and_saved_provider_operations(tmp_path: 
     upload.unlink()
 
 
+@pytest.mark.parametrize("outcome", ["success", "http-failure", "transport-failure"])
+def test_upload_directory_closes_opened_files_for_every_request_outcome(
+    monkeypatch, tmp_path: Path, outcome: str
+):
+    upload = tmp_path / "notes.pdf"
+    upload.write_bytes(b"notes")
+    opened = []
+    real_open = Path.open
+
+    def record_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        opened.append(handle)
+        return handle
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        if outcome == "transport-failure":
+            raise httpx.ConnectError("worker unavailable", request=_request)
+        if outcome == "http-failure":
+            return httpx.Response(503, text="worker unavailable")
+        return httpx.Response(202, json=_workspace_job_json())
+
+    monkeypatch.setattr(Path, "open", record_open)
+    client = WorkerClient(
+        "http://127.0.0.1:8765",
+        WORKER_TOKEN,
+        transport=httpx.MockTransport(respond),
+    )
+    try:
+        if outcome == "success":
+            assert client.upload_directory(
+                "Course", {"week-1/notes.pdf": upload}, "key-1"
+            ).job_id == "job/one"
+        else:
+            with pytest.raises(WorkerClientError, match="Agent Worker request failed"):
+                client.upload_directory("Course", {"week-1/notes.pdf": upload}, "key-1")
+    finally:
+        client.close()
+
+    assert len(opened) == 1
+    assert opened[0].closed
+
+
 def _workspace_summary_json() -> dict[str, object]:
     return {"workspace_id": "workspace/one", "display_name": "Course", "source_mode": "browser_snapshot", "state": "ready", "counts": {}, "updated_at": NOW}
 

@@ -830,6 +830,113 @@ async def test_lifespan_starts_then_pauses_and_shuts_down_runtime(tmp_path, runt
     assert runtime.lifecycle_calls == ["start", "shutdown"]
 
 
+class RecordingLifecycleRuntime:
+    def __init__(self, *, store, calls, failure=None, **_kwargs):
+        self.store = store
+        self._calls = calls
+        self._failure = failure
+
+    def start(self):
+        self._calls.append("runtime.start")
+
+    def shutdown(self):
+        self._calls.append("runtime.shutdown")
+        if self._failure == "runtime.shutdown":
+            raise RuntimeError("runtime shutdown failed")
+
+
+class RecordingLifecycleService:
+    def __init__(self, calls, failure=None):
+        self._calls = calls
+        self._failure = failure
+
+    def start(self):
+        self._calls.append("workspace.start")
+        if self._failure == "workspace.start":
+            raise RuntimeError("workspace start failed")
+
+    def shutdown(self):
+        self._calls.append("workspace.shutdown")
+        if self._failure == "workspace.shutdown":
+            raise RuntimeError("workspace shutdown failed")
+
+
+class RecordingRuntimeStore:
+    def __init__(self, _path, calls, failure=None):
+        self._calls = calls
+        self._failure = failure
+
+    def close(self):
+        self._calls.append("runtime-store.close")
+        if self._failure == "runtime-store.close":
+            raise RuntimeError("runtime store close failed")
+
+
+def _app_with_recording_lifecycle(monkeypatch, tmp_path, calls, failure=None):
+    monkeypatch.setattr(
+        worker_api,
+        "RuntimeStore",
+        lambda path: RecordingRuntimeStore(path, calls, failure),
+    )
+    monkeypatch.setattr(
+        worker_api,
+        "RuntimeCoordinator",
+        lambda **kwargs: RecordingLifecycleRuntime(
+            calls=calls, failure=failure, **kwargs
+        ),
+    )
+    monkeypatch.setattr(worker_api, "KeyringCredentialVault", lambda: object())
+    return create_worker_app(
+        WorkerSettings(port=8765, token=WORKER_TOKEN, data_dir=tmp_path),
+        workspace_store=object(),
+        workspace_service=RecordingLifecycleService(calls, failure),
+    )
+
+
+async def test_lifespan_cleans_up_every_owned_layer_when_workspace_start_fails(
+    monkeypatch, tmp_path
+):
+    calls: list[str] = []
+    app = _app_with_recording_lifecycle(
+        monkeypatch, tmp_path, calls, failure="workspace.start"
+    )
+
+    with pytest.raises(RuntimeError, match="workspace start failed"):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert calls == [
+        "runtime.start",
+        "workspace.start",
+        "workspace.shutdown",
+        "runtime.shutdown",
+        "runtime-store.close",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["workspace.shutdown", "runtime.shutdown", "runtime-store.close"],
+)
+async def test_lifespan_attempts_later_cleanup_when_a_shutdown_layer_fails(
+    monkeypatch, tmp_path, failure
+):
+    calls: list[str] = []
+    app = _app_with_recording_lifecycle(monkeypatch, tmp_path, calls, failure)
+
+    with pytest.raises(RuntimeError):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert calls == [
+        "runtime.start",
+        "workspace.start",
+        "workspace.shutdown",
+        "runtime.shutdown",
+        "runtime-store.close",
+    ]
+
+
 def test_cli_rejects_non_loopback_host(monkeypatch):
     monkeypatch.setattr(
         sys,

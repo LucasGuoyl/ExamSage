@@ -152,15 +152,19 @@ def create_worker_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        runtime.start()
-        workspace_service.start()
         try:
-            yield
+            runtime.start()
+            try:
+                workspace_service.start()
+                yield
+            finally:
+                workspace_service.shutdown()
         finally:
-            workspace_service.shutdown()
-            runtime.shutdown()
-            if owns_runtime_store and runtime_store is not None:
-                runtime_store.close()
+            try:
+                runtime.shutdown()
+            finally:
+                if owns_runtime_store and runtime_store is not None:
+                    runtime_store.close()
 
     app = FastAPI(
         title="ExamSage Agent Worker",

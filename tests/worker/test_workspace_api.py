@@ -268,6 +268,25 @@ async def test_browser_snapshot_rejects_unauthenticated_multipart_before_parsing
     assert workspace_service.calls == []
 
 
+@pytest.mark.parametrize("service_fails", [False, True])
+async def test_browser_snapshot_closes_uploaded_stream_after_success_or_service_failure(
+    client, auth_headers, workspace_service, service_fails
+):
+    if service_fails:
+        workspace_service.errors["upload"] = RuntimeError("upload failed")
+
+    response = await client.post(
+        "/v1/workspaces/browser-snapshot",
+        data={"display_name": "Course notes", "idempotency_key": "upload-once"},
+        files={"files": ("week-1/notes.pdf", b"notes")},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == (422 if service_fails else 202)
+    upload = workspace_service.calls[-1][2][0]
+    assert upload.stream.closed
+
+
 async def test_workspace_routes_return_safe_models_and_delegate_mutations(
     client, auth_headers, workspace_service
 ):
