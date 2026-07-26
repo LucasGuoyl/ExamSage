@@ -19,6 +19,7 @@ def test_streamlit_homepage_renders_without_api_key(tmp_path: Path, monkeypatch)
     button_labels = [button.label for button in app.button]
     assert "Estimate cost" in button_labels
     assert "Build my ExamSage agent" not in button_labels
+    assert "Choose course folder" not in button_labels
 
 
 def test_agent_route_fails_safely_when_worker_is_unavailable(tmp_path: Path, monkeypatch):

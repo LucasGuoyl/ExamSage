@@ -16,6 +16,12 @@ from exam_predictor.runtime.models import (
     RunStatus,
     SubmitMessageResponse,
 )
+from exam_predictor.workspace.models import (
+    ManifestPage,
+    SourceMode,
+    WorkspaceDetail,
+    WorkspaceState,
+)
 from exam_predictor.ui import agent_view
 from exam_predictor.ui.agent_view import AgentViewState, reduce_agent_events
 
@@ -60,8 +66,20 @@ class FakeWorkerClient:
         self.stop_calls = 0
         self.resume_calls = 0
         self.submit_calls = 0
+        self.last_submit_request = None
         self.submitted_run_id = "run-1"
         self.close_calls = 0
+        self.workspace = WorkspaceDetail(
+            workspace_id="12345678-1234-1234-1234-123456789012",
+            display_name="Calculus",
+            source_mode=SourceMode.NATIVE_FOLDER,
+            state=WorkspaceState.APPROVAL_REQUIRED,
+            counts={},
+            updated_at=NOW,
+            current_draft_revision_id="revision-full-1234567890",
+            created_at=NOW,
+        )
+        self.manifest = ManifestPage(items=(), total=0, offset=0, limit=500, counts={})
 
     def health(self) -> HealthResponse:
         if self.health_error:
@@ -79,8 +97,9 @@ class FakeWorkerClient:
             capabilities={"chat": True},
         )
 
-    def submit_message(self, _request) -> SubmitMessageResponse:
+    def submit_message(self, request) -> SubmitMessageResponse:
         self.submit_calls += 1
+        self.last_submit_request = request
         return SubmitMessageResponse(
             run_id=self.submitted_run_id,
             status=RunStatus.RUNNING,
@@ -107,6 +126,18 @@ class FakeWorkerClient:
 
     def close(self) -> None:
         self.close_calls += 1
+
+    def list_workspaces(self):
+        return [self.workspace]
+
+    def get_workspace(self, _workspace_id: str):
+        return self.workspace
+
+    def get_manifest(self, _workspace_id: str, **_kwargs):
+        return self.manifest
+
+    def list_saved_providers(self):
+        return []
 
 
 def button(app: AppTest, label: str):
@@ -470,3 +501,22 @@ def test_submit_requires_provider_then_starts_worker_run(monkeypatch):
         "role": "user",
         "content": "Explain limits.",
     }
+
+
+def test_submit_uses_the_selected_workspace_id_without_a_ui_thread_id(monkeypatch):
+    fake = FakeWorkerClient()
+    monkeypatch.setattr(agent_view, "_new_client", lambda: fake)
+    app = AppTest.from_string(VIEW_SCRIPT)
+    app.session_state["agent_provider"] = {
+        "profile": {"profile_id": "primary", "provider": "gemini"},
+        "capabilities": {"chat": True},
+    }
+    app.session_state["selected_workspace_id"] = fake.workspace.workspace_id
+    app.run()
+
+    app.chat_input[0].set_value("Explain limits.")
+    app.run()
+
+    assert fake.last_submit_request is not None
+    assert fake.last_submit_request.workspace_id == fake.workspace.workspace_id
+    assert fake.last_submit_request.thread_id == "default"

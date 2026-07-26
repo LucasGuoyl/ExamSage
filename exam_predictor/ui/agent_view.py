@@ -15,6 +15,7 @@ from exam_predictor.runtime.models import (
     RunStatus,
     SubmitMessageRequest,
 )
+from exam_predictor.ui.workspace_view import render_workspace_panel
 
 
 @dataclass
@@ -166,6 +167,16 @@ def render_agent_kernel() -> None:
     connect_error = st.session_state.pop("agent_connect_error", None)
     st.session_state.setdefault("agent_messages", [])
     st.session_state.setdefault("agent_thread_id", "default")
+    workspace_client: WorkerClient | None = None
+    try:
+        workspace_client = _new_client()
+        selected_workspace_id = render_workspace_panel(workspace_client)
+    except WorkerClientError:
+        selected_workspace_id = None
+        st.error("Course workspace controls are temporarily unavailable.")
+    finally:
+        if workspace_client is not None:
+            workspace_client.close()
 
     with st.sidebar:
         st.subheader("Provider")
@@ -235,6 +246,7 @@ def render_agent_kernel() -> None:
     request = SubmitMessageRequest(
         thread_id=st.session_state.agent_thread_id,
         provider_profile_id="primary",
+        workspace_id=selected_workspace_id,
         message=prompt,
     )
     client = None
