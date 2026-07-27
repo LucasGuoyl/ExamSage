@@ -16,6 +16,7 @@ rich>=13,<15
 
 # Deterministic local file packaging/extraction (no local AI models)
 pypdf>=6.0,<7
+Pillow>=11,<13
 python-pptx>=1.0,<2
 
 # Local web UI and exports

@@ -30,6 +30,7 @@ dependencies = [
   "tenacity>=8.2,<10",
   "rich>=13,<15",
   "pypdf>=6.0,<7",
+  "Pillow>=11,<13",
   "python-pptx>=1.0,<2",
   "streamlit>=1.49,<2",
   "pandas>=2.2,<3",
