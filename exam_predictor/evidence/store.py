@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -20,7 +21,7 @@ from exam_predictor.evidence.models import (
 )
 
 
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS evidence_meta (
@@ -40,6 +41,8 @@ _SCHEMA = (
       plan_json TEXT NOT NULL,
       attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
       next_attempt_at TEXT,
+      plan_generation INTEGER NOT NULL DEFAULT 1 CHECK(plan_generation >= 1),
+      claim_generation INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation >= 0),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )""",
@@ -198,8 +201,11 @@ class EvidenceStore:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     @classmethod
-    def _claim_fingerprint(cls, plan_json: str) -> str:
-        return f"evidence-plan-v1:{cls._digest(plan_json)}"
+    def _claim_token(
+        cls, part_id: str, plan_generation: int, claim_generation: int
+    ) -> str:
+        identity = f"{part_id}\0{plan_generation}\0{claim_generation}"
+        return f"evidence-claim-v1:{cls._digest(identity)}"
 
     @staticmethod
     def _locator_contains(part_locator: str, citation_locator: str) -> bool:
@@ -270,6 +276,20 @@ class EvidenceStore:
         with self._transaction() as connection:
             for statement in _SCHEMA:
                 connection.execute(statement)
+            part_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(evidence_parts)")
+            }
+            if "plan_generation" not in part_columns:
+                connection.execute(
+                    """ALTER TABLE evidence_parts ADD COLUMN plan_generation
+                       INTEGER NOT NULL DEFAULT 1 CHECK(plan_generation >= 1)"""
+                )
+            if "claim_generation" not in part_columns:
+                connection.execute(
+                    """ALTER TABLE evidence_parts ADD COLUMN claim_generation
+                       INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation >= 0)"""
+                )
             for index_name, (expected_columns, statement) in _REQUIRED_INDEXES.items():
                 actual_columns = tuple(
                     str(item["name"])
@@ -338,8 +358,9 @@ class EvidenceStore:
                                part_id, workspace_id, revision_id, entry_id,
                                source_sha256, part_sha256, priority, ordinal,
                                state, plan_json, attempt_count, next_attempt_at,
+                               plan_generation, claim_generation,
                                created_at, updated_at
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)""",
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 1, 0, ?, ?)""",
                         (plan.part_id, *values, now, now),
                     )
                     continue
@@ -384,6 +405,7 @@ class EvidenceStore:
                            source_sha256 = ?, part_sha256 = ?, priority = ?,
                            ordinal = ?, state = ?, plan_json = ?,
                            attempt_count = 0, next_attempt_at = NULL,
+                           plan_generation = plan_generation + 1,
                            created_at = ?, updated_at = ?
                        WHERE part_id = ?""",
                     (*values, now, now, plan.part_id),
@@ -450,21 +472,16 @@ class EvidenceStore:
             for part_id in part_ids:
                 connection.execute(
                     """UPDATE evidence_parts
-                       SET state = ?, next_attempt_at = NULL, updated_at = ?
+                       SET state = ?, next_attempt_at = NULL,
+                           claim_generation = claim_generation + 1,
+                           updated_at = ?
                        WHERE part_id = ?""",
                     (PartState.RUNNING.value, claimed_at, part_id),
                 )
             claimed_rows = [
                 dict(row) | {"state": PartState.RUNNING.value} for row in rows
             ]
-        return tuple(
-            self._part(self._row_from_mapping(row)).model_copy(
-                update={
-                    "idempotency_key": self._claim_fingerprint(str(row["plan_json"]))
-                }
-            )
-            for row in claimed_rows
-        )
+        return tuple(self._part(self._row_from_mapping(row)) for row in claimed_rows)
 
     @staticmethod
     def _row_from_mapping(value: dict[str, object]) -> sqlite3.Row:
@@ -557,7 +574,9 @@ class EvidenceStore:
             cursor = connection.execute(
                 """UPDATE evidence_parts
                    SET state = ?, attempt_count = MAX(attempt_count, ?),
-                       next_attempt_at = NULL, updated_at = ?
+                       next_attempt_at = NULL,
+                       claim_generation = claim_generation + 1,
+                       updated_at = ?
                    WHERE part_id = ?""",
                 (PartState.RUNNING.value, attempt, now, part_id),
             )
@@ -568,6 +587,30 @@ class EvidenceStore:
             ).fetchone()
         assert row is not None
         return self._part(row)
+
+    def publication_token(self, part_id: str) -> str:
+        with self._lock:
+            part = self._connection.execute(
+                """SELECT workspace_id, revision_id, state,
+                          plan_generation, claim_generation
+                   FROM evidence_parts WHERE part_id = ?""",
+                (part_id,),
+            ).fetchone()
+            if part is None:
+                raise KeyError(f"Evidence part '{part_id}' was not found.")
+            current = self._connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(part['workspace_id'])}",),
+            ).fetchone()
+        if current is None or current["value"] != part["revision_id"]:
+            raise ValueError("evidence part revision is no longer current")
+        if part["state"] != PartState.RUNNING.value:
+            raise ValueError("publication tokens exist only for a running claim")
+        return self._claim_token(
+            part_id,
+            int(part["plan_generation"]),
+            int(part["claim_generation"]),
+        )
 
     @staticmethod
     def _unit(row: sqlite3.Row) -> EvidenceUnit:
@@ -602,6 +645,7 @@ class EvidenceStore:
         unit: EvidenceUnit,
         *,
         cache_key: str,
+        claim_token: str,
         completed_at: datetime,
     ) -> bool:
         unit_payload = unit.model_dump(mode="json")
@@ -620,7 +664,8 @@ class EvidenceStore:
         cache_digest = self._digest(cache_key)
         with self._transaction() as connection:
             part = connection.execute(
-                """SELECT workspace_id, revision_id, source_sha256, state, plan_json
+                """SELECT workspace_id, revision_id, source_sha256, state, plan_json,
+                          plan_generation, claim_generation
                    FROM evidence_parts WHERE part_id = ?""",
                 (part_id,),
             ).fetchone()
@@ -632,15 +677,16 @@ class EvidenceStore:
             ).fetchone()
             if current is None or current["value"] != part["revision_id"]:
                 raise ValueError("evidence part revision is no longer current")
-            if part["state"] not in {
-                PartState.RUNNING.value,
-                PartState.PROCESSED.value,
-            }:
+            if part["state"] != PartState.RUNNING.value:
                 raise ValueError("evidence part must still be running before publication")
             persisted_plan = SourcePartPlan.model_validate_json(part["plan_json"])
-            expected_fingerprint = self._claim_fingerprint(part["plan_json"])
-            if cache_digest != self._digest(expected_fingerprint):
-                raise ValueError("cache identity does not match the persisted plan")
+            expected_token = self._claim_token(
+                part_id,
+                int(part["plan_generation"]),
+                int(part["claim_generation"]),
+            )
+            if not hmac.compare_digest(claim_token, expected_token):
+                raise ValueError("claim token does not match the current running claim")
             if any(
                 citation.relative_path != persisted_plan.relative_path
                 or not self._locator_contains(
@@ -655,14 +701,7 @@ class EvidenceStore:
                 (cache_digest,),
             ).fetchone()
             if cached is not None:
-                if (
-                    cached["unit_sha256"] == unit_sha256
-                    and part["state"] == PartState.PROCESSED.value
-                ):
-                    return False
                 raise ValueError("cache identity is already bound to different evidence")
-            if part["state"] != PartState.RUNNING.value:
-                raise ValueError("evidence part must still be running before publication")
             existing_unit = connection.execute(
                 """SELECT source_part_id, unit_sha256 FROM evidence_units
                    WHERE evidence_unit_id = ?""",

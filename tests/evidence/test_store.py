@@ -81,6 +81,25 @@ def evidence_unit(
     )
 
 
+def publish_claim(
+    store: EvidenceStore,
+    part_id: str,
+    unit: EvidenceUnit,
+    *,
+    cache_key: str,
+    completed_at: datetime,
+    claim_token: str | None = None,
+) -> bool:
+    token = claim_token or store.publication_token(part_id)
+    return store.publish_evidence(
+        part_id,
+        unit,
+        cache_key=cache_key,
+        claim_token=token,
+        completed_at=completed_at,
+    )
+
+
 def snapshot(
     snapshot_id: str,
     unit_id: str,
@@ -189,6 +208,69 @@ def test_migration_is_additive_idempotent_and_never_stores_secret_columns(
         assert connection.execute("SELECT * FROM existing_feature").fetchall() == [
             ("preserved",)
         ]
+
+
+def test_migration_adds_persistent_generation_columns_to_a_legacy_parts_table(
+    tmp_path: Path,
+):
+    path = tmp_path / "legacy-evidence.sqlite3"
+    plan = part_plan()
+    plan_json = EvidenceStore._canonical_json(plan.model_dump(mode="json"))
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE evidence_parts (
+              part_id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              revision_id TEXT NOT NULL,
+              entry_id TEXT NOT NULL,
+              source_sha256 TEXT NOT NULL,
+              part_sha256 TEXT NOT NULL,
+              priority INTEGER NOT NULL CHECK(priority >= 0),
+              ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+              state TEXT NOT NULL,
+              plan_json TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+              next_attempt_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO evidence_parts VALUES (
+                   ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?
+               )""",
+            (
+                plan.part_id,
+                plan.workspace_id,
+                plan.revision_id,
+                plan.entry_id,
+                plan.source_sha256,
+                plan.part_sha256,
+                plan.priority,
+                plan.ordinal,
+                plan.state.value,
+                plan_json,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+
+    store = EvidenceStore(path)
+    with store._lock:
+        columns = {
+            str(row[1])
+            for row in store._connection.execute("PRAGMA table_info(evidence_parts)")
+        }
+        generations = store._connection.execute(
+            """SELECT plan_generation, claim_generation
+               FROM evidence_parts WHERE part_id = ?""",
+            (plan.part_id,),
+        ).fetchone()
+
+    assert {"plan_generation", "claim_generation"} <= columns
+    assert tuple(generations) == (1, 0)
+    assert store.get_part(plan.part_id) == plan
+    store.close()
 
 
 def test_schema_runtime_invariants_are_executable_and_persisted(tmp_path: Path):
@@ -372,14 +454,14 @@ def test_serialized_models_recursively_reject_unsafe_strings_before_writes(
         }
     )
     with pytest.raises(ValueError, match="credentials|handles|paths"):
-        store.publish_evidence(
+        publish_claim(store,
             safe_plan.part_id,
             unsafe_unit,
             cache_key=claimed.idempotency_key,
             completed_at=NOW,
         )
 
-    store.publish_evidence(
+    publish_claim(store,
         safe_plan.part_id,
         safe_unit,
         cache_key=claimed.idempotency_key,
@@ -569,7 +651,7 @@ def test_transaction_rolls_back_when_commit_itself_fails(tmp_path: Path):
         store.close()
 
 
-def test_publication_is_durable_and_false_only_for_an_identical_cache_entry(
+def test_publication_is_durable_and_processed_claim_cannot_publish_again(
     tmp_path: Path,
 ):
     path = tmp_path / "evidence.sqlite3"
@@ -579,14 +661,26 @@ def test_publication_is_durable_and_false_only_for_an_identical_cache_entry(
     [claimed] = store.claim_parts(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
+    claim_token = store.publication_token(plan.part_id)
     unit = evidence_unit()
 
-    assert store.publish_evidence(
-        plan.part_id, unit, cache_key=claimed.idempotency_key, completed_at=NOW
+    assert publish_claim(
+        store,
+        plan.part_id,
+        unit,
+        cache_key=claimed.idempotency_key,
+        claim_token=claim_token,
+        completed_at=NOW,
     ) is True
-    assert store.publish_evidence(
-        plan.part_id, unit, cache_key=claimed.idempotency_key, completed_at=NOW
-    ) is False
+    with pytest.raises(ValueError, match="running"):
+        publish_claim(
+            store,
+            plan.part_id,
+            unit,
+            cache_key=claimed.idempotency_key,
+            claim_token=claim_token,
+            completed_at=NOW,
+        )
     assert store.get_part(plan.part_id).state is PartState.PROCESSED
     assert store.cached_evidence(claimed.idempotency_key) == unit
     store.close()
@@ -603,7 +697,7 @@ def test_publication_rejects_a_part_that_was_never_claimed(tmp_path: Path):
     store.upsert_part_plans((plan,))
 
     with pytest.raises(ValueError, match="running"):
-        store.publish_evidence(
+        publish_claim(store,
             plan.part_id,
             unit,
             cache_key=plan.idempotency_key,
@@ -631,7 +725,7 @@ def test_late_publication_for_a_stale_revision_has_no_side_effects(tmp_path: Pat
     store.upsert_part_plans((current,))
 
     with pytest.raises(ValueError, match="revision"):
-        store.publish_evidence(
+        publish_claim(store,
             stale.part_id,
             evidence_unit(),
             cache_key=running.idempotency_key,
@@ -658,7 +752,7 @@ def test_late_publication_for_an_invalidated_part_has_no_side_effects(
     store.invalidate_entry(plan.workspace_id, plan.revision_id, plan.entry_id)
 
     with pytest.raises(ValueError, match="running"):
-        store.publish_evidence(
+        publish_claim(store,
             plan.part_id,
             evidence_unit(),
             cache_key=claimed.idempotency_key,
@@ -670,13 +764,14 @@ def test_late_publication_for_an_invalidated_part_has_no_side_effects(
     store.close()
 
 
-def test_old_cache_identity_cannot_publish_into_a_replanned_source(tmp_path: Path):
+def test_old_claim_token_cannot_publish_into_a_replanned_source(tmp_path: Path):
     store = EvidenceStore(tmp_path / "evidence.sqlite3")
     old = part_plan()
     store.upsert_part_plans((old,))
     [old_claim] = store.claim_parts(
         old.workspace_id, old.revision_id, limit=1, now=NOW
     )
+    old_token = store.publication_token(old.part_id)
     replanned = old.model_copy(
         update={
             "source_sha256": "c" * 64,
@@ -689,11 +784,13 @@ def test_old_cache_identity_cannot_publish_into_a_replanned_source(tmp_path: Pat
         replanned.workspace_id, replanned.revision_id, limit=1, now=NOW
     )
 
-    with pytest.raises(ValueError, match="cache identity"):
-        store.publish_evidence(
+    with pytest.raises(ValueError, match="claim token"):
+        publish_claim(
+            store,
             replanned.part_id,
             evidence_unit(),
             cache_key=old_claim.idempotency_key,
+            claim_token=old_token,
             completed_at=NOW,
         )
 
@@ -705,50 +802,94 @@ def test_old_cache_identity_cannot_publish_into_a_replanned_source(tmp_path: Pat
     store.close()
 
 
-def test_store_claim_fingerprint_rejects_stale_result_when_caller_key_is_reused(
+def test_claim_returns_exact_plan_and_cache_identity_is_independent_of_claim_token(
     tmp_path: Path,
 ):
     store = EvidenceStore(tmp_path / "evidence.sqlite3")
+    plan = part_plan().model_copy(update={"idempotency_key": "caller-plan-key"})
+    store.upsert_part_plans((plan,))
+    [claimed] = store.claim_parts(
+        plan.workspace_id, plan.revision_id, limit=1, now=NOW
+    )
+    claim_token = store.publication_token(plan.part_id)
+    cache_key = "caller-cache-key-that-is-not-a-claim-token"
+    unit = evidence_unit()
+
+    assert claimed == plan.model_copy(update={"state": PartState.RUNNING})
+    assert cache_key != claim_token
+    assert publish_claim(
+        store,
+        plan.part_id,
+        unit,
+        cache_key=cache_key,
+        claim_token=claim_token,
+        completed_at=NOW,
+    ) is True
+    assert store.cached_evidence(cache_key) == unit
+    store.close()
+
+
+def test_aba_plan_identity_rotates_persistent_generations(tmp_path: Path):
+    store = EvidenceStore(tmp_path / "evidence.sqlite3")
     caller_key = "caller-reused-key"
-    old = part_plan(locator="pages 1-3").model_copy(
+    first_a = part_plan(locator="pages 1-3").model_copy(
         update={"idempotency_key": caller_key}
     )
-    store.upsert_part_plans((old,))
-    [old_claim] = store.claim_parts(
-        old.workspace_id, old.revision_id, limit=1, now=NOW
+    store.upsert_part_plans((first_a,))
+    [claim_a1] = store.claim_parts(
+        first_a.workspace_id, first_a.revision_id, limit=1, now=NOW
     )
-    replanned = old.model_copy(update={"locator": "pages 4-6"})
-    store.upsert_part_plans((replanned,))
-    [new_claim] = store.claim_parts(
-        replanned.workspace_id, replanned.revision_id, limit=1, now=NOW
+    token_a1 = store.publication_token(first_a.part_id)
+    plan_b = first_a.model_copy(update={"locator": "pages 4-6"})
+    store.upsert_part_plans((plan_b,))
+    [claim_b] = store.claim_parts(
+        plan_b.workspace_id, plan_b.revision_id, limit=1, now=NOW
     )
-    stale_result = evidence_unit(locator="pages 4-6", content="Old worker result")
+    token_b = store.publication_token(plan_b.part_id)
+    second_a = plan_b.model_copy(update={"locator": "pages 1-3"})
+    store.upsert_part_plans((second_a,))
+    [claim_a2] = store.claim_parts(
+        second_a.workspace_id, second_a.revision_id, limit=1, now=NOW
+    )
+    token_a2 = store.publication_token(second_a.part_id)
 
-    assert old_claim.idempotency_key != caller_key
-    assert new_claim.idempotency_key != caller_key
-    assert old_claim.idempotency_key != new_claim.idempotency_key
-    with pytest.raises(ValueError, match="cache identity"):
-        store.publish_evidence(
-            replanned.part_id,
-            stale_result,
-            cache_key=old_claim.idempotency_key,
+    assert claim_a1.idempotency_key == caller_key
+    assert claim_b.idempotency_key == caller_key
+    assert claim_a2.idempotency_key == caller_key
+    assert len({token_a1, token_b, token_a2}) == 3
+    with store._lock:
+        generations = store._connection.execute(
+            """SELECT plan_generation, claim_generation
+               FROM evidence_parts WHERE part_id = ?""",
+            (second_a.part_id,),
+        ).fetchone()
+    assert tuple(generations) == (3, 3)
+
+    unit = evidence_unit(content="Current A worker result")
+    with pytest.raises(ValueError, match="claim token"):
+        publish_claim(
+            store,
+            second_a.part_id,
+            unit,
+            cache_key="caller-cache-a",
+            claim_token=token_a1,
             completed_at=NOW,
         )
-    assert store.get_part(replanned.part_id) == replanned.model_copy(
+    assert store.get_part(second_a.part_id) == second_a.model_copy(
         update={"state": PartState.RUNNING}
     )
-    assert store.publish_evidence(
-        replanned.part_id,
-        stale_result,
-        cache_key=new_claim.idempotency_key,
+    assert publish_claim(
+        store,
+        second_a.part_id,
+        unit,
+        cache_key="caller-cache-a",
+        claim_token=token_a2,
         completed_at=NOW,
     ) is True
     store.close()
 
 
-def test_claim_fingerprint_is_stable_across_recovery_and_identical_replay(
-    tmp_path: Path,
-):
+def test_recovery_reclaim_rotates_token_across_process_restart(tmp_path: Path):
     path = tmp_path / "evidence.sqlite3"
     store = EvidenceStore(path)
     plan = part_plan()
@@ -756,6 +897,7 @@ def test_claim_fingerprint_is_stable_across_recovery_and_identical_replay(
     [first_claim] = store.claim_parts(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
+    first_token = store.publication_token(plan.part_id)
     store.close()
 
     restarted = EvidenceStore(path)
@@ -767,9 +909,34 @@ def test_claim_fingerprint_is_stable_across_recovery_and_identical_replay(
         limit=1,
         now=datetime.now(UTC) + timedelta(minutes=1),
     )
-
-    assert resumed_claim.idempotency_key == first_claim.idempotency_key
+    resumed_token = restarted.publication_token(plan.part_id)
     restarted.close()
+
+    again = EvidenceStore(path)
+    assert again.publication_token(plan.part_id) == resumed_token
+    unit = evidence_unit()
+    with pytest.raises(ValueError, match="claim token"):
+        publish_claim(
+            again,
+            plan.part_id,
+            unit,
+            cache_key="restart-cache",
+            claim_token=first_token,
+            completed_at=NOW + timedelta(minutes=2),
+        )
+    assert publish_claim(
+        again,
+        plan.part_id,
+        unit,
+        cache_key="restart-cache",
+        claim_token=resumed_token,
+        completed_at=NOW + timedelta(minutes=2),
+    ) is True
+
+    assert first_claim.idempotency_key == plan.idempotency_key
+    assert resumed_claim.idempotency_key == plan.idempotency_key
+    assert resumed_token != first_token
+    again.close()
 
 
 def test_identical_plan_upsert_preserves_processed_state_and_cache(tmp_path: Path):
@@ -780,7 +947,7 @@ def test_identical_plan_upsert_preserves_processed_state_and_cache(tmp_path: Pat
     [claimed] = store.claim_parts(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
-    store.publish_evidence(
+    publish_claim(store,
         plan.part_id, unit, cache_key=claimed.idempotency_key, completed_at=NOW
     )
 
@@ -833,7 +1000,7 @@ def test_changed_plan_identity_atomically_resets_all_prior_work(
         limit=1,
         now=NOW + timedelta(minutes=1),
     )
-    store.publish_evidence(
+    publish_claim(store,
         original.part_id,
         unit,
         cache_key=resumed.idempotency_key,
@@ -864,7 +1031,7 @@ def test_changed_plan_identity_atomically_resets_all_prior_work(
     store.close()
 
 
-def test_publication_rejects_changed_content_for_the_same_cache_identity(
+def test_processed_claim_token_cannot_republish_changed_content(
     tmp_path: Path,
 ):
     store = EvidenceStore(tmp_path / "evidence.sqlite3")
@@ -874,25 +1041,26 @@ def test_publication_rejects_changed_content_for_the_same_cache_identity(
     [claimed] = store.claim_parts(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
-    store.publish_evidence(
+    claim_token = store.publication_token(plan.part_id)
+    publish_claim(
+        store,
         plan.part_id,
         original,
         cache_key=claimed.idempotency_key,
+        claim_token=claim_token,
         completed_at=NOW,
     )
     changed = original.model_copy(update={"content": "Changed evidence content."})
 
-    try:
-        store.publish_evidence(
+    with pytest.raises(ValueError, match="running"):
+        publish_claim(
+            store,
             plan.part_id,
             changed,
             cache_key=claimed.idempotency_key,
+            claim_token=claim_token,
             completed_at=NOW,
         )
-    except ValueError as error:
-        assert "cache" in str(error).casefold()
-    else:
-        raise AssertionError("a cache identity cannot be rebound to different evidence")
 
     assert store.get_part(plan.part_id).state is PartState.PROCESSED
     assert store.get_evidence_unit(original.evidence_unit_id) == original
@@ -924,7 +1092,7 @@ def test_publication_accepts_only_verifiable_citation_sublocators(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
 
-    assert store.publish_evidence(
+    assert publish_claim(store,
         plan.part_id,
         unit,
         cache_key=claimed.idempotency_key,
@@ -955,7 +1123,7 @@ def test_publication_rejects_archive_member_case_collision(tmp_path: Path):
     unit = evidence_unit(locator="member appendix.pdf: page 2")
 
     with pytest.raises(ValueError, match="citation"):
-        store.publish_evidence(
+        publish_claim(store,
             plan.part_id,
             unit,
             cache_key=claimed.idempotency_key,
@@ -991,7 +1159,7 @@ def test_publication_rejects_citations_not_bound_to_the_persisted_part(
     )
 
     with pytest.raises(ValueError, match="citation"):
-        store.publish_evidence(
+        publish_claim(store,
             plan.part_id,
             unit,
             cache_key=running.idempotency_key,
@@ -1020,7 +1188,7 @@ def test_publication_rolls_back_unit_and_part_when_cache_write_fails(tmp_path: P
         )
 
     try:
-        store.publish_evidence(
+        publish_claim(store,
             plan.part_id,
             evidence_unit(),
             cache_key=running.idempotency_key,
@@ -1049,7 +1217,7 @@ def test_snapshots_persist_exact_coverage_and_missing_dependencies_roll_back(
     [claimed] = store.claim_parts(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
-    store.publish_evidence(
+    publish_claim(store,
         plan.part_id,
         evidence_unit(),
         cache_key=claimed.idempotency_key,
@@ -1083,7 +1251,7 @@ def test_snapshot_rejects_cross_workspace_or_revision_evidence(tmp_path: Path):
     [claimed] = store.claim_parts(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
-    store.publish_evidence(
+    publish_claim(store,
         plan.part_id,
         unit,
         cache_key=claimed.idempotency_key,
@@ -1117,13 +1285,13 @@ def test_snapshot_requires_exact_top_level_and_node_dependency_closure(
             first.workspace_id, first.revision_id, limit=2, now=NOW
         )
     }
-    store.publish_evidence(
+    publish_claim(store,
         first.part_id,
         first_unit,
         cache_key=claims[first.part_id].idempotency_key,
         completed_at=NOW,
     )
-    store.publish_evidence(
+    publish_claim(store,
         second.part_id,
         second_unit,
         cache_key=claims[second.part_id].idempotency_key,
@@ -1157,7 +1325,7 @@ def test_invalidation_does_not_delete_a_legacy_cross_workspace_snapshot(
     [claimed] = store.claim_parts(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
-    store.publish_evidence(
+    publish_claim(store,
         plan.part_id,
         unit,
         cache_key=claimed.idempotency_key,
@@ -1216,13 +1384,13 @@ def test_changed_entry_invalidation_preserves_unaffected_sibling(tmp_path: Path)
             first_plan.workspace_id, first_plan.revision_id, limit=2, now=NOW
         )
     }
-    store.publish_evidence(
+    publish_claim(store,
         first_plan.part_id,
         first_unit,
         cache_key=claims[first_plan.part_id].idempotency_key,
         completed_at=NOW,
     )
-    store.publish_evidence(
+    publish_claim(store,
         second_plan.part_id,
         second_unit,
         cache_key=claims[second_plan.part_id].idempotency_key,
@@ -1266,7 +1434,7 @@ def test_two_argument_invalidation_is_rejected_without_database_changes(
     [claimed] = store.claim_parts(
         plan.workspace_id, plan.revision_id, limit=1, now=NOW
     )
-    store.publish_evidence(
+    publish_claim(store,
         plan.part_id,
         unit,
         cache_key=claimed.idempotency_key,
@@ -1303,7 +1471,7 @@ def test_workspace_cleanup_is_atomic_and_does_not_touch_other_workspaces(
     [other_claim] = store.claim_parts(
         other.workspace_id, other.revision_id, limit=1, now=NOW
     )
-    store.publish_evidence(
+    publish_claim(store,
         first.part_id,
         evidence_unit(),
         cache_key=first_claim.idempotency_key,
@@ -1314,7 +1482,7 @@ def test_workspace_cleanup_is_atomic_and_does_not_touch_other_workspaces(
         part_id="other-part",
         entry_id="other-entry",
     )
-    store.publish_evidence(
+    publish_claim(store,
         other.part_id,
         other_unit,
         cache_key=other_claim.idempotency_key,
