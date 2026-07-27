@@ -1460,11 +1460,13 @@ class OwnedArtifactFilesystem:
         import msvcrt
 
         share_mode = self._FILE_SHARE_READ | self._FILE_SHARE_WRITE
+        access = self._GENERIC_READ | self._GENERIC_WRITE
         if not pin:
             share_mode |= self._FILE_SHARE_DELETE
+            access |= self._DELETE
         handle = self._create_file_windows(
             path,
-            access=self._GENERIC_READ | self._GENERIC_WRITE | self._DELETE,
+            access=access,
             share_mode=share_mode,
             disposition=self._CREATE_NEW,
             flags=self._FILE_ATTRIBUTE_NORMAL | self._FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1484,8 +1486,10 @@ class OwnedArtifactFilesystem:
         if not pin:
             share_mode |= self._FILE_SHARE_DELETE
         if mutable:
-            access |= self._GENERIC_WRITE | self._DELETE
+            access |= self._GENERIC_WRITE
             descriptor_flags = os.O_RDWR | os.O_BINARY
+            if not pin:
+                access |= self._DELETE
         handle = self._create_file_windows(
             path,
             access=access,
