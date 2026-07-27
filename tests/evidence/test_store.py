@@ -100,6 +100,21 @@ def publish_claim(
     )
 
 
+def publication_rows(
+    store: EvidenceStore,
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    with store._lock:
+        return {
+            table: tuple(
+                tuple(row)
+                for row in store._connection.execute(
+                    f'SELECT * FROM "{table}" ORDER BY rowid'
+                )
+            )
+            for table in ("evidence_parts", "evidence_units", "evidence_cache")
+        }
+
+
 def snapshot(
     snapshot_id: str,
     unit_id: str,
@@ -270,6 +285,43 @@ def test_migration_adds_persistent_generation_columns_to_a_legacy_parts_table(
     assert {"plan_generation", "claim_generation"} <= columns
     assert tuple(generations) == (1, 0)
     assert store.get_part(plan.part_id) == plan
+    store.close()
+
+
+def test_migration_adds_unassociated_generations_to_a_legacy_cache_table(
+    tmp_path: Path,
+):
+    path = tmp_path / "legacy-cache.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE evidence_cache (
+              cache_digest TEXT PRIMARY KEY,
+              evidence_unit_id TEXT NOT NULL,
+              unit_sha256 TEXT NOT NULL,
+              source_sha256 TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO evidence_cache VALUES (?, ?, ?, ?, ?)""",
+            ("c" * 64, "legacy-unit", "d" * 64, "e" * 64, NOW.isoformat()),
+        )
+
+    store = EvidenceStore(path)
+    store.migrate()
+    with store._lock:
+        columns = {
+            str(row[1])
+            for row in store._connection.execute("PRAGMA table_info(evidence_cache)")
+        }
+        legacy = store._connection.execute(
+            """SELECT cache_digest, evidence_unit_id,
+                      plan_generation, claim_generation
+               FROM evidence_cache"""
+        ).fetchone()
+
+    assert {"plan_generation", "claim_generation"} <= columns
+    assert tuple(legacy) == ("c" * 64, "legacy-unit", None, None)
     store.close()
 
 
@@ -517,6 +569,81 @@ def test_recovery_pauses_running_parts_without_consuming_attempt(tmp_path: Path)
     restarted.close()
 
 
+def test_upsert_cannot_create_a_running_part_without_a_claim(tmp_path: Path):
+    store = EvidenceStore(tmp_path / "evidence.sqlite3")
+    running_plan = part_plan(state=PartState.RUNNING)
+
+    with pytest.raises(ValueError, match="claim_parts|mark_running"):
+        store.upsert_part_plans((running_plan,))
+
+    with pytest.raises(KeyError, match=running_plan.part_id):
+        store.get_part(running_plan.part_id)
+    store.close()
+
+
+def test_record_attempt_cannot_reenter_running_with_a_recovered_claim_token(
+    tmp_path: Path,
+):
+    store = EvidenceStore(tmp_path / "evidence.sqlite3")
+    plan = part_plan()
+    unit = evidence_unit()
+    store.upsert_part_plans((plan,))
+    store.claim_parts(plan.workspace_id, plan.revision_id, limit=1, now=NOW)
+    recovered_token = store.publication_token(plan.part_id)
+
+    assert store.recover_unfinished() == (plan.part_id,)
+    with pytest.raises(ValueError, match="claim_parts|mark_running"):
+        store.record_attempt(
+            plan.part_id,
+            attempt=1,
+            route="document",
+            outcome=PartState.RUNNING,
+            started_at=NOW,
+        )
+
+    assert store.get_part(plan.part_id).state is PartState.RETRY_WAIT
+    assert store.attempt_count(plan.part_id) == 0
+    with pytest.raises(ValueError, match="running"):
+        store.publication_token(plan.part_id)
+    with pytest.raises(ValueError, match="running"):
+        publish_claim(
+            store,
+            plan.part_id,
+            unit,
+            cache_key="recovery-cache",
+            claim_token=recovered_token,
+            completed_at=NOW + timedelta(minutes=1),
+        )
+
+    [resumed] = store.claim_parts(
+        plan.workspace_id,
+        plan.revision_id,
+        limit=1,
+        now=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    assert resumed.state is PartState.RUNNING
+    resumed_token = store.publication_token(plan.part_id)
+    assert resumed_token != recovered_token
+    with pytest.raises(ValueError, match="claim token"):
+        publish_claim(
+            store,
+            plan.part_id,
+            unit,
+            cache_key="recovery-cache",
+            claim_token=recovered_token,
+            completed_at=NOW + timedelta(minutes=2),
+        )
+    assert publish_claim(
+        store,
+        plan.part_id,
+        unit,
+        cache_key="recovery-cache",
+        claim_token=resumed_token,
+        completed_at=NOW + timedelta(minutes=2),
+    ) is True
+    store.close()
+
+
 def test_claims_are_atomic_ordered_and_reject_a_stale_revision(tmp_path: Path):
     path = tmp_path / "evidence.sqlite3"
     first = EvidenceStore(path)
@@ -651,7 +778,7 @@ def test_transaction_rolls_back_when_commit_itself_fails(tmp_path: Path):
         store.close()
 
 
-def test_publication_is_durable_and_processed_claim_cannot_publish_again(
+def test_publication_is_durable_and_exact_processed_replay_is_a_noop(
     tmp_path: Path,
 ):
     path = tmp_path / "evidence.sqlite3"
@@ -672,21 +799,162 @@ def test_publication_is_durable_and_processed_claim_cannot_publish_again(
         claim_token=claim_token,
         completed_at=NOW,
     ) is True
-    with pytest.raises(ValueError, match="running"):
+
+    rows_before_replay = publication_rows(store)
+    with store._lock:
+        changes_before_replay = store._connection.total_changes
+
+    assert publish_claim(
+        store,
+        plan.part_id,
+        unit,
+        cache_key=claimed.idempotency_key,
+        claim_token=claim_token,
+        completed_at=NOW + timedelta(minutes=1),
+    ) is False
+    with store._lock:
+        assert store._connection.total_changes == changes_before_replay
+    assert publication_rows(store) == rows_before_replay
+
+    rejected_replays = (
+        (unit, "different-cache", claim_token),
+        (
+            unit.model_copy(update={"content": "Different canonical unit."}),
+            claimed.idempotency_key,
+            claim_token,
+        ),
+        (
+            evidence_unit(unit_id="unit-2"),
+            claimed.idempotency_key,
+            claim_token,
+        ),
+        (unit, claimed.idempotency_key, "evidence-claim-v1:" + "0" * 64),
+    )
+    for replay_unit, cache_key, replay_token in rejected_replays:
+        with pytest.raises(ValueError):
+            publish_claim(
+                store,
+                plan.part_id,
+                replay_unit,
+                cache_key=cache_key,
+                claim_token=replay_token,
+                completed_at=NOW + timedelta(minutes=1),
+            )
+    with pytest.raises(ValueError, match="does not belong"):
         publish_claim(
             store,
-            plan.part_id,
+            "different-part",
             unit,
             cache_key=claimed.idempotency_key,
             claim_token=claim_token,
-            completed_at=NOW,
+            completed_at=NOW + timedelta(minutes=1),
         )
+    assert publication_rows(store) == rows_before_replay
     assert store.get_part(plan.part_id).state is PartState.PROCESSED
     assert store.cached_evidence(claimed.idempotency_key) == unit
     store.close()
 
     restarted = EvidenceStore(path)
+    with restarted._lock:
+        restart_changes_before_replay = restarted._connection.total_changes
+    assert publish_claim(
+        restarted,
+        plan.part_id,
+        unit,
+        cache_key=claimed.idempotency_key,
+        claim_token=claim_token,
+        completed_at=NOW + timedelta(minutes=2),
+    ) is False
+    with restarted._lock:
+        assert restarted._connection.total_changes == restart_changes_before_replay
     assert restarted.cached_evidence(claimed.idempotency_key) == unit
+
+    current = part_plan(
+        part_id="current-part",
+        revision_id="revision-2",
+        entry_id="current-entry",
+    )
+    restarted.upsert_part_plans((current,))
+    with pytest.raises(ValueError, match="revision"):
+        publish_claim(
+            restarted,
+            plan.part_id,
+            unit,
+            cache_key=claimed.idempotency_key,
+            claim_token=claim_token,
+            completed_at=NOW + timedelta(minutes=3),
+        )
+    assert restarted.get_part(plan.part_id).state is PartState.PROCESSED
+    assert restarted.cached_evidence(claimed.idempotency_key) == unit
+    restarted.close()
+
+
+def test_processed_replay_requires_cache_tuple_from_the_same_claim_generation(
+    tmp_path: Path,
+):
+    path = tmp_path / "evidence.sqlite3"
+    store = EvidenceStore(path)
+    plan = part_plan()
+    first_unit = evidence_unit()
+    second_unit = evidence_unit(
+        unit_id="unit-2",
+        content="Evidence produced by the second running claim.",
+    )
+    store.upsert_part_plans((plan,))
+    store.claim_parts(plan.workspace_id, plan.revision_id, limit=1, now=NOW)
+    first_token = store.publication_token(plan.part_id)
+    assert publish_claim(
+        store,
+        plan.part_id,
+        first_unit,
+        cache_key="first-cache",
+        claim_token=first_token,
+        completed_at=NOW,
+    ) is True
+
+    store.mark_running(plan.part_id, attempt=2)
+    second_token = store.publication_token(plan.part_id)
+    assert second_token != first_token
+    assert publish_claim(
+        store,
+        plan.part_id,
+        second_unit,
+        cache_key="second-cache",
+        claim_token=second_token,
+        completed_at=NOW + timedelta(minutes=1),
+    ) is True
+    rows_after_second_claim = publication_rows(store)
+
+    with pytest.raises(ValueError, match="claim|exact"):
+        publish_claim(
+            store,
+            plan.part_id,
+            first_unit,
+            cache_key="first-cache",
+            claim_token=second_token,
+            completed_at=NOW + timedelta(minutes=2),
+        )
+    assert publication_rows(store) == rows_after_second_claim
+    store.close()
+
+    restarted = EvidenceStore(path)
+    with pytest.raises(ValueError, match="claim|exact"):
+        publish_claim(
+            restarted,
+            plan.part_id,
+            first_unit,
+            cache_key="first-cache",
+            claim_token=second_token,
+            completed_at=NOW + timedelta(minutes=3),
+        )
+    assert publish_claim(
+        restarted,
+        plan.part_id,
+        second_unit,
+        cache_key="second-cache",
+        claim_token=second_token,
+        completed_at=NOW + timedelta(minutes=3),
+    ) is False
     restarted.close()
 
 

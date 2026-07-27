@@ -21,7 +21,7 @@ from exam_predictor.evidence.models import (
 )
 
 
-_SCHEMA_VERSION = "2"
+_SCHEMA_VERSION = "3"
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS evidence_meta (
@@ -69,6 +69,8 @@ _SCHEMA = (
       evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(evidence_unit_id) ON DELETE CASCADE,
       unit_sha256 TEXT NOT NULL,
       source_sha256 TEXT NOT NULL,
+      plan_generation INTEGER CHECK(plan_generation IS NULL OR plan_generation >= 1),
+      claim_generation INTEGER CHECK(claim_generation IS NULL OR claim_generation >= 0),
       created_at TEXT NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS study_map_snapshots (
@@ -290,6 +292,20 @@ class EvidenceStore:
                     """ALTER TABLE evidence_parts ADD COLUMN claim_generation
                        INTEGER NOT NULL DEFAULT 0 CHECK(claim_generation >= 0)"""
                 )
+            cache_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(evidence_cache)")
+            }
+            if "plan_generation" not in cache_columns:
+                connection.execute(
+                    """ALTER TABLE evidence_cache ADD COLUMN plan_generation
+                       INTEGER CHECK(plan_generation IS NULL OR plan_generation >= 1)"""
+                )
+            if "claim_generation" not in cache_columns:
+                connection.execute(
+                    """ALTER TABLE evidence_cache ADD COLUMN claim_generation
+                       INTEGER CHECK(claim_generation IS NULL OR claim_generation >= 0)"""
+                )
             for index_name, (expected_columns, statement) in _REQUIRED_INDEXES.items():
                 actual_columns = tuple(
                     str(item["name"])
@@ -323,6 +339,10 @@ class EvidenceStore:
         revisions: dict[str, str] = {}
         for plan in plans:
             self._validate_serialized_strings(plan.model_dump(mode="json"))
+            if plan.state is PartState.RUNNING:
+                raise ValueError(
+                    "running parts must be entered via claim_parts or mark_running"
+                )
             previous = revisions.setdefault(plan.workspace_id, plan.revision_id)
             if previous != plan.revision_id:
                 raise ValueError("one upsert cannot mix revisions for a workspace")
@@ -527,6 +547,10 @@ class EvidenceStore:
         ):
             raise ValueError("safe_error_code must be a bounded stable code")
         state = self._attempt_state(outcome)
+        if state is PartState.RUNNING:
+            raise ValueError(
+                "running attempts must be entered via claim_parts or mark_running"
+            )
         if state is PartState.RETRY_WAIT and next_attempt_at is None:
             raise ValueError("retry attempts require next_attempt_at")
         started = self._timestamp(started_at)
@@ -677,9 +701,6 @@ class EvidenceStore:
             ).fetchone()
             if current is None or current["value"] != part["revision_id"]:
                 raise ValueError("evidence part revision is no longer current")
-            if part["state"] != PartState.RUNNING.value:
-                raise ValueError("evidence part must still be running before publication")
-            persisted_plan = SourcePartPlan.model_validate_json(part["plan_json"])
             expected_token = self._claim_token(
                 part_id,
                 int(part["plan_generation"]),
@@ -687,6 +708,7 @@ class EvidenceStore:
             )
             if not hmac.compare_digest(claim_token, expected_token):
                 raise ValueError("claim token does not match the current running claim")
+            persisted_plan = SourcePartPlan.model_validate_json(part["plan_json"])
             if any(
                 citation.relative_path != persisted_plan.relative_path
                 or not self._locator_contains(
@@ -696,10 +718,37 @@ class EvidenceStore:
             ):
                 raise ValueError("evidence citation is outside the persisted source part")
             cached = connection.execute(
-                """SELECT unit_sha256 FROM evidence_cache
-                   WHERE cache_digest = ?""",
+                """SELECT cache.evidence_unit_id, cache.unit_sha256,
+                          cache.source_sha256,
+                          cache.plan_generation AS cache_plan_generation,
+                          cache.claim_generation AS cache_claim_generation,
+                          units.source_part_id,
+                          units.unit_sha256 AS persisted_unit_sha256
+                   FROM evidence_cache AS cache
+                   JOIN evidence_units AS units
+                     ON units.evidence_unit_id = cache.evidence_unit_id
+                   WHERE cache.cache_digest = ?""",
                 (cache_digest,),
             ).fetchone()
+            if part["state"] == PartState.PROCESSED.value:
+                if (
+                    cached is not None
+                    and cached["evidence_unit_id"] == unit.evidence_unit_id
+                    and cached["unit_sha256"] == unit_sha256
+                    and cached["source_sha256"] == part["source_sha256"]
+                    and cached["cache_plan_generation"]
+                    == part["plan_generation"]
+                    and cached["cache_claim_generation"]
+                    == part["claim_generation"]
+                    and cached["source_part_id"] == part_id
+                    and cached["persisted_unit_sha256"] == unit_sha256
+                ):
+                    return False
+                raise ValueError(
+                    "processed evidence does not exactly match its running claim"
+                )
+            if part["state"] != PartState.RUNNING.value:
+                raise ValueError("evidence part must still be running before publication")
             if cached is not None:
                 raise ValueError("cache identity is already bound to different evidence")
             existing_unit = connection.execute(
@@ -729,13 +778,16 @@ class EvidenceStore:
             connection.execute(
                 """INSERT INTO evidence_cache(
                        cache_digest, evidence_unit_id, unit_sha256,
-                       source_sha256, created_at
-                   ) VALUES (?, ?, ?, ?, ?)""",
+                       source_sha256, plan_generation, claim_generation,
+                       created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     cache_digest,
                     unit.evidence_unit_id,
                     unit_sha256,
                     part["source_sha256"],
+                    part["plan_generation"],
+                    part["claim_generation"],
                     published_at,
                 ),
             )
