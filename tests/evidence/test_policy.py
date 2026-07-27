@@ -9,10 +9,13 @@ def test_policy_defaults_and_bounds_are_deterministic():
 
     assert policy.policy_version == "evidence-v1"
     assert policy.multimodal_concurrency == 2
+    assert policy.retry_backoff_seconds == 1.0
     with pytest.raises(ValidationError):
         EvidencePolicy(multimodal_concurrency=5)
     with pytest.raises(ValidationError):
         EvidencePolicy(api_key="not-allowed")
+    with pytest.raises(ValidationError):
+        EvidencePolicy(retry_backoff_seconds=0.0)
 
 
 @pytest.mark.parametrize(

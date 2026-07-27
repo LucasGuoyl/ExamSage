@@ -14,6 +14,7 @@ class EvidencePolicy(FrozenModel):
     tool_deadline_seconds: float = Field(default=3600.0, ge=60.0, le=14400.0)
     max_attempts_per_route: int = Field(default=3, ge=1, le=3)
     max_repair_attempts: int = Field(default=1, ge=0, le=1)
+    retry_backoff_seconds: float = Field(default=1.0, ge=0.1, le=10.0)
     pdf_pages_per_part: int = Field(default=24, ge=1, le=80)
     max_part_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=48 * 1024 * 1024)
     first_map_deadline_seconds: float = Field(default=180.0, ge=30.0, le=600.0)

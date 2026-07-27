@@ -44,6 +44,111 @@ def test_source_part_rejects_absolute_paths_and_secret_fields():
         SourcePartPlan(**SOURCE_PART, api_key="not-allowed")
 
 
+@pytest.mark.parametrize(
+    ("model", "factory", "field", "unsafe_value"),
+    [
+        (
+            SourcePartPlan,
+            lambda: SOURCE_PART,
+            "locator",
+            "https://storage.example/file?X-Amz-Signature=abc",
+        ),
+        (SourcePartPlan, lambda: SOURCE_PART, "locator", "C:/private/provider.log"),
+        (
+            EvidenceCitation,
+            lambda: {
+                "citation_id": "citation-1",
+                "evidence_unit_id": "unit-1",
+                "source_part_id": "part-1",
+                "relative_path": "course/syllabus.pdf",
+                "locator": "page 1",
+            },
+            "locator",
+            "Authorization: Bearer provider-secret",
+        ),
+        (
+            EvidenceUnit,
+            lambda: {
+                "evidence_unit_id": "unit-1",
+                "source_part_id": "part-1",
+                "content": "Ordinary course text.",
+                "citations": (
+                    EvidenceCitation(
+                        citation_id="citation-1",
+                        evidence_unit_id="unit-1",
+                        source_part_id="part-1",
+                        relative_path="course/syllabus.pdf",
+                        locator="page 1",
+                    ),
+                ),
+            },
+            "content",
+            "Provider returned sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+        ),
+        (
+            EvidenceUnit,
+            lambda: {
+                "evidence_unit_id": "unit-1",
+                "source_part_id": "part-1",
+                "content": "Ordinary course text.",
+                "citations": (
+                    EvidenceCitation(
+                        citation_id="citation-1",
+                        evidence_unit_id="unit-1",
+                        source_part_id="part-1",
+                        relative_path="course/syllabus.pdf",
+                        locator="page 1",
+                    ),
+                ),
+            },
+            "content",
+            "Traceback (most recent call last): provider failure",
+        ),
+        (
+            EvidenceUnit,
+            lambda: {
+                "evidence_unit_id": "unit-1",
+                "source_part_id": "part-1",
+                "content": "Ordinary course text.",
+                "citations": (
+                    EvidenceCitation(
+                        citation_id="citation-1",
+                        evidence_unit_id="unit-1",
+                        source_part_id="part-1",
+                        relative_path="course/syllabus.pdf",
+                        locator="page 1",
+                    ),
+                ),
+            },
+            "content",
+            "<openai.OpenAI object at 0x1234>",
+        ),
+    ],
+)
+def test_evidence_text_fields_reject_sensitive_values(model, factory, field, unsafe_value):
+    with pytest.raises(ValidationError):
+        model(**{**factory(), field: unsafe_value})
+
+
+def test_evidence_text_fields_allow_ordinary_course_text():
+    unit = EvidenceUnit(
+        evidence_unit_id="unit-1",
+        source_part_id="part-1",
+        content="The lecture discusses limits, continuity, and exam preparation.",
+        citations=(
+            EvidenceCitation(
+                citation_id="citation-1",
+                evidence_unit_id="unit-1",
+                source_part_id="part-1",
+                relative_path="course/syllabus.pdf",
+                locator="page 1",
+            ),
+        ),
+    )
+
+    assert unit.content.startswith("The lecture")
+
+
 def test_source_part_normalizes_relative_paths_and_requires_lowercase_hashes():
     part = SourcePartPlan(**{**SOURCE_PART, "relative_path": "course/./syllabus.pdf"})
 
@@ -104,7 +209,14 @@ def test_initial_snapshot_accepts_coverage_and_unique_evidence_dependencies():
                 evidence_unit_ids=("unit-1",),
             ),
         ),
-        coverage=CoverageSummary(items=(CoverageItem(topic="Limits", covered=True),)),
+        coverage=CoverageSummary(
+            items=(
+                CoverageItem(topic="Limits", covered=True),
+                CoverageItem(topic="Continuity", covered=False),
+            ),
+            covered_count=1,
+            total_count=2,
+        ),
         evidence_unit_ids=("unit-1",),
         created_at=NOW,
     )
@@ -131,3 +243,49 @@ def test_evidence_models_are_frozen_and_forbid_extra_fields():
         unit.content = "changed"
     with pytest.raises(ValidationError):
         EvidenceUnit(**unit.model_dump(), secret="not-allowed")
+
+
+def test_evidence_unit_requires_at_least_one_citation():
+    with pytest.raises(ValidationError):
+        EvidenceUnit(
+            evidence_unit_id="unit-1",
+            source_part_id="part-1",
+            content="A limit is ...",
+            citations=(),
+        )
+
+
+def test_coverage_summary_has_exact_noncontradictory_partial_counts():
+    summary = CoverageSummary(
+        items=(
+            CoverageItem(topic="Limits", covered=True),
+            CoverageItem(topic="Continuity", covered=False),
+            CoverageItem(topic="Derivatives", covered=False),
+        ),
+        covered_count=1,
+        total_count=3,
+    )
+
+    assert summary.coverage_fraction == pytest.approx(1 / 3)
+    assert summary.is_partial is True
+    with pytest.raises(ValidationError):
+        CoverageSummary(
+            items=(CoverageItem(topic="Limits", covered=True),),
+            covered_count=0,
+            total_count=1,
+        )
+    with pytest.raises(ValidationError):
+        CoverageSummary(
+            items=(CoverageItem(topic=" ", covered=True),),
+            covered_count=1,
+            total_count=1,
+        )
+    with pytest.raises(ValidationError):
+        CoverageSummary(
+            items=(
+                CoverageItem(topic="Limits", covered=True),
+                CoverageItem(topic="Limits", covered=False),
+            ),
+            covered_count=1,
+            total_count=2,
+        )

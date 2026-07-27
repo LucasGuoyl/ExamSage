@@ -2,10 +2,33 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+import re
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, computed_field, field_validator, model_validator
 
 from exam_predictor.workspace.models import FrozenModel, normalize_relative_path
+
+
+_SENSITIVE_EVIDENCE_PATTERNS = (
+    re.compile(r"\bauthorization\s*:\s*(?:bearer|basic)\s+\S+", re.IGNORECASE),
+    re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{12,}", re.IGNORECASE),
+    re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{30,}"),
+    re.compile(r"https?://[^\s/@:]+:[^\s/@]+@", re.IGNORECASE),
+    re.compile(
+        r"https?://\S+[?&](?:x-amz-(?:signature|credential|security-token)|"
+        r"x-goog-(?:signature|credential)|sig|signature|token|access_token)=",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/]|/(?:home|users|var|tmp)/)", re.IGNORECASE),
+    re.compile(r"traceback \(most recent call last\)|<(?:openai|google\.genai|httpx)\.", re.IGNORECASE),
+)
+
+
+def validate_safe_evidence_text(value: str) -> str:
+    if any(pattern.search(value) for pattern in _SENSITIVE_EVIDENCE_PATTERNS):
+        raise ValueError("evidence text must not contain credentials, handles, or absolute paths")
+    return value
 
 
 class PartState(StrEnum):
@@ -50,6 +73,11 @@ class SourcePartPlan(EvidenceFrozenModel):
     def validate_relative_path(cls, value: str) -> str:
         return normalize_relative_path(value)
 
+    @field_validator("locator")
+    @classmethod
+    def validate_locator(cls, value: str) -> str:
+        return validate_safe_evidence_text(value)
+
 
 class EvidenceCitation(EvidenceFrozenModel):
     citation_id: str
@@ -63,6 +91,11 @@ class EvidenceCitation(EvidenceFrozenModel):
     def validate_relative_path(cls, value: str) -> str:
         return normalize_relative_path(value)
 
+    @field_validator("locator")
+    @classmethod
+    def validate_locator(cls, value: str) -> str:
+        return validate_safe_evidence_text(value)
+
 
 class EvidenceUnit(EvidenceFrozenModel):
     evidence_unit_id: str
@@ -70,14 +103,56 @@ class EvidenceUnit(EvidenceFrozenModel):
     content: str
     citations: tuple[EvidenceCitation, ...]
 
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        return validate_safe_evidence_text(value)
+
+    @field_validator("citations")
+    @classmethod
+    def validate_citations(cls, value: tuple[EvidenceCitation, ...]) -> tuple[EvidenceCitation, ...]:
+        if not value:
+            raise ValueError("evidence units require at least one citation")
+        return value
+
 
 class CoverageItem(EvidenceFrozenModel):
     topic: str
     covered: bool
 
+    @field_validator("topic")
+    @classmethod
+    def validate_topic(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("coverage topics must not be empty")
+        return normalized
+
 
 class CoverageSummary(EvidenceFrozenModel):
     items: tuple[CoverageItem, ...]
+    covered_count: int = Field(ge=0)
+    total_count: int = Field(ge=1)
+
+    @computed_field
+    @property
+    def coverage_fraction(self) -> float:
+        return self.covered_count / self.total_count
+
+    @computed_field
+    @property
+    def is_partial(self) -> bool:
+        return 0 < self.covered_count < self.total_count
+
+    @model_validator(mode="after")
+    def validate_exact_coverage(self) -> CoverageSummary:
+        if self.total_count != len(self.items):
+            raise ValueError("total_count must equal the number of coverage items")
+        if self.covered_count != sum(item.covered for item in self.items):
+            raise ValueError("covered_count must equal the covered coverage items")
+        if len({item.topic.casefold() for item in self.items}) != len(self.items):
+            raise ValueError("coverage topics must be unique")
+        return self
 
 
 class KnowledgeNode(EvidenceFrozenModel):
@@ -110,7 +185,7 @@ class StudyMapSnapshot(EvidenceFrozenModel):
     @model_validator(mode="after")
     def validate_initial_dependencies(self) -> StudyMapSnapshot:
         if self.status is SnapshotStatus.INITIAL and (
-            self.coverage is None or not self.coverage.items or not self.evidence_unit_ids
+            self.coverage is None or not self.coverage.is_partial or not self.evidence_unit_ids
         ):
             raise ValueError("initial snapshots require coverage and evidence dependencies")
         if len(set(self.evidence_unit_ids)) != len(self.evidence_unit_ids):
