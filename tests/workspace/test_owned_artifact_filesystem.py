@@ -107,6 +107,96 @@ def test_mutation_rejects_wrong_parent_identity(tmp_path):
     assert not (root / "artifact").exists()
 
 
+def test_claimed_read_handle_is_os_read_only(tmp_path):
+    filesystem = OwnedArtifactFilesystem()
+    root = tmp_path / "data"
+    root.mkdir()
+    artifact = root / "artifact"
+    artifact.write_bytes(b"immutable")
+    opened = artifact.stat()
+
+    with filesystem.anchor_directory(root) as anchor:
+        with filesystem.open_claimed_file(
+            anchor,
+            "artifact",
+            expected_parent_identity=anchor.identity,
+            expected_source_identity=(opened.st_dev, opened.st_ino),
+            expected_sha256=_sha256(b"immutable"),
+            expected_size=9,
+        ) as source:
+            with pytest.raises(OSError):
+                os.write(source.descriptor, b"changed")
+
+    assert artifact.read_bytes() == b"immutable"
+
+
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_unreleased_temporary_file_is_cleaned_on_context_exit(tmp_path, raise_inside):
+    filesystem = OwnedArtifactFilesystem()
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with filesystem.anchor_directory(root) as anchor:
+        if raise_inside:
+            with pytest.raises(RuntimeError, match="before journal"):
+                with filesystem.create_temporary_file(
+                    anchor,
+                    ".owned.tmp",
+                    expected_parent_identity=anchor.identity,
+                ) as temporary:
+                    os.write(temporary.descriptor, b"uncommitted")
+                    raise RuntimeError("before journal")
+        else:
+            with filesystem.create_temporary_file(
+                anchor,
+                ".owned.tmp",
+                expected_parent_identity=anchor.identity,
+            ) as temporary:
+                os.write(temporary.descriptor, b"uncommitted")
+
+    assert not (root / ".owned.tmp").exists()
+
+
+def test_exclusive_child_creation_refuses_an_existing_directory(tmp_path):
+    filesystem = OwnedArtifactFilesystem()
+    root = tmp_path / "data"
+    (root / "evidence").mkdir(parents=True)
+
+    with filesystem.anchor_directory(root) as anchor:
+        with pytest.raises(OwnedFilesystemError) as caught:
+            with filesystem.create_new_child_directory(
+                anchor,
+                "evidence",
+                expected_parent_identity=anchor.identity,
+            ):
+                pytest.fail("an existing unregistered directory cannot be adopted")
+
+    assert caught.value.code == "owned_destination_exists"
+
+
+def test_fixed_mutation_file_is_created_then_reopened_with_one_identity(tmp_path):
+    filesystem = OwnedArtifactFilesystem()
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with filesystem.anchor_directory(root) as anchor:
+        with filesystem.open_or_create_mutation_file(
+            anchor,
+            ".registry.sqlite3",
+            expected_parent_identity=anchor.identity,
+        ) as created:
+            os.write(created.descriptor, b"registry")
+            os.fsync(created.descriptor)
+            identity = created.identity
+        with filesystem.open_or_create_mutation_file(
+            anchor,
+            ".registry.sqlite3",
+            expected_parent_identity=anchor.identity,
+        ) as reopened:
+            assert reopened.identity == identity
+            assert filesystem.hash_open_file(reopened) == (_sha256(b"registry"), 8)
+
+
 def test_existing_child_read_and_empty_directory_removal_stay_anchored(tmp_path):
     filesystem = OwnedArtifactFilesystem()
     root = tmp_path / "data"

@@ -50,11 +50,35 @@ class OwnedDirectoryAnchor:
 
 
 @dataclass(frozen=True)
-class OwnedOpenFile:
+class OwnedReadFile:
     parent: OwnedDirectoryAnchor
     name: str
     descriptor: int
     identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class OwnedMutationFile:
+    parent: OwnedDirectoryAnchor
+    name: str
+    descriptor: int
+    identity: tuple[int, int]
+
+
+@dataclass
+class OwnedTemporaryFile:
+    parent: OwnedDirectoryAnchor
+    name: str
+    descriptor: int
+    identity: tuple[int, int]
+    _released: bool = False
+
+    def release(self) -> None:
+        self._released = True
+
+
+# Compatibility for callers migrated in the same Task 3 change set.
+OwnedOpenFile = OwnedMutationFile
 
 
 @dataclass(frozen=True)
@@ -623,6 +647,33 @@ class OwnedArtifactFilesystem:
             self._close_directory(child)
 
     @contextmanager
+    def create_new_child_directory(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+    ) -> Iterator[OwnedDirectoryAnchor]:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        try:
+            self._mkdir_child(parent, name)
+        except FileExistsError:
+            raise OwnedFilesystemError("owned_destination_exists") from None
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        child: OwnedDirectoryAnchor | None = None
+        try:
+            child = self._open_child_directory(parent, name)
+            self._assert_anchor(parent, expected_parent_identity)
+            yield child
+        finally:
+            if child is not None:
+                self._close_directory(child)
+
+    @contextmanager
     def anchor_child_directory(
         self,
         parent: OwnedDirectoryAnchor,
@@ -654,7 +705,7 @@ class OwnedArtifactFilesystem:
         name: str,
         *,
         expected_parent_identity: tuple[int, int],
-    ) -> Iterator[OwnedOpenFile]:
+    ) -> Iterator[OwnedTemporaryFile]:
         self._validate_name(name)
         self._assert_anchor(parent, expected_parent_identity)
         descriptor: int | None = None
@@ -667,7 +718,7 @@ class OwnedArtifactFilesystem:
                 descriptor = self._create_temporary_windows(parent.path / name)
             opened = os.fstat(descriptor)
             self._validate_regular(opened)
-            temporary = OwnedOpenFile(
+            temporary = OwnedTemporaryFile(
                 parent=parent,
                 name=name,
                 descriptor=descriptor,
@@ -675,7 +726,54 @@ class OwnedArtifactFilesystem:
             )
             self._assert_named_file(parent, name, temporary.identity)
             self._assert_anchor(parent, expected_parent_identity)
-            yield temporary
+            try:
+                yield temporary
+            finally:
+                if not temporary._released:
+                    self._discard_temporary_file(temporary, expected_parent_identity)
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @contextmanager
+    def open_or_create_mutation_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+    ) -> Iterator[OwnedMutationFile]:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        descriptor: int | None = None
+        try:
+            if self._platform == "posix":
+                flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+                except FileNotFoundError:
+                    descriptor = os.open(
+                        name,
+                        flags | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=parent.descriptor,
+                    )
+            else:
+                try:
+                    descriptor = self._open_file_windows(parent.path / name, mutable=True, pin=True)
+                except FileNotFoundError:
+                    descriptor = self._create_mutation_windows(parent.path / name, pin=True)
+            opened = os.fstat(descriptor)
+            self._validate_regular(opened)
+            source = OwnedMutationFile(parent, name, descriptor, (opened.st_dev, opened.st_ino))
+            self._assert_named_file(parent, name, source.identity)
+            self._assert_anchor(parent, expected_parent_identity)
+            yield source
         except OwnedFilesystemError:
             raise
         except OSError:
@@ -694,20 +792,20 @@ class OwnedArtifactFilesystem:
         expected_source_identity: tuple[int, int],
         expected_sha256: str,
         expected_size: int,
-    ) -> Iterator[OwnedOpenFile]:
+    ) -> Iterator[OwnedReadFile]:
         self._validate_name(name)
         self._assert_anchor(parent, expected_parent_identity)
         descriptor: int | None = None
         try:
             if self._platform == "posix":
-                flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                 flags |= getattr(os, "O_NOFOLLOW", 0)
                 descriptor = os.open(name, flags, dir_fd=parent.descriptor)
             else:
-                descriptor = self._open_file_windows(parent.path / name)
+                descriptor = self._open_file_windows(parent.path / name, mutable=False)
             opened = os.fstat(descriptor)
             self._validate_regular(opened, expected_source_identity)
-            source = OwnedOpenFile(parent, name, descriptor, expected_source_identity)
+            source = OwnedReadFile(parent, name, descriptor, expected_source_identity)
             digest, size = self.hash_open_file(source)
             if digest != expected_sha256 or size != expected_size:
                 raise OwnedFilesystemError("owned_content_changed")
@@ -722,7 +820,48 @@ class OwnedArtifactFilesystem:
             if descriptor is not None:
                 os.close(descriptor)
 
-    def hash_open_file(self, source: OwnedOpenFile) -> tuple[str, int]:
+    @contextmanager
+    def open_claimed_file_for_mutation(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_source_identity: tuple[int, int],
+        expected_sha256: str,
+        expected_size: int,
+    ) -> Iterator[OwnedMutationFile]:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        descriptor: int | None = None
+        try:
+            if self._platform == "posix":
+                flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+            else:
+                descriptor = self._open_file_windows(parent.path / name, mutable=True)
+            opened = os.fstat(descriptor)
+            self._validate_regular(opened, expected_source_identity)
+            source = OwnedMutationFile(parent, name, descriptor, expected_source_identity)
+            digest, size = self.hash_open_file(source)
+            if digest != expected_sha256 or size != expected_size:
+                raise OwnedFilesystemError("owned_content_changed")
+            self._assert_named_file(parent, name, expected_source_identity)
+            self._assert_anchor(parent, expected_parent_identity)
+            yield source
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def hash_open_file(
+        self,
+        source: OwnedReadFile | OwnedMutationFile | OwnedTemporaryFile,
+    ) -> tuple[str, int]:
         try:
             opened = os.fstat(source.descriptor)
             self._validate_regular(opened, source.identity)
@@ -754,7 +893,7 @@ class OwnedArtifactFilesystem:
                 flags |= getattr(os, "O_NOFOLLOW", 0)
                 descriptor = os.open(name, flags, dir_fd=parent.descriptor)
             else:
-                descriptor = self._open_file_windows(parent.path / name)
+                descriptor = self._open_file_windows(parent.path / name, mutable=False)
             opened = os.fstat(descriptor)
             self._validate_regular(opened)
             identity = (opened.st_dev, opened.st_ino)
@@ -775,7 +914,7 @@ class OwnedArtifactFilesystem:
     def replace_open_file(
         self,
         parent: OwnedDirectoryAnchor,
-        source: OwnedOpenFile,
+        source: OwnedMutationFile | OwnedTemporaryFile,
         source_name: str,
         destination_name: str,
         *,
@@ -838,6 +977,8 @@ class OwnedArtifactFilesystem:
             self._quarantine_untrusted(parent, destination_name)
             raise
         self._assert_anchor(parent, expected_parent_identity)
+        if isinstance(source, OwnedTemporaryFile):
+            source.release()
         return OwnedMutationResult(
             identity=expected_source_identity,
             sha256=digest,
@@ -859,7 +1000,7 @@ class OwnedArtifactFilesystem:
         expected_size: int,
         replace_existing: bool,
     ) -> OwnedMutationResult:
-        with self.open_claimed_file(
+        with self.open_claimed_file_for_mutation(
             parent,
             source_name,
             expected_parent_identity=expected_parent_identity,
@@ -890,7 +1031,7 @@ class OwnedArtifactFilesystem:
         expected_size: int,
     ) -> None:
         quarantine_name = f".owned-quarantine-{secrets.token_hex(16)}"
-        with self.open_claimed_file(
+        with self.open_claimed_file_for_mutation(
             parent,
             source_name,
             expected_parent_identity=expected_parent_identity,
@@ -910,7 +1051,7 @@ class OwnedArtifactFilesystem:
     def delete_open_file(
         self,
         parent: OwnedDirectoryAnchor,
-        source: OwnedOpenFile,
+        source: OwnedMutationFile | OwnedTemporaryFile,
         source_name: str,
         *,
         quarantine_name: str | None = None,
@@ -933,6 +1074,8 @@ class OwnedArtifactFilesystem:
             self._flush_directory_windows(parent)
             self._assert_named_file(parent, quarantine_name, expected_source_identity)
             self._mark_delete_windows(source.descriptor)
+            if isinstance(source, OwnedTemporaryFile):
+                source.release()
             return
         self.replace_open_file(
             parent,
@@ -951,6 +1094,27 @@ class OwnedArtifactFilesystem:
             os.fsync(parent.descriptor)
         else:
             self._mark_delete_windows(source.descriptor)
+        if isinstance(source, OwnedTemporaryFile):
+            source.release()
+
+    def _discard_temporary_file(
+        self,
+        temporary: OwnedTemporaryFile,
+        expected_parent_identity: tuple[int, int],
+    ) -> None:
+        self._assert_anchor(temporary.parent, expected_parent_identity)
+        self._assert_named_file(temporary.parent, temporary.name, temporary.identity)
+        if self._platform == "windows":
+            import msvcrt
+
+            handle = msvcrt.get_osfhandle(temporary.descriptor)
+            quarantine = temporary.parent.path / f".owned-quarantine-{secrets.token_hex(16)}"
+            self._rename_handle_windows(handle, quarantine)
+            self._flush_directory_windows(temporary.parent)
+            self._mark_delete_windows(temporary.descriptor)
+            return
+        os.unlink(temporary.name, dir_fd=temporary.parent.descriptor)
+        os.fsync(temporary.parent.descriptor)
 
     def list_names(self, anchor: OwnedDirectoryAnchor) -> tuple[str, ...]:
         self._assert_anchor(anchor, anchor.identity)
@@ -1292,18 +1456,45 @@ class OwnedArtifactFilesystem:
             self._close_handle_windows(handle)
             raise
 
-    def _open_file_windows(self, path: Path) -> int:
+    def _create_mutation_windows(self, path: Path, *, pin: bool) -> int:
         import msvcrt
 
+        share_mode = self._FILE_SHARE_READ | self._FILE_SHARE_WRITE
+        if not pin:
+            share_mode |= self._FILE_SHARE_DELETE
         handle = self._create_file_windows(
             path,
             access=self._GENERIC_READ | self._GENERIC_WRITE | self._DELETE,
-            share_mode=(self._FILE_SHARE_READ | self._FILE_SHARE_WRITE | self._FILE_SHARE_DELETE),
-            disposition=self._OPEN_EXISTING,
+            share_mode=share_mode,
+            disposition=self._CREATE_NEW,
             flags=self._FILE_ATTRIBUTE_NORMAL | self._FILE_FLAG_OPEN_REPARSE_POINT,
         )
         try:
             return msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+        except BaseException:
+            self._close_handle_windows(handle)
+            raise
+
+    def _open_file_windows(self, path: Path, *, mutable: bool, pin: bool = False) -> int:
+        import msvcrt
+
+        access = self._GENERIC_READ
+        descriptor_flags = os.O_RDONLY | os.O_BINARY
+        share_mode = self._FILE_SHARE_READ | self._FILE_SHARE_WRITE
+        if not pin:
+            share_mode |= self._FILE_SHARE_DELETE
+        if mutable:
+            access |= self._GENERIC_WRITE | self._DELETE
+            descriptor_flags = os.O_RDWR | os.O_BINARY
+        handle = self._create_file_windows(
+            path,
+            access=access,
+            share_mode=share_mode,
+            disposition=self._OPEN_EXISTING,
+            flags=self._FILE_ATTRIBUTE_NORMAL | self._FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        try:
+            return msvcrt.open_osfhandle(handle, descriptor_flags)
         except BaseException:
             self._close_handle_windows(handle)
             raise
