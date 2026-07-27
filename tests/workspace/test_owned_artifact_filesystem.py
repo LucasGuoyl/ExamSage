@@ -221,3 +221,41 @@ def test_windows_replace_uses_documented_write_through_and_required_flush(tmp_pa
     assert calls == [filesystem.MOVEFILE_REPLACE_EXISTING | filesystem.MOVEFILE_WRITE_THROUGH]
     assert result.rename_write_through is True
     assert result.final_file_flushed is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound quarantine")
+def test_windows_claimed_delete_renames_the_verified_handle(tmp_path, monkeypatch):
+    filesystem = OwnedArtifactFilesystem()
+    path_moves: list[int] = []
+    handle_moves: list[str] = []
+    real_path_move = filesystem._move_file_ex_windows
+    real_handle_move = filesystem._rename_handle_windows
+
+    def recording_path_move(source, destination, flags):
+        path_moves.append(flags)
+        return real_path_move(source, destination, flags)
+
+    def recording_handle_move(handle, destination):
+        handle_moves.append(destination.name)
+        return real_handle_move(handle, destination)
+
+    monkeypatch.setattr(filesystem, "_move_file_ex_windows", recording_path_move)
+    monkeypatch.setattr(filesystem, "_rename_handle_windows", recording_handle_move)
+    root = tmp_path / "data"
+    root.mkdir()
+    artifact = root / "artifact"
+    artifact.write_bytes(b"claimed")
+    artifact_stat = artifact.stat()
+    with filesystem.anchor_directory(root) as anchor:
+        filesystem.delete_claimed_file(
+            anchor,
+            "artifact",
+            expected_parent_identity=anchor.identity,
+            expected_source_identity=(artifact_stat.st_dev, artifact_stat.st_ino),
+            expected_sha256=_sha256(b"claimed"),
+            expected_size=7,
+        )
+
+    assert path_moves == []
+    assert len(handle_moves) == 1
+    assert handle_moves[0].startswith(".owned-quarantine-")
