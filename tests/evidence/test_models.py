@@ -54,6 +54,8 @@ def test_source_part_rejects_absolute_paths_and_secret_fields():
             "https://storage.example/file?X-Amz-Signature=abc",
         ),
         (SourcePartPlan, lambda: SOURCE_PART, "locator", "C:/private/provider.log"),
+        (SourcePartPlan, lambda: SOURCE_PART, "locator", "/etc/passwd"),
+        (SourcePartPlan, lambda: SOURCE_PART, "locator", "/"),
         (
             EvidenceCitation,
             lambda: {
@@ -103,6 +105,25 @@ def test_source_part_rejects_absolute_paths_and_secret_fields():
             },
             "content",
             "Traceback (most recent call last): provider failure",
+        ),
+        (
+            EvidenceUnit,
+            lambda: {
+                "evidence_unit_id": "unit-1",
+                "source_part_id": "part-1",
+                "content": "Ordinary course text.",
+                "citations": (
+                    EvidenceCitation(
+                        citation_id="citation-1",
+                        evidence_unit_id="unit-1",
+                        source_part_id="part-1",
+                        relative_path="course/syllabus.pdf",
+                        locator="page 1",
+                    ),
+                ),
+            },
+            "content",
+            "RuntimeError: provider failure",
         ),
         (
             EvidenceUnit,
@@ -289,3 +310,35 @@ def test_coverage_summary_has_exact_noncontradictory_partial_counts():
             covered_count=1,
             total_count=2,
         )
+
+
+def test_coverage_summary_and_snapshot_round_trip_without_derived_field_extras():
+    coverage = CoverageSummary(
+        items=(
+            CoverageItem(topic="Limits", covered=True),
+            CoverageItem(topic="Continuity", covered=False),
+        ),
+        covered_count=1,
+        total_count=2,
+    )
+    snapshot = StudyMapSnapshot(
+        snapshot_id="s" * 32,
+        workspace_id="w" * 32,
+        revision_id="r" * 32,
+        status=SnapshotStatus.INITIAL,
+        nodes=(
+            KnowledgeNode(
+                node_id="node-1",
+                title="Limits",
+                focus_score=0.9,
+                confidence=0.5,
+                evidence_unit_ids=("unit-1",),
+            ),
+        ),
+        coverage=coverage,
+        evidence_unit_ids=("unit-1",),
+        created_at=NOW,
+    )
+
+    assert CoverageSummary.model_validate(coverage.model_dump()) == coverage
+    assert StudyMapSnapshot.model_validate_json(snapshot.model_dump_json()) == snapshot

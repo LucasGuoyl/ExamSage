@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 import re
 
-from pydantic import ConfigDict, Field, computed_field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from exam_predictor.workspace.models import FrozenModel, normalize_relative_path
 
@@ -20,8 +20,17 @@ _SENSITIVE_EVIDENCE_PATTERNS = (
         r"x-goog-(?:signature|credential)|sig|signature|token|access_token)=",
         re.IGNORECASE,
     ),
-    re.compile(r"(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/]|/(?:home|users|var|tmp)/)", re.IGNORECASE),
+    re.compile(r"(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/])", re.IGNORECASE),
+    re.compile(
+        r"(?<!\S)/(?:etc|usr|bin|sbin|opt|root|proc|sys|dev|run|mnt|media|home|var|tmp)(?:/|$)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^/$"),
     re.compile(r"traceback \(most recent call last\)|<(?:openai|google\.genai|httpx)\.", re.IGNORECASE),
+    re.compile(
+        r"^(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)|KeyboardInterrupt|SystemExit):\s+\S+",
+        re.MULTILINE,
+    ),
 )
 
 
@@ -134,12 +143,10 @@ class CoverageSummary(EvidenceFrozenModel):
     covered_count: int = Field(ge=0)
     total_count: int = Field(ge=1)
 
-    @computed_field
     @property
     def coverage_fraction(self) -> float:
         return self.covered_count / self.total_count
 
-    @computed_field
     @property
     def is_partial(self) -> bool:
         return 0 < self.covered_count < self.total_count
