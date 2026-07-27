@@ -345,6 +345,21 @@ class EvidenceArtifactRegistry:
             if cursor.rowcount != 1:
                 raise RegistryError("registry_state_conflict")
 
+    def abort_publish(self, workspace_id: str, *, expected_phases: set[str]) -> None:
+        if not expected_phases or not expected_phases <= {"prepared", "backup"}:
+            raise RegistryError("registry_claim_invalid")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT phase FROM publish_journal WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+            if row is None or str(row["phase"]) not in expected_phases:
+                raise RegistryError("registry_state_conflict")
+            connection.execute(
+                "DELETE FROM publish_journal WHERE workspace_id = ?",
+                (workspace_id,),
+            )
+
     def begin_delete(self, workspace_id: str) -> tuple[DeleteJournalItem, ...]:
         with self._transaction() as connection:
             workspace = connection.execute(
@@ -387,6 +402,24 @@ class EvidenceArtifactRegistry:
             (workspace_id,),
         )
         return tuple(self._delete_from_row(row) for row in rows)
+
+    def plan_delete_quarantine(
+        self,
+        workspace_id: str,
+        slot: str,
+        quarantine_name: str,
+    ) -> None:
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE delete_journal SET quarantine_name = ?
+                WHERE workspace_id = ? AND slot = ? AND phase = 'planned'
+                  AND (quarantine_name IS NULL OR quarantine_name = ?)
+                """,
+                (quarantine_name, workspace_id, slot, quarantine_name),
+            )
+            if cursor.rowcount != 1:
+                raise RegistryError("registry_state_conflict")
 
     def advance_delete_item(
         self,

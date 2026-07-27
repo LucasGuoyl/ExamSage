@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 
@@ -101,6 +102,25 @@ def test_registry_uses_fixed_pinned_file_and_required_sqlite_pragmas(tmp_path):
                 "publish_journal",
                 "delete_journal",
             } <= tables
+
+
+def test_registry_file_is_pinned_or_replacement_is_detected_before_next_read(tmp_path):
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with _open_registry(root) as registry:
+        displaced = root / "displaced-registry"
+        try:
+            registry.path.rename(displaced)
+        except PermissionError:
+            assert os.name == "nt"
+            assert registry.get_workspace(WORKSPACE_ID) is None
+            return
+        registry.path.write_bytes(b"replacement")
+
+        with pytest.raises(RegistryError) as caught:
+            registry.get_workspace(WORKSPACE_ID)
+        assert caught.value.code == "registry_identity_changed"
 
 
 def test_workspace_bootstrap_is_reserve_then_compare_and_swap_finalize(tmp_path):
@@ -212,3 +232,43 @@ def test_delete_journal_survives_restart_and_workspace_clear_cascades(tmp_path):
         assert restarted.get_collection_identities(WORKSPACE_ID) == {}
         assert restarted.get_artifact(WORKSPACE_ID, NEW_CLAIM.slot) is None
         assert restarted.get_delete_items(WORKSPACE_ID) == ()
+
+
+def test_publish_abort_clears_only_the_expected_uncommitted_phase(tmp_path):
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with _open_registry(root) as registry:
+        _active_workspace(registry)
+        registry.prepare_publish(_publish_journal(old_claim=None))
+        registry.abort_publish(WORKSPACE_ID, expected_phases={"prepared", "backup"})
+        assert registry.get_publish_journal(WORKSPACE_ID) is None
+        assert registry.get_artifact(WORKSPACE_ID, NEW_CLAIM.slot) is None
+
+        with pytest.raises(RegistryError) as caught:
+            registry.abort_publish(WORKSPACE_ID, expected_phases={"prepared"})
+        assert caught.value.code == "registry_state_conflict"
+
+
+def test_delete_quarantine_name_is_durable_before_the_filesystem_move(tmp_path):
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with _open_registry(root) as registry:
+        _active_workspace(registry)
+        registry.prepare_publish(_publish_journal(old_claim=None))
+        registry.advance_publish(WORKSPACE_ID, expected_phase="prepared", new_phase="backup")
+        registry.advance_publish(WORKSPACE_ID, expected_phase="backup", new_phase="installed")
+        registry.commit_publish(WORKSPACE_ID, NEW_CLAIM)
+        registry.clear_publish(WORKSPACE_ID)
+        registry.begin_delete(WORKSPACE_ID)
+        registry.plan_delete_quarantine(
+            WORKSPACE_ID,
+            NEW_CLAIM.slot,
+            ".owned-quarantine-before-move",
+        )
+
+    with _open_registry(root) as restarted:
+        item = restarted.get_delete_items(WORKSPACE_ID)[0]
+        assert item.phase == "planned"
+        assert item.quarantine_name == ".owned-quarantine-before-move"

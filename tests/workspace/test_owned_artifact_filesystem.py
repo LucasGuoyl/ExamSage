@@ -197,6 +197,32 @@ def test_fixed_mutation_file_is_created_then_reopened_with_one_identity(tmp_path
             assert filesystem.hash_open_file(reopened) == (_sha256(b"registry"), 8)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound temp cleanup")
+def test_windows_temp_cleanup_marks_exact_handle_even_when_directory_flush_fails(
+    tmp_path,
+    monkeypatch,
+):
+    filesystem = OwnedArtifactFilesystem()
+    root = tmp_path / "data"
+    root.mkdir()
+
+    def fail_flush(parent):
+        del parent
+        raise OSError("directory flush failed")
+
+    monkeypatch.setattr(filesystem, "_flush_directory_windows", fail_flush)
+    with filesystem.anchor_directory(root) as anchor:
+        with pytest.raises(OwnedFilesystemError):
+            with filesystem.create_temporary_file(
+                anchor,
+                ".owned.tmp",
+                expected_parent_identity=anchor.identity,
+            ) as temporary:
+                os.write(temporary.descriptor, b"uncommitted")
+
+    assert list(root.iterdir()) == []
+
+
 def test_existing_child_read_and_empty_directory_removal_stay_anchored(tmp_path):
     filesystem = OwnedArtifactFilesystem()
     root = tmp_path / "data"

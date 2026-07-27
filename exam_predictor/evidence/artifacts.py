@@ -7,17 +7,26 @@ import math
 import os
 import re
 import secrets
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
 from exam_predictor.evidence.models import EvidenceUnit, StudyMapSnapshot
+from exam_predictor.evidence.registry import (
+    ArtifactClaim,
+    DeleteJournalItem,
+    EvidenceArtifactRegistry,
+    PublishJournal,
+    RegistryError,
+    WorkspaceClaim,
+)
 from exam_predictor.workspace.filesystem import (
     OwnedArtifactFilesystem,
     OwnedDirectoryAnchor,
     OwnedFilesystemError,
-    OwnedOpenFile,
+    OwnedTemporaryFile,
 )
 
 
@@ -26,16 +35,12 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _JSON_TYPES = frozenset({"units", "snapshots"})
 _COLLECTIONS = ("parts", "units", "snapshots")
 _KIND_BY_COLLECTION = {"parts": "part", "units": "unit", "snapshots": "snapshot"}
-_OWNERSHIP_NAME = ".artifact-ownership.json"
-_OWNERSHIP_VERSION = 2
-_MAX_MARKER_BYTES = 1024 * 1024
 _MAX_JSON_BYTES = 8 * 1024 * 1024
 _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 100_000
 _MAX_JSON_STRING_BYTES = 1024 * 1024
 
 Identity = tuple[int, int]
-Claim = dict[str, Any]
 
 
 class ArtifactBoundaryError(RuntimeError):
@@ -49,37 +54,38 @@ class ArtifactCleanupState(StrEnum):
     CLEANUP_PENDING = "cleanup_pending"
 
 
-# Backward-compatible public name; all mutation mechanics now live in the shared adapter.
-NativeArtifactFilesystemOps = OwnedArtifactFilesystem
-ArtifactFilesystemOps = OwnedArtifactFilesystem
+@dataclass(frozen=True)
+class _WorkspaceTree:
+    claim: WorkspaceClaim
+    workspace: OwnedDirectoryAnchor
+    evidence: OwnedDirectoryAnchor
+    collections: dict[str, OwnedDirectoryAnchor]
 
 
 class EvidenceArtifactStore:
-    """Marker-authoritative evidence artifacts below a trusted existing data root."""
+    """Registry-authoritative evidence artifacts below a trusted existing root."""
 
-    def __init__(
-        self,
-        root: Path,
-        *,
-        filesystem_ops: OwnedArtifactFilesystem | None = None,
-    ) -> None:
+    def __init__(self, root: Path) -> None:
         self._root = Path(root).absolute()
-        self._filesystem = filesystem_ops or OwnedArtifactFilesystem()
+        self._filesystem = OwnedArtifactFilesystem()
         self._root_context = self._filesystem.anchor_directory(self._root)
+        self._root_anchor: OwnedDirectoryAnchor | None = None
+        self._registry: EvidenceArtifactRegistry | None = None
+        self._closed = False
         try:
             self._root_anchor = self._root_context.__enter__()
         except OwnedFilesystemError as error:
             code = "artifact_root_missing" if error.code == "owned_root_missing" else "artifact_root_invalid"
             raise ArtifactBoundaryError(code) from None
-        self._closed = False
         try:
+            self._registry = EvidenceArtifactRegistry(self._root_anchor, self._filesystem)
             with self._filesystem.create_child_directory(
                 self._root_anchor,
                 "workspaces",
                 expected_parent_identity=self._root_anchor.identity,
             ):
                 pass
-        except OwnedFilesystemError:
+        except Exception:
             self.close()
             raise ArtifactBoundaryError("artifact_root_invalid") from None
 
@@ -87,7 +93,12 @@ class EvidenceArtifactStore:
         if self._closed:
             return
         self._closed = True
-        self._root_context.__exit__(None, None, None)
+        if self._registry is not None:
+            self._registry.close()
+            self._registry = None
+        if self._root_anchor is not None:
+            self._root_context.__exit__(None, None, None)
+            self._root_anchor = None
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
@@ -114,37 +125,40 @@ class EvidenceArtifactStore:
                 expected_sha256,
                 suffix="",
             )
+        except ArtifactBoundaryError:
+            raise
+        except RegistryError as error:
+            self._raise_registry_boundary(error)
         except OwnedFilesystemError as error:
             self._raise_filesystem_boundary(error)
-        except OSError:
+        except Exception:
             raise ArtifactBoundaryError("artifact_publish_failed") from None
 
     @contextmanager
     def open_part(self, workspace_id: str, part_id: str) -> Iterator[BinaryIO]:
         self._validate_identifier(workspace_id)
         self._validate_identifier(part_id)
-        with self._collection(workspace_id, "parts", create=False) as (
-            workspace,
-            evidence,
-            collection,
-            ownership,
-        ):
-            del workspace, evidence
-            claim = self._claim(ownership, "parts", part_id)
-            try:
+        try:
+            with self._ready_tree(workspace_id, create=False) as tree:
+                claim = self._claim(workspace_id, "parts", part_id)
+                collection = tree.collections["parts"]
                 with self._filesystem.open_claimed_file(
                     collection,
                     part_id,
                     expected_parent_identity=collection.identity,
-                    expected_source_identity=self._claim_identity(claim),
-                    expected_sha256=claim["sha256"],
-                    expected_size=claim["size"],
+                    expected_source_identity=claim.identity,
+                    expected_sha256=claim.sha256,
+                    expected_size=claim.size,
                 ) as opened:
                     with os.fdopen(os.dup(opened.descriptor), "rb", buffering=0) as source:
                         yield source
                     self._filesystem.anchor_identity(collection)
-            except OwnedFilesystemError:
-                raise ArtifactBoundaryError("artifact_identity_changed") from None
+        except ArtifactBoundaryError:
+            raise
+        except (RegistryError, OwnedFilesystemError):
+            raise ArtifactBoundaryError("artifact_identity_changed") from None
+        except Exception:
+            raise ArtifactBoundaryError("artifact_identity_changed") from None
 
     def publish_json(
         self,
@@ -168,9 +182,13 @@ class EvidenceArtifactStore:
                 expected_sha256,
                 suffix=".json",
             )
+        except ArtifactBoundaryError:
+            raise
+        except RegistryError as error:
+            self._raise_registry_boundary(error)
         except OwnedFilesystemError as error:
             self._raise_filesystem_boundary(error)
-        except OSError:
+        except Exception:
             raise ArtifactBoundaryError("artifact_publish_failed") from None
 
     def read_json(
@@ -183,122 +201,73 @@ class EvidenceArtifactStore:
         self._validate_json_type(artifact_type)
         self._validate_identifier(artifact_id)
         filename = f"{artifact_id}.json"
-        with self._collection(workspace_id, artifact_type, create=False) as (
-            workspace,
-            evidence,
-            collection,
-            ownership,
-        ):
-            del workspace, evidence
-            claim = self._claim(ownership, artifact_type, filename)
-            try:
+        try:
+            with self._ready_tree(workspace_id, create=False) as tree:
+                claim = self._claim(workspace_id, artifact_type, filename)
+                collection = tree.collections[artifact_type]
                 with self._filesystem.open_claimed_file(
                     collection,
                     filename,
                     expected_parent_identity=collection.identity,
-                    expected_source_identity=self._claim_identity(claim),
-                    expected_sha256=claim["sha256"],
-                    expected_size=claim["size"],
+                    expected_source_identity=claim.identity,
+                    expected_sha256=claim.sha256,
+                    expected_size=claim.size,
                 ) as opened:
-                    if claim["size"] > _MAX_JSON_BYTES:
+                    if claim.size > _MAX_JSON_BYTES:
                         raise ArtifactBoundaryError("artifact_json_too_large")
                     os.lseek(opened.descriptor, 0, os.SEEK_SET)
                     content = os.read(opened.descriptor, _MAX_JSON_BYTES + 1)
-            except ArtifactBoundaryError:
-                raise
-            except OwnedFilesystemError:
-                raise ArtifactBoundaryError("artifact_identity_changed") from None
+        except ArtifactBoundaryError:
+            raise
+        except (RegistryError, OwnedFilesystemError):
+            raise ArtifactBoundaryError("artifact_identity_changed") from None
+        except Exception:
+            raise ArtifactBoundaryError("artifact_identity_changed") from None
         return self._decode_json(workspace_id, artifact_type, artifact_id, content)
 
     def delete_workspace(self, workspace_id: str) -> ArtifactCleanupState:
         self._validate_identifier(workspace_id)
-        collection_identities: dict[str, Identity] = {}
-        evidence_identity: Identity | None = None
         try:
-            with self._evidence(workspace_id, create=False) as (
-                workspace,
-                evidence,
-                ownership,
-                marker_identity,
-                marker_bytes,
-            ):
-                evidence_identity = evidence.identity
-                root_names = set(self._filesystem.list_names(evidence))
-                if not root_names <= {_OWNERSHIP_NAME, *_COLLECTIONS}:
-                    return ArtifactCleanupState.CLEANUP_PENDING
-                claims = ownership["artifacts"]
-                opened_collections: dict[str, OwnedDirectoryAnchor] = {}
-                unknown_entry = False
-                with contextlib.ExitStack() as stack:
-                    for collection_name in _COLLECTIONS:
-                        expected_names = {
-                            slot.split("/", 1)[1] for slot in claims if slot.startswith(f"{collection_name}/")
-                        }
-                        if collection_name not in root_names:
-                            if expected_names:
-                                raise ArtifactBoundaryError("artifact_identity_changed")
-                            continue
-                        collection = stack.enter_context(
-                            self._filesystem.anchor_child_directory(
-                                evidence,
-                                collection_name,
-                                expected_parent_identity=evidence.identity,
-                            )
-                        )
-                        opened_collections[collection_name] = collection
-                        collection_identities[collection_name] = collection.identity
-                        if set(self._filesystem.list_names(collection)) != expected_names:
-                            unknown_entry = True
-                    for slot, claim in sorted(claims.items()):
-                        collection_name, filename = slot.split("/", 1)
-                        self._verify_claimed_name(opened_collections[collection_name], filename, claim)
-                    if unknown_entry:
-                        return ArtifactCleanupState.CLEANUP_PENDING
-                    for slot, claim in sorted(claims.items()):
-                        collection_name, filename = slot.split("/", 1)
-                        collection = opened_collections[collection_name]
-                        self._filesystem.delete_claimed_file(
-                            collection,
-                            filename,
-                            expected_parent_identity=collection.identity,
-                            expected_source_identity=self._claim_identity(claim),
-                            expected_sha256=claim["sha256"],
-                            expected_size=claim["size"],
-                        )
-                for collection_name, identity in collection_identities.items():
-                    self._filesystem.remove_empty_directory(
-                        evidence,
-                        collection_name,
-                        expected_parent_identity=evidence.identity,
-                        expected_child_identity=identity,
-                    )
-                self._filesystem.delete_claimed_file(
-                    evidence,
-                    _OWNERSHIP_NAME,
-                    expected_parent_identity=evidence.identity,
-                    expected_source_identity=marker_identity,
-                    expected_sha256=hashlib.sha256(marker_bytes).hexdigest(),
-                    expected_size=len(marker_bytes),
-                )
-            if evidence_identity is None:
+            registry = self._require_registry()
+            claim = registry.get_workspace(workspace_id)
+            if claim is None:
                 return ArtifactCleanupState.DELETED
-            with self._workspace(workspace_id, create=False) as workspace:
-                self._filesystem.remove_empty_directory(
-                    workspace,
-                    "evidence",
-                    expected_parent_identity=workspace.identity,
-                    expected_child_identity=evidence_identity,
-                )
+            if claim.phase == "reserved":
+                return ArtifactCleanupState.CLEANUP_PENDING
+            if registry.get_publish_journal(workspace_id) is not None:
+                with self._open_tree(workspace_id, allowed_phases={"active"}) as tree:
+                    self._recover_publish(tree)
+                if registry.get_publish_journal(workspace_id) is not None:
+                    return ArtifactCleanupState.CLEANUP_PENDING
+            claim = registry.get_workspace(workspace_id)
+            if claim is None:
+                return ArtifactCleanupState.DELETED
+            if claim.phase == "active":
+                registry.begin_delete(workspace_id)
+            elif claim.phase != "deleting":
+                return ArtifactCleanupState.CLEANUP_PENDING
+            items = registry.get_delete_items(workspace_id)
+            if any(item.phase != "removed" for item in items):
+                with self._open_tree(workspace_id, allowed_phases={"deleting"}) as tree:
+                    if not self._delete_layout_is_known(tree, items):
+                        return ArtifactCleanupState.CLEANUP_PENDING
+                    self._delete_claimed_items(tree, items)
+            items = registry.get_delete_items(workspace_id)
+            if any(item.phase != "removed" for item in items):
+                return ArtifactCleanupState.CLEANUP_PENDING
+            self._remove_deleted_tree(workspace_id)
             return ArtifactCleanupState.DELETED
         except ArtifactBoundaryError:
             raise
+        except RegistryError as error:
+            if error.code in {"registry_identity_changed", "registry_claim_invalid"}:
+                raise ArtifactBoundaryError("artifact_identity_changed") from None
+            return ArtifactCleanupState.CLEANUP_PENDING
         except OwnedFilesystemError as error:
-            if error.code in {"owned_not_found", "owned_root_missing"}:
-                return ArtifactCleanupState.DELETED
             if error.code == "owned_identity_changed":
                 raise ArtifactBoundaryError("artifact_identity_changed") from None
             return ArtifactCleanupState.CLEANUP_PENDING
-        except OSError:
+        except Exception:
             return ArtifactCleanupState.CLEANUP_PENDING
 
     def _publish_bytes(
@@ -315,14 +284,11 @@ class EvidenceArtifactStore:
         if hashlib.sha256(content).hexdigest() != expected_sha256:
             raise ArtifactBoundaryError("artifact_hash_mismatch")
         filename = f"{artifact_id}{suffix}"
-        with self._collection(workspace_id, artifact_type, create=True) as (
-            workspace,
-            evidence,
-            collection,
-            ownership,
-        ):
-            slot = f"{artifact_type}/{filename}"
-            old_claim = ownership["artifacts"].get(slot)
+        slot = f"{artifact_type}/{filename}"
+        with self._ready_tree(workspace_id, create=True) as tree:
+            registry = self._require_registry()
+            collection = tree.collections[artifact_type]
+            old_claim = registry.get_artifact(workspace_id, slot)
             if old_claim is None:
                 if self._filesystem.name_exists(
                     collection,
@@ -334,485 +300,542 @@ class EvidenceArtifactStore:
                 self._verify_claimed_name(collection, filename, old_claim)
             temporary_name = f".artifact-{secrets.token_hex(16)}.tmp"
             backup_name = f".artifact-{secrets.token_hex(16)}.backup"
-            with self._filesystem.create_temporary_file(
-                collection,
-                temporary_name,
-                expected_parent_identity=collection.identity,
-            ) as temporary:
-                self._write_descriptor(temporary.descriptor, content)
-                digest, size = self._filesystem.hash_open_file(temporary)
-                if digest != expected_sha256 or size != len(content):
-                    raise ArtifactBoundaryError("artifact_hash_mismatch")
-                new_claim = self._make_claim(
-                    slot,
-                    artifact_type,
-                    artifact_id,
-                    temporary.identity,
-                    digest,
-                    size,
-                )
-                pending = {
-                    "phase": "prepared",
-                    "slot": slot,
-                    "target": filename,
-                    "temporary": temporary_name,
-                    "backup": backup_name,
-                    "new": new_claim,
-                    "old": old_claim,
-                }
-                self._write_marker(workspace, evidence, ownership["artifacts"], pending)
-                try:
-                    if old_claim is not None:
-                        self._filesystem.move_claimed_file(
-                            collection,
-                            filename,
-                            backup_name,
-                            expected_parent_identity=collection.identity,
-                            expected_source_identity=self._claim_identity(old_claim),
-                            expected_sha256=old_claim["sha256"],
-                            expected_size=old_claim["size"],
-                            replace_existing=False,
-                        )
-                    self._filesystem.replace_open_file(
-                        collection,
-                        temporary,
-                        temporary_name,
-                        filename,
-                        expected_parent_identity=collection.identity,
-                        expected_source_identity=temporary.identity,
-                        expected_sha256=digest,
-                        expected_size=size,
-                        replace_existing=True,
+            try:
+                with self._filesystem.create_temporary_file(
+                    collection,
+                    temporary_name,
+                    expected_parent_identity=collection.identity,
+                ) as temporary:
+                    self._write_descriptor(temporary.descriptor, content)
+                    digest, size = self._filesystem.hash_open_file(temporary)
+                    if digest != expected_sha256 or size != len(content):
+                        raise ArtifactBoundaryError("artifact_hash_mismatch")
+                    new_claim = ArtifactClaim(
+                        workspace_id=workspace_id,
+                        slot=slot,
+                        collection=artifact_type,
+                        kind=_KIND_BY_COLLECTION[artifact_type],
+                        artifact_id=artifact_id,
+                        identity=temporary.identity,
+                        sha256=digest,
+                        size=size,
                     )
-                    self._verify_claimed_name(collection, filename, new_claim)
-                    new_artifacts = dict(ownership["artifacts"])
-                    new_artifacts[slot] = new_claim
-                    committed = dict(pending)
-                    committed["phase"] = "committed"
-                    self._write_marker(workspace, evidence, new_artifacts, committed)
-                except BaseException as error:
-                    if isinstance(error, Exception):
-                        self._rollback_pending(
-                            workspace,
-                            evidence,
-                            collection,
-                            ownership["artifacts"],
-                            pending,
-                            temporary=temporary,
-                        )
-                    raise
-                if old_claim is not None:
-                    self._delete_if_claimed(collection, backup_name, old_claim)
-                self._write_marker(workspace, evidence, new_artifacts, None)
+                    journal = PublishJournal(
+                        workspace_id=workspace_id,
+                        slot=slot,
+                        phase="prepared",
+                        target_name=filename,
+                        temporary_name=temporary_name,
+                        backup_name=backup_name,
+                        new_claim=new_claim,
+                        old_claim=old_claim,
+                    )
+                    registry.prepare_publish(journal)
+                    self._install_publish(tree, journal, temporary)
+            except BaseException as error:
+                if isinstance(error, Exception):
+                    with contextlib.suppress(Exception):
+                        self._recover_publish(tree)
+                raise
         return expected_sha256
 
-    def _rollback_pending(
+    def _install_publish(
         self,
-        workspace: OwnedDirectoryAnchor,
-        evidence: OwnedDirectoryAnchor,
-        collection: OwnedDirectoryAnchor,
-        old_artifacts: dict[str, Claim],
-        pending: dict[str, Any],
-        *,
-        temporary: OwnedOpenFile | None = None,
+        tree: _WorkspaceTree,
+        journal: PublishJournal,
+        temporary: OwnedTemporaryFile,
     ) -> None:
-        new_claim = pending["new"]
-        old_claim = pending["old"]
-        target_exists = self._filesystem.name_exists(
-            collection,
-            pending["target"],
-            expected_parent_identity=collection.identity,
-        )
-        if target_exists:
-            if temporary is not None and self._filesystem.name_has_identity(
-                collection,
-                pending["target"],
-                expected_parent_identity=collection.identity,
-                expected_source_identity=temporary.identity,
-            ):
-                self._filesystem.delete_open_file(
-                    collection,
-                    temporary,
-                    pending["target"],
-                    expected_parent_identity=collection.identity,
-                    expected_source_identity=temporary.identity,
-                )
-            elif self._matches_claim(collection, pending["target"], new_claim):
-                if temporary is not None:
-                    self._filesystem.delete_open_file(
-                        collection,
-                        temporary,
-                        pending["target"],
-                        expected_parent_identity=collection.identity,
-                        expected_source_identity=temporary.identity,
-                    )
-                else:
-                    self._delete_if_claimed(collection, pending["target"], new_claim)
-            elif old_claim is None or not self._matches_claim(collection, pending["target"], old_claim):
-                raise ArtifactBoundaryError("artifact_identity_changed")
-        if old_claim is not None and self._is_claimed_name(collection, pending["backup"], old_claim):
-            if self._filesystem.name_exists(
-                collection,
-                pending["target"],
-                expected_parent_identity=collection.identity,
-            ):
-                raise ArtifactBoundaryError("artifact_identity_changed")
+        registry = self._require_registry()
+        collection = tree.collections[journal.new_claim.collection]
+        old_claim = journal.old_claim
+        if old_claim is not None:
             self._filesystem.move_claimed_file(
                 collection,
-                pending["backup"],
-                pending["target"],
+                journal.target_name,
+                journal.backup_name,
                 expected_parent_identity=collection.identity,
-                expected_source_identity=self._claim_identity(old_claim),
-                expected_sha256=old_claim["sha256"],
-                expected_size=old_claim["size"],
+                expected_source_identity=old_claim.identity,
+                expected_sha256=old_claim.sha256,
+                expected_size=old_claim.size,
                 replace_existing=False,
             )
-        if temporary is not None and self._filesystem.name_exists(
+        registry.advance_publish(
+            journal.workspace_id,
+            expected_phase="prepared",
+            new_phase="backup",
+        )
+        self._filesystem.replace_open_file(
             collection,
-            pending["temporary"],
+            temporary,
+            journal.temporary_name,
+            journal.target_name,
+            expected_parent_identity=collection.identity,
+            expected_source_identity=temporary.identity,
+            expected_sha256=journal.new_claim.sha256,
+            expected_size=journal.new_claim.size,
+            replace_existing=True,
+        )
+        self._verify_claimed_name(collection, journal.target_name, journal.new_claim)
+        registry.advance_publish(
+            journal.workspace_id,
+            expected_phase="backup",
+            new_phase="installed",
+        )
+        registry.commit_publish(journal.workspace_id, journal.new_claim)
+        if old_claim is not None:
+            self._delete_if_claimed(collection, journal.backup_name, old_claim)
+        registry.clear_publish(journal.workspace_id)
+
+    def _recover_publish(self, tree: _WorkspaceTree) -> None:
+        registry = self._require_registry()
+        journal = registry.get_publish_journal(tree.claim.workspace_id)
+        if journal is None:
+            return
+        collection = tree.collections[journal.new_claim.collection]
+        if journal.phase in {"prepared", "backup"}:
+            self._rollback_publish(collection, journal)
+            registry.abort_publish(
+                journal.workspace_id,
+                expected_phases={"prepared", "backup"},
+            )
+            return
+        if journal.phase == "installed":
+            self._require_name_claim(collection, journal.target_name, journal.new_claim)
+            self._delete_named_claim_if_present(
+                collection,
+                journal.temporary_name,
+                journal.new_claim,
+            )
+            self._validate_optional_backup(collection, journal)
+            registry.commit_publish(journal.workspace_id, journal.new_claim)
+            journal = registry.get_publish_journal(journal.workspace_id)
+            if journal is None:
+                raise RegistryError("registry_state_conflict")
+        if journal.phase != "committed":
+            raise RegistryError("registry_state_conflict")
+        self._require_name_claim(collection, journal.target_name, journal.new_claim)
+        committed = registry.get_artifact(journal.workspace_id, journal.slot)
+        if committed != journal.new_claim:
+            raise RegistryError("registry_state_conflict")
+        self._delete_named_claim_if_present(
+            collection,
+            journal.temporary_name,
+            journal.new_claim,
+        )
+        if journal.old_claim is not None:
+            self._delete_named_claim_if_present(
+                collection,
+                journal.backup_name,
+                journal.old_claim,
+            )
+        elif self._filesystem.name_exists(
+            collection,
+            journal.backup_name,
             expected_parent_identity=collection.identity,
         ):
-            self._filesystem.delete_open_file(
-                collection,
-                temporary,
-                pending["temporary"],
-                expected_parent_identity=collection.identity,
-                expected_source_identity=temporary.identity,
-            )
-        else:
-            self._delete_if_claimed(collection, pending["temporary"], new_claim)
-        self._write_marker(workspace, evidence, old_artifacts, None)
+            raise ArtifactBoundaryError("artifact_identity_changed")
+        registry.clear_publish(journal.workspace_id)
 
-    def _recover_pending(
+    def _rollback_publish(
         self,
-        workspace: OwnedDirectoryAnchor,
-        evidence: OwnedDirectoryAnchor,
-        ownership: dict[str, Any],
-    ) -> dict[str, Any]:
-        pending = ownership["pending"]
-        if pending is None:
-            return ownership
-        collection_name = pending["slot"].split("/", 1)[0]
-        with self._filesystem.anchor_child_directory(
-            evidence,
-            collection_name,
-            expected_parent_identity=evidence.identity,
-        ) as collection:
-            if pending["phase"] == "committed":
-                if not self._is_claimed_name(collection, pending["target"], pending["new"]):
-                    raise ArtifactBoundaryError("artifact_identity_changed")
-                if pending["old"] is not None:
-                    self._delete_if_claimed(collection, pending["backup"], pending["old"])
-                self._delete_if_claimed(collection, pending["temporary"], pending["new"])
-                return self._write_marker(workspace, evidence, ownership["artifacts"], None)
-            old_artifacts = dict(ownership["artifacts"])
-            self._rollback_pending(workspace, evidence, collection, old_artifacts, pending)
-            return self._load_marker(workspace, evidence, recover=False)[0]
+        collection: OwnedDirectoryAnchor,
+        journal: PublishJournal,
+    ) -> None:
+        target = self._classify_name(
+            collection,
+            journal.target_name,
+            tuple(claim for claim in (journal.old_claim, journal.new_claim) if claim is not None),
+        )
+        temporary = self._classify_name(
+            collection,
+            journal.temporary_name,
+            (journal.new_claim,),
+        )
+        backup_claims = () if journal.old_claim is None else (journal.old_claim,)
+        backup = self._classify_name(collection, journal.backup_name, backup_claims)
+        if journal.old_claim is None:
+            if target is journal.new_claim:
+                self._delete_if_claimed(collection, journal.target_name, journal.new_claim)
+            if temporary is journal.new_claim:
+                self._delete_if_claimed(collection, journal.temporary_name, journal.new_claim)
+            if backup is not None:
+                raise ArtifactBoundaryError("artifact_identity_changed")
+            return
+        old_claim = journal.old_claim
+        if target is journal.new_claim:
+            self._delete_if_claimed(collection, journal.target_name, journal.new_claim)
+            target = None
+        if temporary is journal.new_claim:
+            self._delete_if_claimed(collection, journal.temporary_name, journal.new_claim)
+        if target is old_claim:
+            if backup is not None:
+                raise ArtifactBoundaryError("artifact_identity_changed")
+            return
+        if target is not None or backup is not old_claim:
+            raise ArtifactBoundaryError("artifact_operation_pending")
+        self._filesystem.move_claimed_file(
+            collection,
+            journal.backup_name,
+            journal.target_name,
+            expected_parent_identity=collection.identity,
+            expected_source_identity=old_claim.identity,
+            expected_sha256=old_claim.sha256,
+            expected_size=old_claim.size,
+            replace_existing=False,
+        )
+
+    def _validate_optional_backup(
+        self,
+        collection: OwnedDirectoryAnchor,
+        journal: PublishJournal,
+    ) -> None:
+        if journal.old_claim is None:
+            if self._filesystem.name_exists(
+                collection,
+                journal.backup_name,
+                expected_parent_identity=collection.identity,
+            ):
+                raise ArtifactBoundaryError("artifact_identity_changed")
+            return
+        self._require_name_claim(collection, journal.backup_name, journal.old_claim)
 
     @contextmanager
-    def _workspace(self, workspace_id: str, *, create: bool) -> Iterator[OwnedDirectoryAnchor]:
-        with contextlib.ExitStack() as stack:
+    def _ready_tree(self, workspace_id: str, *, create: bool) -> Iterator[_WorkspaceTree]:
+        registry = self._require_registry()
+        claim = registry.get_workspace(workspace_id)
+        if claim is None and create:
+            self._bootstrap_workspace(workspace_id)
+            claim = registry.get_workspace(workspace_id)
+        if claim is None:
+            raise ArtifactBoundaryError("artifact_identity_changed")
+        if claim.phase != "active":
+            raise ArtifactBoundaryError("artifact_operation_pending")
+        if registry.get_publish_journal(workspace_id) is not None:
+            with self._open_tree(workspace_id, allowed_phases={"active"}) as recovery_tree:
+                self._recover_publish(recovery_tree)
+            if registry.get_publish_journal(workspace_id) is not None:
+                raise ArtifactBoundaryError("artifact_operation_pending")
+        with self._open_tree(workspace_id, allowed_phases={"active"}) as tree:
+            yield tree
+
+    def _bootstrap_workspace(self, workspace_id: str) -> None:
+        registry = self._require_registry()
+        if not registry.reserve_workspace(workspace_id):
+            claim = registry.get_workspace(workspace_id)
+            if claim is None or claim.phase != "active":
+                raise ArtifactBoundaryError("artifact_operation_pending")
+            return
+        root = self._require_root()
+        with self._filesystem.anchor_child_directory(
+            root,
+            "workspaces",
+            expected_parent_identity=root.identity,
+        ) as workspaces:
+            with self._filesystem.create_child_directory(
+                workspaces,
+                workspace_id,
+                expected_parent_identity=workspaces.identity,
+            ) as workspace:
+                if self._filesystem.name_exists(
+                    workspace,
+                    "evidence",
+                    expected_parent_identity=workspace.identity,
+                ):
+                    raise ArtifactBoundaryError("artifact_identity_changed")
+                with self._filesystem.create_new_child_directory(
+                    workspace,
+                    "evidence",
+                    expected_parent_identity=workspace.identity,
+                ) as evidence:
+                    identities: dict[str, Identity] = {}
+                    with ExitStack() as stack:
+                        for name in _COLLECTIONS:
+                            child = stack.enter_context(
+                                self._filesystem.create_new_child_directory(
+                                    evidence,
+                                    name,
+                                    expected_parent_identity=evidence.identity,
+                                )
+                            )
+                            identities[name] = child.identity
+                        registry.finalize_workspace(
+                            workspace_id,
+                            workspace_identity=workspace.identity,
+                            evidence_identity=evidence.identity,
+                            collection_identities=identities,
+                        )
+
+    @contextmanager
+    def _open_tree(
+        self,
+        workspace_id: str,
+        *,
+        allowed_phases: set[str],
+    ) -> Iterator[_WorkspaceTree]:
+        registry = self._require_registry()
+        claim = registry.get_workspace(workspace_id)
+        if (
+            claim is None
+            or claim.phase not in allowed_phases
+            or claim.workspace_identity is None
+            or claim.evidence_identity is None
+        ):
+            raise RegistryError("registry_state_conflict")
+        collection_identities = registry.get_collection_identities(workspace_id)
+        if set(collection_identities) != set(_COLLECTIONS):
+            raise RegistryError("registry_claim_invalid")
+        root = self._require_root()
+        with ExitStack() as stack:
             workspaces = stack.enter_context(
                 self._filesystem.anchor_child_directory(
-                    self._root_anchor,
+                    root,
                     "workspaces",
-                    expected_parent_identity=self._root_anchor.identity,
+                    expected_parent_identity=root.identity,
                 )
             )
-            workspace = self._enter_child(stack, workspaces, workspace_id, create=create)
-            yield workspace
-
-    @contextmanager
-    def _evidence(
-        self, workspace_id: str, *, create: bool
-    ) -> Iterator[tuple[OwnedDirectoryAnchor, OwnedDirectoryAnchor, dict[str, Any], Identity, bytes]]:
-        with contextlib.ExitStack() as stack:
-            workspace = stack.enter_context(self._workspace(workspace_id, create=create))
-            existed = self._filesystem.name_exists(
-                workspace,
-                "evidence",
-                expected_parent_identity=workspace.identity,
-            )
-            evidence = self._enter_child(stack, workspace, "evidence", create=create)
-            if not existed:
-                ownership = self._write_marker(workspace, evidence, {}, None)
-            ownership, marker_identity, marker_bytes = self._load_marker(workspace, evidence, recover=True)
-            yield workspace, evidence, ownership, marker_identity, marker_bytes
-
-    @contextmanager
-    def _collection(
-        self, workspace_id: str, artifact_type: str, *, create: bool
-    ) -> Iterator[
-        tuple[
-            OwnedDirectoryAnchor,
-            OwnedDirectoryAnchor,
-            OwnedDirectoryAnchor,
-            dict[str, Any],
-        ]
-    ]:
-        with contextlib.ExitStack() as stack:
-            workspace, evidence, ownership, _, _ = stack.enter_context(
-                self._evidence(workspace_id, create=create)
-            )
-            collection = self._enter_child(stack, evidence, artifact_type, create=create)
-            yield workspace, evidence, collection, ownership
-
-    def _enter_child(
-        self,
-        stack: contextlib.ExitStack,
-        parent: OwnedDirectoryAnchor,
-        name: str,
-        *,
-        create: bool,
-    ) -> OwnedDirectoryAnchor:
-        try:
-            return stack.enter_context(
+            workspace = stack.enter_context(
                 self._filesystem.anchor_child_directory(
-                    parent,
-                    name,
-                    expected_parent_identity=parent.identity,
+                    workspaces,
+                    workspace_id,
+                    expected_parent_identity=workspaces.identity,
                 )
             )
-        except OwnedFilesystemError as error:
-            if error.code != "owned_not_found" or not create:
-                code = (
-                    "artifact_not_found" if error.code == "owned_not_found" else "artifact_identity_changed"
-                )
-                raise ArtifactBoundaryError(code) from None
-            return stack.enter_context(
-                self._filesystem.create_child_directory(
-                    parent,
-                    name,
-                    expected_parent_identity=parent.identity,
+            if workspace.identity != claim.workspace_identity:
+                raise OwnedFilesystemError("owned_identity_changed")
+            evidence = stack.enter_context(
+                self._filesystem.anchor_child_directory(
+                    workspace,
+                    "evidence",
+                    expected_parent_identity=workspace.identity,
                 )
             )
-
-    def _load_marker(
-        self,
-        workspace: OwnedDirectoryAnchor,
-        evidence: OwnedDirectoryAnchor,
-        *,
-        recover: bool,
-    ) -> tuple[dict[str, Any], Identity, bytes]:
-        try:
-            marker_identity, content = self._filesystem.read_named_file(
-                evidence,
-                _OWNERSHIP_NAME,
-                expected_parent_identity=evidence.identity,
-                maximum_bytes=_MAX_MARKER_BYTES,
-            )
-        except OwnedFilesystemError as error:
-            if error.code == "owned_content_changed":
-                raise ArtifactBoundaryError("artifact_hash_mismatch") from None
-            raise ArtifactBoundaryError("artifact_identity_changed") from None
-        if len(content) > _MAX_MARKER_BYTES:
-            raise ArtifactBoundaryError("artifact_identity_changed")
-        try:
-            payload = json.loads(content.decode("utf-8"))
-            self._validate_marker(payload, workspace.identity, evidence.identity, marker_identity)
-        except ArtifactBoundaryError:
-            raise
-        except (
-            TypeError,
-            ValueError,
-            UnicodeError,
-            RecursionError,
-            OwnedFilesystemError,
-        ):
-            raise ArtifactBoundaryError("artifact_identity_changed") from None
-        if recover and payload["pending"] is not None:
-            payload = self._recover_pending(workspace, evidence, payload)
-            return self._load_marker(workspace, evidence, recover=False)
-        return payload, marker_identity, content
-
-    def _write_marker(
-        self,
-        workspace: OwnedDirectoryAnchor,
-        evidence: OwnedDirectoryAnchor,
-        artifacts: dict[str, Claim],
-        pending: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        temporary_name = f".ownership-{secrets.token_hex(16)}.tmp"
-        temporary: OwnedOpenFile | None = None
-        digest = ""
-        size = 0
-        try:
-            with self._filesystem.create_temporary_file(
-                evidence,
-                temporary_name,
-                expected_parent_identity=evidence.identity,
-            ) as temporary:
-                payload = {
-                    "version": _OWNERSHIP_VERSION,
-                    "root": list(self._root_anchor.identity),
-                    "workspace": list(workspace.identity),
-                    "evidence": list(evidence.identity),
-                    "marker": list(temporary.identity),
-                    "artifacts": artifacts,
-                    "pending": pending,
-                }
-                encoded = self._canonical_bytes(payload, _MAX_MARKER_BYTES)
-                self._write_descriptor(temporary.descriptor, encoded)
-                digest, size = self._filesystem.hash_open_file(temporary)
-                self._filesystem.replace_open_file(
-                    evidence,
-                    temporary,
-                    temporary_name,
-                    _OWNERSHIP_NAME,
-                    expected_parent_identity=evidence.identity,
-                    expected_source_identity=temporary.identity,
-                    expected_sha256=digest,
-                    expected_size=size,
-                    replace_existing=True,
-                )
-                return payload
-        except ArtifactBoundaryError:
-            raise
-        except (OwnedFilesystemError, OSError):
-            if temporary is not None and digest:
-                with contextlib.suppress(OwnedFilesystemError):
-                    self._filesystem.delete_claimed_file(
+            if evidence.identity != claim.evidence_identity:
+                raise OwnedFilesystemError("owned_identity_changed")
+            collections: dict[str, OwnedDirectoryAnchor] = {}
+            for name in _COLLECTIONS:
+                collection = stack.enter_context(
+                    self._filesystem.anchor_child_directory(
                         evidence,
-                        temporary_name,
+                        name,
                         expected_parent_identity=evidence.identity,
-                        expected_source_identity=temporary.identity,
-                        expected_sha256=digest,
-                        expected_size=size,
                     )
-            raise ArtifactBoundaryError("artifact_publish_failed") from None
+                )
+                if collection.identity != collection_identities[name]:
+                    raise OwnedFilesystemError("owned_identity_changed")
+                collections[name] = collection
+            yield _WorkspaceTree(claim, workspace, evidence, collections)
 
-    def _validate_marker(
+    def _delete_layout_is_known(
         self,
-        payload: Any,
-        workspace_identity: Identity,
-        evidence_identity: Identity,
-        marker_identity: Identity,
+        tree: _WorkspaceTree,
+        items: tuple[DeleteJournalItem, ...],
+    ) -> bool:
+        if set(self._filesystem.list_names(tree.evidence)) != set(_COLLECTIONS):
+            return False
+        by_collection: dict[str, set[str]] = {name: set() for name in _COLLECTIONS}
+        for item in items:
+            filename = item.slot.split("/", 1)[1]
+            collection = tree.collections[item.claim.collection]
+            if item.phase == "planned":
+                by_collection[item.claim.collection].add(filename)
+                if self._filesystem.name_exists(
+                    collection,
+                    filename,
+                    expected_parent_identity=collection.identity,
+                ):
+                    self._classify_name(collection, filename, (item.claim,))
+                if item.quarantine_name is not None:
+                    by_collection[item.claim.collection].add(item.quarantine_name)
+                    if self._filesystem.name_exists(
+                        collection,
+                        item.quarantine_name,
+                        expected_parent_identity=collection.identity,
+                    ):
+                        self._classify_name(collection, item.quarantine_name, (item.claim,))
+            elif item.phase == "quarantined" and item.quarantine_name is not None:
+                by_collection[item.claim.collection].add(item.quarantine_name)
+                if self._filesystem.name_exists(
+                    collection,
+                    item.quarantine_name,
+                    expected_parent_identity=collection.identity,
+                ):
+                    self._classify_name(collection, item.quarantine_name, (item.claim,))
+        return all(
+            set(self._filesystem.list_names(tree.collections[name])) <= expected
+            for name, expected in by_collection.items()
+        )
+
+    def _delete_claimed_items(
+        self,
+        tree: _WorkspaceTree,
+        items: tuple[DeleteJournalItem, ...],
     ) -> None:
-        if not isinstance(payload, dict) or set(payload) != {
-            "version",
-            "root",
-            "workspace",
-            "evidence",
-            "marker",
-            "artifacts",
-            "pending",
-        }:
-            raise ArtifactBoundaryError("artifact_identity_changed")
-        expected = {
-            "version": _OWNERSHIP_VERSION,
-            "root": list(self._root_anchor.identity),
-            "workspace": list(workspace_identity),
-            "evidence": list(evidence_identity),
-            "marker": list(marker_identity),
-        }
-        if any(payload[key] != value for key, value in expected.items()):
-            raise ArtifactBoundaryError("artifact_identity_changed")
-        artifacts = payload["artifacts"]
-        if not isinstance(artifacts, dict) or len(artifacts) > _MAX_JSON_NODES:
-            raise ArtifactBoundaryError("artifact_identity_changed")
-        for slot, claim in artifacts.items():
-            self._validate_claim(slot, claim)
-        pending = payload["pending"]
-        if pending is not None:
-            self._validate_pending(pending)
+        registry = self._require_registry()
+        for original in items:
+            item = original
+            collection = tree.collections[item.claim.collection]
+            filename = item.slot.split("/", 1)[1]
+            if item.phase == "planned":
+                quarantine = item.quarantine_name
+                if quarantine is None:
+                    quarantine = f".artifact-delete-{secrets.token_hex(16)}.quarantine"
+                    registry.plan_delete_quarantine(item.workspace_id, item.slot, quarantine)
+                    item = next(
+                        candidate
+                        for candidate in registry.get_delete_items(item.workspace_id)
+                        if candidate.slot == item.slot
+                    )
+                source = self._classify_name(collection, filename, (item.claim,))
+                quarantined = self._classify_name(collection, quarantine, (item.claim,))
+                if source is item.claim and quarantined is None:
+                    self._filesystem.move_claimed_file(
+                        collection,
+                        filename,
+                        quarantine,
+                        expected_parent_identity=collection.identity,
+                        expected_source_identity=item.claim.identity,
+                        expected_sha256=item.claim.sha256,
+                        expected_size=item.claim.size,
+                        replace_existing=False,
+                    )
+                elif source is not None or quarantined is not item.claim:
+                    raise ArtifactBoundaryError("artifact_identity_changed")
+                if not self._delete_layout_is_known(
+                    tree,
+                    registry.get_delete_items(item.workspace_id),
+                ):
+                    raise RegistryError("registry_pending")
+                registry.advance_delete_item(
+                    item.workspace_id,
+                    item.slot,
+                    expected_phase="planned",
+                    new_phase="quarantined",
+                    quarantine_name=quarantine,
+                )
+                item = next(
+                    candidate
+                    for candidate in registry.get_delete_items(item.workspace_id)
+                    if candidate.slot == item.slot
+                )
+            if item.phase == "quarantined":
+                quarantine = item.quarantine_name
+                if quarantine is None:
+                    raise RegistryError("registry_claim_invalid")
+                if not self._delete_layout_is_known(
+                    tree,
+                    registry.get_delete_items(item.workspace_id),
+                ):
+                    raise RegistryError("registry_pending")
+                if self._filesystem.name_exists(
+                    collection,
+                    filename,
+                    expected_parent_identity=collection.identity,
+                ):
+                    raise ArtifactBoundaryError("artifact_identity_changed")
+                if self._filesystem.name_exists(
+                    collection,
+                    quarantine,
+                    expected_parent_identity=collection.identity,
+                ):
+                    self._delete_if_claimed(collection, quarantine, item.claim)
+                registry.advance_delete_item(
+                    item.workspace_id,
+                    item.slot,
+                    expected_phase="quarantined",
+                    new_phase="removed",
+                    quarantine_name=quarantine,
+                )
 
-    def _validate_pending(self, pending: Any) -> None:
-        if not isinstance(pending, dict) or set(pending) != {
-            "phase",
-            "slot",
-            "target",
-            "temporary",
-            "backup",
-            "new",
-            "old",
-        }:
-            raise ArtifactBoundaryError("artifact_identity_changed")
-        if pending["phase"] not in {"prepared", "committed"}:
-            raise ArtifactBoundaryError("artifact_identity_changed")
-        self._validate_claim(pending["slot"], pending["new"])
-        if pending["old"] is not None:
-            self._validate_claim(pending["slot"], pending["old"])
-        for key in ("target", "temporary", "backup"):
-            OwnedArtifactFilesystem._validate_name(pending[key])
+    def _remove_deleted_tree(self, workspace_id: str) -> None:
+        registry = self._require_registry()
+        claim = registry.get_workspace(workspace_id)
+        if claim is None:
+            return
+        if claim.workspace_identity is None or claim.evidence_identity is None:
+            raise RegistryError("registry_claim_invalid")
+        collection_identities = registry.get_collection_identities(workspace_id)
+        root = self._require_root()
+        with self._filesystem.anchor_child_directory(
+            root,
+            "workspaces",
+            expected_parent_identity=root.identity,
+        ) as workspaces:
+            with self._filesystem.anchor_child_directory(
+                workspaces,
+                workspace_id,
+                expected_parent_identity=workspaces.identity,
+            ) as workspace:
+                if workspace.identity != claim.workspace_identity:
+                    raise OwnedFilesystemError("owned_identity_changed")
+                if not self._filesystem.name_exists(
+                    workspace,
+                    "evidence",
+                    expected_parent_identity=workspace.identity,
+                ):
+                    registry.clear_deleted_workspace(workspace_id)
+                    return
+                with self._filesystem.anchor_child_directory(
+                    workspace,
+                    "evidence",
+                    expected_parent_identity=workspace.identity,
+                ) as evidence:
+                    if evidence.identity != claim.evidence_identity:
+                        raise OwnedFilesystemError("owned_identity_changed")
+                    for name in _COLLECTIONS:
+                        if not self._filesystem.name_exists(
+                            evidence,
+                            name,
+                            expected_parent_identity=evidence.identity,
+                        ):
+                            continue
+                        with self._filesystem.anchor_child_directory(
+                            evidence,
+                            name,
+                            expected_parent_identity=evidence.identity,
+                        ) as collection:
+                            if collection.identity != collection_identities[
+                                name
+                            ] or self._filesystem.list_names(collection):
+                                raise OwnedFilesystemError("owned_identity_changed")
+                        self._filesystem.remove_empty_directory(
+                            evidence,
+                            name,
+                            expected_parent_identity=evidence.identity,
+                            expected_child_identity=collection_identities[name],
+                        )
+                    if self._filesystem.list_names(evidence):
+                        raise OwnedFilesystemError("owned_identity_changed")
+                self._filesystem.remove_empty_directory(
+                    workspace,
+                    "evidence",
+                    expected_parent_identity=workspace.identity,
+                    expected_child_identity=claim.evidence_identity,
+                )
+        registry.clear_deleted_workspace(workspace_id)
 
-    @staticmethod
-    def _validate_claim(slot: str, claim: Any) -> None:
-        if (
-            not isinstance(slot, str)
-            or not isinstance(claim, dict)
-            or set(claim)
-            != {
-                "slot",
-                "kind",
-                "id",
-                "device_id",
-                "file_id",
-                "sha256",
-                "size",
-            }
-        ):
-            raise ArtifactBoundaryError("artifact_identity_changed")
-        collection, separator, filename = slot.partition("/")
-        expected_kind = _KIND_BY_COLLECTION.get(collection)
-        artifact_id = claim.get("id")
-        expected_filename = artifact_id if collection == "parts" else f"{artifact_id}.json"
-        if (
-            not separator
-            or claim.get("slot") != slot
-            or claim.get("kind") != expected_kind
-            or not isinstance(artifact_id, str)
-            or _IDENTIFIER.fullmatch(artifact_id) is None
-            or filename != expected_filename
-            or not isinstance(claim.get("device_id"), str)
-            or not claim["device_id"].isdigit()
-            or not isinstance(claim.get("file_id"), str)
-            or not claim["file_id"].isdigit()
-            or not isinstance(claim.get("sha256"), str)
-            or _SHA256.fullmatch(claim["sha256"]) is None
-            or not isinstance(claim.get("size"), int)
-            or isinstance(claim["size"], bool)
-            or claim["size"] < 0
-        ):
-            raise ArtifactBoundaryError("artifact_identity_changed")
-
-    @staticmethod
-    def _make_claim(
-        slot: str,
-        artifact_type: str,
-        artifact_id: str,
-        identity: Identity,
-        digest: str,
-        size: int,
-    ) -> Claim:
-        return {
-            "slot": slot,
-            "kind": _KIND_BY_COLLECTION[artifact_type],
-            "id": artifact_id,
-            "device_id": str(identity[0]),
-            "file_id": str(identity[1]),
-            "sha256": digest,
-            "size": size,
-        }
-
-    @staticmethod
-    def _claim_identity(claim: Claim) -> Identity:
-        return int(claim["device_id"]), int(claim["file_id"])
-
-    def _claim(self, ownership: dict[str, Any], artifact_type: str, filename: str) -> Claim:
-        claim = ownership["artifacts"].get(f"{artifact_type}/{filename}")
-        if not isinstance(claim, dict):
+    def _claim(self, workspace_id: str, collection: str, filename: str) -> ArtifactClaim:
+        claim = self._require_registry().get_artifact(
+            workspace_id,
+            f"{collection}/{filename}",
+        )
+        if claim is None:
             raise ArtifactBoundaryError("artifact_identity_changed")
         return claim
 
-    def _verify_claimed_name(self, collection: OwnedDirectoryAnchor, name: str, claim: Claim) -> None:
+    def _verify_claimed_name(
+        self,
+        collection: OwnedDirectoryAnchor,
+        name: str,
+        claim: ArtifactClaim,
+    ) -> None:
         try:
             with self._filesystem.open_claimed_file(
                 collection,
                 name,
                 expected_parent_identity=collection.identity,
-                expected_source_identity=self._claim_identity(claim),
-                expected_sha256=claim["sha256"],
-                expected_size=claim["size"],
+                expected_source_identity=claim.identity,
+                expected_sha256=claim.sha256,
+                expected_size=claim.size,
             ):
                 pass
         except OwnedFilesystemError as error:
@@ -820,43 +843,79 @@ class EvidenceArtifactStore:
                 raise ArtifactBoundaryError("artifact_hash_mismatch") from None
             raise ArtifactBoundaryError("artifact_identity_changed") from None
 
-    def _is_claimed_name(self, collection: OwnedDirectoryAnchor, name: str, claim: Claim) -> bool:
-        if not self._filesystem.name_exists(collection, name, expected_parent_identity=collection.identity):
-            return False
-        self._verify_claimed_name(collection, name, claim)
-        return True
+    def _classify_name(
+        self,
+        collection: OwnedDirectoryAnchor,
+        name: str,
+        claims: tuple[ArtifactClaim, ...],
+    ) -> ArtifactClaim | None:
+        if not self._filesystem.name_exists(
+            collection,
+            name,
+            expected_parent_identity=collection.identity,
+        ):
+            return None
+        for claim in claims:
+            if self._filesystem.name_has_identity(
+                collection,
+                name,
+                expected_parent_identity=collection.identity,
+                expected_source_identity=claim.identity,
+            ):
+                self._verify_claimed_name(collection, name, claim)
+                return claim
+        raise ArtifactBoundaryError("artifact_identity_changed")
 
-    def _matches_claim(self, collection: OwnedDirectoryAnchor, name: str, claim: Claim) -> bool:
-        if not self._filesystem.name_exists(collection, name, expected_parent_identity=collection.identity):
-            return False
-        try:
-            self._verify_claimed_name(collection, name, claim)
-        except ArtifactBoundaryError:
-            return False
-        return True
+    def _require_name_claim(
+        self,
+        collection: OwnedDirectoryAnchor,
+        name: str,
+        claim: ArtifactClaim,
+    ) -> None:
+        if self._classify_name(collection, name, (claim,)) is not claim:
+            raise ArtifactBoundaryError("artifact_operation_pending")
 
-    def _delete_if_claimed(self, collection: OwnedDirectoryAnchor, name: str, claim: Claim) -> None:
-        if not self._is_claimed_name(collection, name, claim):
-            return
+    def _delete_named_claim_if_present(
+        self,
+        collection: OwnedDirectoryAnchor,
+        name: str,
+        claim: ArtifactClaim,
+    ) -> None:
+        classified = self._classify_name(collection, name, (claim,))
+        if classified is claim:
+            self._delete_if_claimed(collection, name, claim)
+
+    def _delete_if_claimed(
+        self,
+        collection: OwnedDirectoryAnchor,
+        name: str,
+        claim: ArtifactClaim,
+    ) -> None:
         self._filesystem.delete_claimed_file(
             collection,
             name,
             expected_parent_identity=collection.identity,
-            expected_source_identity=self._claim_identity(claim),
-            expected_sha256=claim["sha256"],
-            expected_size=claim["size"],
+            expected_source_identity=claim.identity,
+            expected_sha256=claim.sha256,
+            expected_size=claim.size,
         )
 
-    def _encode_json(self, workspace_id: str, artifact_type: str, artifact_id: str, document: Any) -> bytes:
+    def _encode_json(
+        self,
+        workspace_id: str,
+        artifact_type: str,
+        artifact_id: str,
+        document: Any,
+    ) -> bytes:
         try:
-            bounded = (
-                document.model_dump(mode="json")
-                if isinstance(document, (EvidenceUnit, StudyMapSnapshot))
-                else document
-            )
-            self._validate_json_object(bounded)
             model_type = EvidenceUnit if artifact_type == "units" else StudyMapSnapshot
-            model = model_type.model_validate(document)
+            if type(document) is model_type:
+                model = document
+            elif type(document) is dict:
+                self._validate_json_object(document)
+                model = model_type.model_validate(document)
+            else:
+                raise ValueError("document type")
             if artifact_type == "units" and model.evidence_unit_id != artifact_id:
                 raise ValueError("identifier mismatch")
             if artifact_type == "snapshots" and (
@@ -864,11 +923,13 @@ class EvidenceArtifactStore:
             ):
                 raise ValueError("identifier mismatch")
             canonical = model.model_dump(mode="json")
+            if type(canonical) is not dict:
+                raise ValueError("model serialization")
             self._validate_json_object(canonical)
             return self._canonical_bytes(canonical, _MAX_JSON_BYTES)
         except ArtifactBoundaryError:
             raise
-        except (TypeError, ValueError, UnicodeError, RecursionError):
+        except Exception:
             raise ArtifactBoundaryError("artifact_json_invalid") from None
 
     def _decode_json(
@@ -882,6 +943,8 @@ class EvidenceArtifactStore:
             if len(content) > _MAX_JSON_BYTES:
                 raise ArtifactBoundaryError("artifact_json_too_large")
             document = json.loads(content.decode("utf-8"))
+            if type(document) is not dict:
+                raise ValueError("document type")
             self._validate_json_object(document)
             model_type = EvidenceUnit if artifact_type == "units" else StudyMapSnapshot
             model = model_type.model_validate(document)
@@ -894,29 +957,33 @@ class EvidenceArtifactStore:
             return model
         except ArtifactBoundaryError:
             raise
-        except (TypeError, ValueError, UnicodeError, RecursionError):
+        except Exception:
             raise ArtifactBoundaryError("artifact_json_invalid") from None
 
     @staticmethod
     def _canonical_bytes(document: Any, maximum: int) -> bytes:
         try:
-            encoded = json.dumps(
-                document,
+            encoder = json.JSONEncoder(
                 ensure_ascii=False,
                 allow_nan=False,
                 sort_keys=True,
                 separators=(",", ":"),
-            ).encode("utf-8")
-        except (TypeError, ValueError, UnicodeError, RecursionError):
+            )
+            encoded = bytearray()
+            for chunk in encoder.iterencode(document):
+                piece = chunk.encode("utf-8")
+                if len(encoded) + len(piece) > maximum:
+                    raise ArtifactBoundaryError("artifact_json_too_large")
+                encoded.extend(piece)
+            return bytes(encoded)
+        except ArtifactBoundaryError:
+            raise
+        except Exception:
             raise ArtifactBoundaryError("artifact_json_invalid") from None
-        if len(encoded) > maximum:
-            code = "artifact_marker_full" if maximum == _MAX_MARKER_BYTES else "artifact_json_too_large"
-            raise ArtifactBoundaryError(code)
-        return encoded
 
     @staticmethod
     def _validate_json_object(document: Any) -> None:
-        if not isinstance(document, dict):
+        if type(document) is not dict:
             raise ArtifactBoundaryError("artifact_json_invalid")
         stack: list[tuple[Any, int]] = [(document, 0)]
         seen: set[int] = set()
@@ -928,32 +995,32 @@ class EvidenceArtifactStore:
                 raise ArtifactBoundaryError("artifact_json_too_large")
             if depth > _MAX_JSON_DEPTH:
                 raise ArtifactBoundaryError("artifact_json_too_deep")
-            if isinstance(value, dict):
+            if type(value) is dict:
                 identity = id(value)
                 if identity in seen:
                     raise ArtifactBoundaryError("artifact_json_invalid")
                 seen.add(identity)
                 for key, child in value.items():
-                    if not isinstance(key, str):
+                    if type(key) is not str:
                         raise ArtifactBoundaryError("artifact_json_invalid")
                     if len(key.encode("utf-8")) > _MAX_JSON_STRING_BYTES:
                         raise ArtifactBoundaryError("artifact_json_too_large")
                     stack.append((child, depth + 1))
                 continue
-            if isinstance(value, (list, tuple)):
+            if type(value) in {list, tuple}:
                 identity = id(value)
                 if identity in seen:
                     raise ArtifactBoundaryError("artifact_json_invalid")
                 seen.add(identity)
                 stack.extend((child, depth + 1) for child in value)
                 continue
-            if isinstance(value, str):
+            if type(value) is str:
                 if len(value.encode("utf-8")) > _MAX_JSON_STRING_BYTES:
                     raise ArtifactBoundaryError("artifact_json_too_large")
                 continue
-            if value is None or isinstance(value, (bool, int)):
+            if value is None or type(value) in {bool, int}:
                 continue
-            if isinstance(value, float) and math.isfinite(value):
+            if type(value) is float and math.isfinite(value):
                 continue
             raise ArtifactBoundaryError("artifact_json_invalid")
 
@@ -969,6 +1036,16 @@ class EvidenceArtifactStore:
         os.ftruncate(descriptor, len(content))
         os.fsync(descriptor)
         os.lseek(descriptor, 0, os.SEEK_SET)
+
+    def _require_root(self) -> OwnedDirectoryAnchor:
+        if self._root_anchor is None:
+            raise ArtifactBoundaryError("artifact_store_closed")
+        return self._root_anchor
+
+    def _require_registry(self) -> EvidenceArtifactRegistry:
+        if self._registry is None:
+            raise ArtifactBoundaryError("artifact_store_closed")
+        return self._registry
 
     @staticmethod
     def _validate_identifier(value: str) -> None:
@@ -986,9 +1063,17 @@ class EvidenceArtifactStore:
             raise ArtifactBoundaryError("artifact_hash_invalid")
 
     @staticmethod
+    def _raise_registry_boundary(error: RegistryError) -> None:
+        if error.code in {"registry_identity_changed", "registry_claim_invalid"}:
+            raise ArtifactBoundaryError("artifact_identity_changed") from None
+        if error.code in {"registry_pending", "registry_state_conflict"}:
+            raise ArtifactBoundaryError("artifact_operation_pending") from None
+        raise ArtifactBoundaryError("artifact_publish_failed") from None
+
+    @staticmethod
     def _raise_filesystem_boundary(error: OwnedFilesystemError) -> None:
         if error.code == "owned_content_changed":
             raise ArtifactBoundaryError("artifact_hash_mismatch") from None
-        if error.code == "owned_identity_changed":
+        if error.code in {"owned_identity_changed", "owned_destination_exists"}:
             raise ArtifactBoundaryError("artifact_identity_changed") from None
         raise ArtifactBoundaryError("artifact_publish_failed") from None

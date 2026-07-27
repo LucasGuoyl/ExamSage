@@ -1110,8 +1110,10 @@ class OwnedArtifactFilesystem:
             handle = msvcrt.get_osfhandle(temporary.descriptor)
             quarantine = temporary.parent.path / f".owned-quarantine-{secrets.token_hex(16)}"
             self._rename_handle_windows(handle, quarantine)
-            self._flush_directory_windows(temporary.parent)
-            self._mark_delete_windows(temporary.descriptor)
+            try:
+                self._flush_directory_windows(temporary.parent)
+            finally:
+                self._mark_delete_windows(temporary.descriptor)
             return
         os.unlink(temporary.name, dir_fd=temporary.parent.descriptor)
         os.fsync(temporary.parent.descriptor)

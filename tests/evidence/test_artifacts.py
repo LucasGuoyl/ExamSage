@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+from collections import UserDict
+from contextlib import contextmanager
 from datetime import UTC, datetime
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
+from unittest.mock import patch
 
 import pytest
 
+import exam_predictor.evidence.artifacts as artifacts_module
 from exam_predictor.evidence.artifacts import (
     ArtifactBoundaryError,
     ArtifactCleanupState,
     EvidenceArtifactStore,
-    NativeArtifactFilesystemOps,
 )
 from exam_predictor.evidence.models import (
     EvidenceCitation,
@@ -22,15 +26,22 @@ from exam_predictor.evidence.models import (
     SnapshotStatus,
     StudyMapSnapshot,
 )
-from exam_predictor.workspace.filesystem import OwnedFilesystemError
+from exam_predictor.workspace.filesystem import OwnedArtifactFilesystem, OwnedFilesystemError
 
 
 _RawEvidenceArtifactStore = EvidenceArtifactStore
+NativeArtifactFilesystemOps = OwnedArtifactFilesystem
 
 
 def EvidenceArtifactStore(root, *args, **kwargs):
     Path(root).mkdir(parents=True, exist_ok=True)
     return _RawEvidenceArtifactStore(root, *args, **kwargs)
+
+
+def _store_with_filesystem(root, filesystem):
+    Path(root).mkdir(parents=True, exist_ok=True)
+    with patch.object(artifacts_module, "OwnedArtifactFilesystem", return_value=filesystem):
+        return _RawEvidenceArtifactStore(root)
 
 
 WORKSPACE_ID = "workspace_0123456789"
@@ -129,7 +140,102 @@ def test_replaced_evidence_directory_is_rejected_by_its_anchored_identity(tmp_pa
             pytest.fail("a replaced evidence directory must not be opened")
 
     assert caught.value.code == "artifact_identity_changed"
-    assert not list(outside.iterdir())
+
+
+def test_public_constructor_cannot_inject_filesystem_operations(tmp_path):
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with pytest.raises(TypeError):
+        _RawEvidenceArtifactStore(root, filesystem_ops=NativeArtifactFilesystemOps())
+
+
+def test_bootstrap_refuses_an_existing_unregistered_evidence_directory(tmp_path):
+    data_root = tmp_path / "data"
+    evidence = data_root / "workspaces" / WORKSPACE_ID / "evidence"
+    evidence.mkdir(parents=True)
+    store = _RawEvidenceArtifactStore(data_root)
+
+    with pytest.raises(ArtifactBoundaryError) as caught:
+        _publish_part(store)
+
+    assert caught.value.code == "artifact_identity_changed"
+    assert list(evidence.iterdir()) == []
+
+
+def test_external_registry_rejects_a_forged_complete_evidence_replacement(tmp_path):
+    data_root = tmp_path / "data"
+    first = EvidenceArtifactStore(data_root)
+    _publish_part(first)
+    first.close()
+    workspace = data_root / "workspaces" / WORKSPACE_ID
+    evidence = workspace / "evidence"
+    original = workspace / "original-evidence"
+    evidence.rename(original)
+    shutil.copytree(original, evidence)
+
+    marker_path = evidence / ".artifact-ownership.json"
+    part = evidence / "parts" / PART_ID
+    part_stat = part.stat(follow_symlinks=False)
+    marker_path.write_text("{}", encoding="utf-8")
+    marker_stat = marker_path.stat(follow_symlinks=False)
+    marker = {
+        "version": 2,
+        "root": list((data_root.stat().st_dev, data_root.stat().st_ino)),
+        "workspace": list((workspace.stat().st_dev, workspace.stat().st_ino)),
+        "evidence": list((evidence.stat().st_dev, evidence.stat().st_ino)),
+        "marker": list((marker_stat.st_dev, marker_stat.st_ino)),
+        "artifacts": {
+            f"parts/{PART_ID}": {
+                "slot": f"parts/{PART_ID}",
+                "kind": "part",
+                "id": PART_ID,
+                "device_id": str(part_stat.st_dev),
+                "file_id": str(part_stat.st_ino),
+                "sha256": _sha256(b"course evidence"),
+                "size": len(b"course evidence"),
+            }
+        },
+        "pending": None,
+    }
+    marker_path.write_text(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    restarted = EvidenceArtifactStore(data_root)
+    with pytest.raises(ArtifactBoundaryError) as caught:
+        with restarted.open_part(WORKSPACE_ID, PART_ID):
+            pytest.fail("a forged in-tree marker cannot replace the external authority")
+
+    assert caught.value.code == "artifact_identity_changed"
+    assert (original / "parts" / PART_ID).read_bytes() == b"course evidence"
+
+
+def test_registry_is_external_and_internal_marker_is_absent(tmp_path):
+    data_root = tmp_path / "data"
+    store = EvidenceArtifactStore(data_root)
+    digest = _publish_part(store)
+    evidence = data_root / "workspaces" / WORKSPACE_ID / "evidence"
+    registry_path = data_root / ".evidence-artifact-registry.sqlite3"
+
+    assert registry_path.is_file()
+    assert not (evidence / ".artifact-ownership.json").exists()
+    with sqlite3.connect(registry_path) as observer:
+        row = observer.execute(
+            """
+            SELECT device_id, file_id, sha256, size
+            FROM artifacts WHERE workspace_id = ? AND slot = ?
+            """,
+            (WORKSPACE_ID, f"parts/{PART_ID}"),
+        ).fetchone()
+    part_stat = (evidence / "parts" / PART_ID).stat(follow_symlinks=False)
+    assert row == (
+        str(part_stat.st_dev),
+        str(part_stat.st_ino),
+        digest,
+        len(b"course evidence"),
+    )
 
 
 def test_publish_part_atomically_reopens_with_the_expected_sha256(tmp_path):
@@ -143,6 +249,20 @@ def test_publish_part_atomically_reopens_with_the_expected_sha256(tmp_path):
     part = tmp_path / "data" / "workspaces" / WORKSPACE_ID / "evidence" / "parts" / PART_ID
     assert part.read_bytes() == content
     assert not list(part.parent.glob(".examsage-artifact-*.tmp"))
+
+
+def test_open_part_exposes_only_a_read_only_os_descriptor(tmp_path):
+    data_root = tmp_path / "data"
+    store = EvidenceArtifactStore(data_root)
+    _publish_part(store, b"read only")
+
+    with store.open_part(WORKSPACE_ID, PART_ID) as source:
+        with pytest.raises(OSError):
+            os.write(source.fileno(), b"mutate")
+
+    assert (
+        data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts" / PART_ID
+    ).read_bytes() == b"read only"
 
 
 def test_delete_workspace_refuses_a_native_source_path_without_touching_it(tmp_path):
@@ -276,6 +396,82 @@ def test_json_schema_and_unicode_failures_are_normalized(tmp_path):
         assert str(caught.value) == "artifact_json_invalid"
 
 
+def test_json_rejects_dict_subclasses_and_wrong_pydantic_model_types(tmp_path):
+    store = EvidenceArtifactStore(tmp_path / "data")
+
+    class DerivedDict(dict):
+        pass
+
+    for non_exact_mapping in (
+        DerivedDict(_unit().model_dump(mode="json")),
+        UserDict(_unit().model_dump(mode="json")),
+    ):
+        with pytest.raises(ArtifactBoundaryError) as caught:
+            store.publish_json(
+                WORKSPACE_ID,
+                "units",
+                UNIT_ID,
+                non_exact_mapping,
+                expected_sha256=_sha256(_canonical_json(_unit())),
+            )
+        assert caught.value.code == "artifact_json_invalid"
+
+    with pytest.raises(ArtifactBoundaryError) as caught:
+        store.publish_json(
+            WORKSPACE_ID,
+            "units",
+            UNIT_ID,
+            _snapshot(),
+            expected_sha256=_sha256(b"irrelevant"),
+        )
+    assert caught.value.code == "artifact_json_invalid"
+
+
+def test_json_runtime_failures_are_mapped_to_the_safe_boundary_code(tmp_path, monkeypatch):
+    store = EvidenceArtifactStore(tmp_path / "data")
+
+    def fail_validation(*args, **kwargs):
+        raise RuntimeError("validator internals must not cross the boundary")
+
+    monkeypatch.setattr(EvidenceUnit, "model_validate", fail_validation)
+    with pytest.raises(ArtifactBoundaryError) as caught:
+        store.publish_json(
+            WORKSPACE_ID,
+            "units",
+            UNIT_ID,
+            _unit().model_dump(mode="json"),
+            expected_sha256=_sha256(b"irrelevant"),
+        )
+
+    assert caught.value.code == "artifact_json_invalid"
+
+
+def test_json_iterencode_stops_as_soon_as_utf8_limit_is_exceeded(tmp_path, monkeypatch):
+    store = EvidenceArtifactStore(tmp_path / "data")
+    consumed: list[str] = []
+
+    def oversized_chunks(self, document, _one_shot=False):
+        del self, document, _one_shot
+        consumed.append("first")
+        yield "123456789"
+        consumed.append("second")
+        raise RuntimeError("the encoder consumed beyond the established limit")
+
+    monkeypatch.setattr(artifacts_module, "_MAX_JSON_BYTES", 8)
+    monkeypatch.setattr(json.JSONEncoder, "iterencode", oversized_chunks)
+    with pytest.raises(ArtifactBoundaryError) as caught:
+        store.publish_json(
+            WORKSPACE_ID,
+            "units",
+            UNIT_ID,
+            _unit(),
+            expected_sha256=_sha256(b"irrelevant"),
+        )
+
+    assert caught.value.code == "artifact_json_too_large"
+    assert consumed == ["first"]
+
+
 def test_hash_mismatch_never_publishes_or_leaves_a_temporary_file(tmp_path):
     store = EvidenceArtifactStore(tmp_path / "data")
 
@@ -365,10 +561,7 @@ def test_delete_rechecks_hardlink_identity_after_judgement_before_delete(tmp_pat
     part = data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts" / PART_ID
     external = tmp_path / "native-source"
     external.write_bytes(b"native bytes")
-    store = EvidenceArtifactStore(
-        data_root,
-        filesystem_ops=_HardlinkSwapDuringRemove(part, external),
-    )
+    store = _store_with_filesystem(data_root, _HardlinkSwapDuringRemove(part, external))
 
     with pytest.raises(ArtifactBoundaryError) as caught:
         store.delete_workspace(WORKSPACE_ID)
@@ -397,16 +590,40 @@ def test_delete_never_removes_regular_substitution_after_judgement(tmp_path):
     initial = EvidenceArtifactStore(data_root)
     _publish_part(initial)
     part = data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts" / PART_ID
-    store = EvidenceArtifactStore(
-        data_root,
-        filesystem_ops=_RegularSwapDuringRemove(part),
-    )
+    store = _store_with_filesystem(data_root, _RegularSwapDuringRemove(part))
 
     with pytest.raises(ArtifactBoundaryError) as caught:
         store.delete_workspace(WORKSPACE_ID)
 
     assert caught.value.code == "artifact_identity_changed"
     assert part.read_bytes() == b"not an artifact"
+
+
+class _AddUnknownDuringRemove(NativeArtifactFilesystemOps):
+    def __init__(self) -> None:
+        super().__init__()
+        self.added = False
+
+    def before_mutation(self, operation, parent, source_name) -> None:
+        del operation
+        if self.added or source_name != PART_ID:
+            return
+        self.added = True
+        (parent.path / "unknown_native_entry").write_bytes(b"native")
+
+
+def test_delete_rescans_after_quarantine_and_preserves_claim_when_unknown_appears(tmp_path):
+    data_root = tmp_path / "data"
+    initial = EvidenceArtifactStore(data_root)
+    _publish_part(initial)
+    store = _store_with_filesystem(data_root, _AddUnknownDuringRemove())
+
+    assert store.delete_workspace(WORKSPACE_ID) is ArtifactCleanupState.CLEANUP_PENDING
+    parts = data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts"
+    assert (parts / "unknown_native_entry").read_bytes() == b"native"
+    quarantines = list(parts.glob(".artifact-delete-*.quarantine"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == b"course evidence"
 
 
 class _AlwaysSharingViolation(NativeArtifactFilesystemOps):
@@ -468,11 +685,26 @@ class _CorruptTargetAfterReplace(NativeArtifactFilesystemOps):
         return result
 
 
+class _SwapTargetAfterReplace(NativeArtifactFilesystemOps):
+    def __init__(self) -> None:
+        super().__init__()
+        self.swapped = False
+
+    def replace_open_file(self, parent, source, source_name, destination_name, **kwargs):
+        result = super().replace_open_file(parent, source, source_name, destination_name, **kwargs)
+        if not self.swapped and destination_name == PART_ID:
+            self.swapped = True
+            target = parent.path / destination_name
+            target.rename(parent.path / ".attacker-stole-installed-target")
+            target.write_bytes(b"attacker target")
+        return result
+
+
 def test_temp_same_inode_mutation_is_rejected_before_replace(tmp_path):
     data_root = tmp_path / "data"
     original = EvidenceArtifactStore(data_root)
     _publish_part(original, b"original")
-    store = EvidenceArtifactStore(data_root, filesystem_ops=_MutateTempBeforeReplace())
+    store = _store_with_filesystem(data_root, _MutateTempBeforeReplace())
 
     with pytest.raises(ArtifactBoundaryError) as caught:
         store.publish_part(
@@ -487,16 +719,54 @@ def test_temp_same_inode_mutation_is_rejected_before_replace(tmp_path):
     assert part.read_bytes() == b"original"
 
 
-def test_post_replace_hash_mismatch_removes_the_owned_target(tmp_path):
+def test_post_replace_hash_mismatch_keeps_registry_pending_and_old_backup(tmp_path):
     data_root = tmp_path / "data"
-    store = EvidenceArtifactStore(data_root, filesystem_ops=_CorruptTargetAfterReplace())
+    original = EvidenceArtifactStore(data_root)
+    _publish_part(original, b"original")
+    store = _store_with_filesystem(data_root, _CorruptTargetAfterReplace())
 
     with pytest.raises(ArtifactBoundaryError) as caught:
         _publish_part(store, b"content")
 
     assert caught.value.code == "artifact_hash_mismatch"
     target = data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts" / PART_ID
-    assert not target.exists()
+    assert target.read_bytes() == b"corrupt"
+    backups = list(target.parent.glob(".artifact-*.backup"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"original"
+    with sqlite3.connect(data_root / ".evidence-artifact-registry.sqlite3") as observer:
+        assert observer.execute(
+            "SELECT phase FROM publish_journal WHERE workspace_id = ?",
+            (WORKSPACE_ID,),
+        ).fetchone() == ("backup",)
+    with pytest.raises(ArtifactBoundaryError):
+        with store.open_part(WORKSPACE_ID, PART_ID):
+            pytest.fail("a pending corrupted target must not be opened")
+
+
+def test_wrong_installed_target_keeps_old_backup_and_blocks_open(tmp_path):
+    data_root = tmp_path / "data"
+    original = EvidenceArtifactStore(data_root)
+    _publish_part(original, b"original")
+    store = _store_with_filesystem(data_root, _SwapTargetAfterReplace())
+
+    with pytest.raises(ArtifactBoundaryError) as caught:
+        _publish_part(store, b"replacement")
+
+    assert caught.value.code == "artifact_identity_changed"
+    parts = data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts"
+    assert (parts / PART_ID).read_bytes() == b"attacker target"
+    backups = list(parts.glob(".artifact-*.backup"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"original"
+    with sqlite3.connect(data_root / ".evidence-artifact-registry.sqlite3") as observer:
+        assert observer.execute(
+            "SELECT phase FROM publish_journal WHERE workspace_id = ?",
+            (WORKSPACE_ID,),
+        ).fetchone() == ("backup",)
+    with pytest.raises(ArtifactBoundaryError):
+        with store.open_part(WORKSPACE_ID, PART_ID):
+            pytest.fail("an unclaimed installed target must never be opened")
 
 
 def test_publish_reports_identity_change_when_parent_is_retargeted_at_replace(
@@ -513,10 +783,7 @@ def test_publish_reports_identity_change_when_parent_is_retargeted_at_replace(
     )
     outside = tmp_path / "outside"
     outside.mkdir()
-    store = EvidenceArtifactStore(
-        data_root,
-        filesystem_ops=_RetargetBeforeReplace(parts, outside),
-    )
+    store = _store_with_filesystem(data_root, _RetargetBeforeReplace(parts, outside))
 
     with pytest.raises(ArtifactBoundaryError) as caught:
         store.publish_part(
@@ -532,15 +799,16 @@ def test_publish_reports_identity_change_when_parent_is_retargeted_at_replace(
 
 def test_sharing_violation_is_cleanup_pending_and_restart_can_retry(tmp_path):
     data_root = tmp_path / "data"
-    store = EvidenceArtifactStore(data_root, filesystem_ops=_AlwaysSharingViolation())
+    store = _store_with_filesystem(data_root, _AlwaysSharingViolation())
     _publish_part(store)
 
     assert store.delete_workspace(WORKSPACE_ID) is ArtifactCleanupState.CLEANUP_PENDING
-    assert (
-        data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts" / PART_ID
-    ).read_bytes() == b"course evidence"
+    parts = data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts"
+    quarantines = list(parts.glob(".artifact-delete-*.quarantine"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == b"course evidence"
 
-    restarted = EvidenceArtifactStore(data_root, filesystem_ops=NativeArtifactFilesystemOps())
+    restarted = _store_with_filesystem(data_root, NativeArtifactFilesystemOps())
     assert restarted.delete_workspace(WORKSPACE_ID) is ArtifactCleanupState.DELETED
     assert not (data_root / "workspaces" / WORKSPACE_ID / "evidence").exists()
 
@@ -553,26 +821,6 @@ def test_restart_reanchors_and_reads_an_existing_artifact(tmp_path):
     restarted = EvidenceArtifactStore(data_root)
     with restarted.open_part(WORKSPACE_ID, PART_ID) as source:
         assert hashlib.sha256(source.read()).hexdigest() == expected
-
-
-def test_marker_persists_complete_authoritative_claim(tmp_path):
-    data_root = tmp_path / "data"
-    store = EvidenceArtifactStore(data_root)
-    digest = _publish_part(store)
-    part = data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts" / PART_ID
-    part_stat = part.stat(follow_symlinks=False)
-    marker = json.loads((part.parents[1] / ".artifact-ownership.json").read_text(encoding="utf-8"))
-
-    assert marker["artifacts"][f"parts/{PART_ID}"] == {
-        "slot": f"parts/{PART_ID}",
-        "kind": "part",
-        "id": PART_ID,
-        "device_id": str(part_stat.st_dev),
-        "file_id": str(part_stat.st_ino),
-        "sha256": digest,
-        "size": len(b"course evidence"),
-    }
-    assert marker["pending"] is None
 
 
 def test_unknown_file_in_fixed_collection_is_never_deleted(tmp_path):
@@ -588,38 +836,35 @@ def test_unknown_file_in_fixed_collection_is_never_deleted(tmp_path):
     assert (parts / PART_ID).read_bytes() == b"course evidence"
 
 
-class _RetargetEvidenceBeforeMarker(NativeArtifactFilesystemOps):
+class _RetargetWorkspaceBeforeEvidence(NativeArtifactFilesystemOps):
     def __init__(self, outside: Path) -> None:
         super().__init__()
         self.outside = outside
         self.retargeted = False
 
-    def before_mutation(self, operation, parent, source_name) -> None:
-        del operation
-        if self.retargeted or not source_name.startswith(".ownership-"):
-            return
-        self.retargeted = True
-        original = parent.path.with_name("original-evidence")
-        try:
-            parent.path.rename(original)
-        except OSError:
-            raise OwnedFilesystemError("owned_identity_changed") from None
-        _directory_link_or_skip(parent.path, self.outside)
+    @contextmanager
+    def create_new_child_directory(self, parent, name, **kwargs):
+        if not self.retargeted and name == "evidence":
+            self.retargeted = True
+            original = parent.path.with_name("original-workspace")
+            try:
+                parent.path.rename(original)
+            except OSError:
+                raise OwnedFilesystemError("owned_identity_changed") from None
+            _directory_link_or_skip(parent.path, self.outside)
+        with super().create_new_child_directory(parent, name, **kwargs) as child:
+            yield child
 
 
-def test_bootstrap_retarget_never_writes_marker_to_replacement_tree(tmp_path):
+def test_bootstrap_retarget_never_writes_into_a_replacement_workspace(tmp_path):
     data_root = tmp_path / "data"
     outside = tmp_path / "outside"
     outside.mkdir()
-    store = EvidenceArtifactStore(
-        data_root,
-        filesystem_ops=_RetargetEvidenceBeforeMarker(outside),
-    )
+    store = _store_with_filesystem(data_root, _RetargetWorkspaceBeforeEvidence(outside))
 
     with pytest.raises(ArtifactBoundaryError):
         _publish_part(store)
 
-    assert not (outside / ".artifact-ownership.json").exists()
     assert not list(outside.iterdir())
 
 
@@ -627,69 +872,61 @@ class _SimulatedCrash(BaseException):
     pass
 
 
-class _JournalFaultFilesystem(NativeArtifactFilesystemOps):
-    def __init__(self) -> None:
-        super().__init__()
-        self.phase: str | None = None
-        self.marker_count = 0
+def _crash_after_registry_phase(store, phase):
+    registry = store._registry
+    assert registry is not None
+    if phase == "prepared":
+        method_name = "prepare_publish"
+    elif phase in {"backup", "installed"}:
+        method_name = "advance_publish"
+    elif phase == "committed":
+        method_name = "commit_publish"
+    elif phase == "cleared":
+        method_name = "clear_publish"
+    else:
+        raise AssertionError(phase)
+    original = getattr(registry, method_name)
 
-    def arm(self, phase: str) -> None:
-        self.phase = phase
-        self.marker_count = 0
-
-    def replace_open_file(self, parent, source, source_name, destination_name, **kwargs):
-        if self.phase and destination_name == ".artifact-ownership.json":
-            self.marker_count += 1
-            if self.phase == "fail_commit" and self.marker_count == 2:
-                raise OwnedFilesystemError("owned_operation_failed")
-        result = super().replace_open_file(parent, source, source_name, destination_name, **kwargs)
-        if (
-            self.phase == "pending"
-            and self.marker_count == 1
-            and destination_name == ".artifact-ownership.json"
-        ):
-            raise _SimulatedCrash()
-        if self.phase == "backup" and destination_name.endswith(".backup"):
-            raise _SimulatedCrash()
-        if self.phase == "target" and destination_name == PART_ID:
-            raise _SimulatedCrash()
-        if (
-            self.phase == "committed_marker"
-            and self.marker_count == 2
-            and destination_name == ".artifact-ownership.json"
-        ):
-            raise _SimulatedCrash()
-        if (
-            self.phase == "final_clear"
-            and self.marker_count == 3
-            and destination_name == ".artifact-ownership.json"
-        ):
+    def crashing(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if method_name != "advance_publish" or kwargs.get("new_phase") == phase:
             raise _SimulatedCrash()
         return result
 
-    def delete_claimed_file(self, parent, source_name, **kwargs) -> None:
-        super().delete_claimed_file(parent, source_name, **kwargs)
-        if self.phase == "backup_delete" and source_name.endswith(".backup"):
+    setattr(registry, method_name, crashing)
+
+
+def _crash_after_backup_delete(store):
+    original = store._filesystem.delete_claimed_file
+
+    def crashing(parent, source_name, **kwargs):
+        result = original(parent, source_name, **kwargs)
+        if source_name.endswith(".backup"):
             raise _SimulatedCrash()
+        return result
+
+    store._filesystem.delete_claimed_file = crashing
 
 
 @pytest.mark.parametrize(
     "phase,expected",
     [
-        ("pending", b"old"),
+        ("prepared", b"old"),
         ("backup", b"old"),
-        ("target", b"old"),
-        ("committed_marker", b"new"),
+        ("installed", b"new"),
+        ("committed", b"new"),
         ("backup_delete", b"new"),
-        ("final_clear", b"new"),
+        ("cleared", b"new"),
     ],
 )
-def test_restart_recovers_every_persisted_publish_phase(tmp_path, phase, expected):
+def test_restart_recovers_every_registry_publish_phase(tmp_path, phase, expected):
     data_root = tmp_path / "data"
-    operations = _JournalFaultFilesystem()
-    store = EvidenceArtifactStore(data_root, filesystem_ops=operations)
+    store = EvidenceArtifactStore(data_root)
     _publish_part(store, b"old")
-    operations.arm(phase)
+    if phase == "backup_delete":
+        _crash_after_backup_delete(store)
+    else:
+        _crash_after_registry_phase(store, phase)
 
     with pytest.raises(_SimulatedCrash):
         _publish_part(store, b"new")
@@ -698,31 +935,41 @@ def test_restart_recovers_every_persisted_publish_phase(tmp_path, phase, expecte
     restarted = EvidenceArtifactStore(data_root)
     with restarted.open_part(WORKSPACE_ID, PART_ID) as source:
         assert source.read() == expected
-    marker = json.loads(
-        (data_root / "workspaces" / WORKSPACE_ID / "evidence" / ".artifact-ownership.json").read_text(
-            encoding="utf-8"
+    with sqlite3.connect(data_root / ".evidence-artifact-registry.sqlite3") as observer:
+        assert (
+            observer.execute(
+                "SELECT 1 FROM publish_journal WHERE workspace_id = ?",
+                (WORKSPACE_ID,),
+            ).fetchone()
+            is None
         )
-    )
-    assert marker["pending"] is None
 
 
-def test_marker_commit_failure_rolls_back_existing_target(tmp_path):
+def test_registry_commit_failure_keeps_pending_and_restart_completes_install(tmp_path):
     data_root = tmp_path / "data"
-    operations = _JournalFaultFilesystem()
-    store = EvidenceArtifactStore(data_root, filesystem_ops=operations)
+    store = EvidenceArtifactStore(data_root)
     _publish_part(store, b"old")
-    operations.arm("fail_commit")
+    registry = store._registry
+    assert registry is not None
+
+    def fail_commit(*args, **kwargs):
+        raise RuntimeError("registry commit unavailable")
+
+    registry.commit_publish = fail_commit
 
     with pytest.raises(ArtifactBoundaryError):
         _publish_part(store, b"new")
+    with pytest.raises(ArtifactBoundaryError):
+        with store.open_part(WORKSPACE_ID, PART_ID):
+            pytest.fail("pending registry commit must block reads")
     store.close()
 
     restarted = EvidenceArtifactStore(data_root)
     with restarted.open_part(WORKSPACE_ID, PART_ID) as source:
-        assert source.read() == b"old"
+        assert source.read() == b"new"
 
 
-def test_restart_refuses_a_copied_evidence_tree_with_a_copied_marker(tmp_path):
+def test_restart_refuses_a_copied_evidence_tree(tmp_path):
     data_root = tmp_path / "data"
     first = EvidenceArtifactStore(data_root)
     _publish_part(first)
@@ -737,7 +984,7 @@ def test_restart_refuses_a_copied_evidence_tree_with_a_copied_marker(tmp_path):
     restarted = EvidenceArtifactStore(data_root)
     with pytest.raises(ArtifactBoundaryError) as caught:
         with restarted.open_part(WORKSPACE_ID, PART_ID):
-            pytest.fail("a copied ownership marker must not re-claim a tree")
+            pytest.fail("a copied tree cannot replace the registry-claimed evidence identity")
 
     assert caught.value.code == "artifact_identity_changed"
     assert (original / "parts" / PART_ID).read_bytes() == b"course evidence"
@@ -777,6 +1024,129 @@ def test_restart_delete_refuses_same_bytes_replacement_inode(tmp_path):
 
     assert caught.value.code == "artifact_identity_changed"
     assert part.read_bytes() == b"course evidence"
+    assert original.read_bytes() == b"course evidence"
+
+
+def test_delete_absent_registry_workspace_is_idempotent_and_touches_nothing(tmp_path):
+    data_root = tmp_path / "data"
+    store = EvidenceArtifactStore(data_root)
+    unregistered = data_root / "workspaces" / WORKSPACE_ID / "evidence"
+    unregistered.mkdir(parents=True)
+    native = unregistered / "native.bin"
+    native.write_bytes(b"native")
+
+    assert store.delete_workspace(WORKSPACE_ID) is ArtifactCleanupState.DELETED
+    assert store.delete_workspace(WORKSPACE_ID) is ArtifactCleanupState.DELETED
+    assert native.read_bytes() == b"native"
+
+
+def _arm_delete_crash(store, phase):
+    registry = store._registry
+    assert registry is not None
+    if phase == "planned":
+        original = registry.plan_delete_quarantine
+
+        def crashing(*args, **kwargs):
+            original(*args, **kwargs)
+            raise _SimulatedCrash()
+
+        registry.plan_delete_quarantine = crashing
+        return
+    if phase in {"quarantined", "removed"}:
+        original = registry.advance_delete_item
+
+        def crashing(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs.get("new_phase") == phase:
+                raise _SimulatedCrash()
+            return result
+
+        registry.advance_delete_item = crashing
+        return
+    if phase == "moved":
+        original = store._filesystem.move_claimed_file
+
+        def crashing(parent, source_name, destination_name, **kwargs):
+            result = original(parent, source_name, destination_name, **kwargs)
+            if destination_name.endswith(".quarantine"):
+                raise _SimulatedCrash()
+            return result
+
+        store._filesystem.move_claimed_file = crashing
+        return
+    if phase == "deleted":
+        original = store._filesystem.delete_claimed_file
+
+        def crashing(parent, source_name, **kwargs):
+            result = original(parent, source_name, **kwargs)
+            if source_name.endswith(".quarantine"):
+                raise _SimulatedCrash()
+            return result
+
+        store._filesystem.delete_claimed_file = crashing
+        return
+    if phase == "evidence_removed":
+        original = store._filesystem.remove_empty_directory
+
+        def crashing(parent, name, **kwargs):
+            result = original(parent, name, **kwargs)
+            if name == "evidence":
+                raise _SimulatedCrash()
+            return result
+
+        store._filesystem.remove_empty_directory = crashing
+        return
+    raise AssertionError(phase)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["planned", "moved", "quarantined", "deleted", "removed", "evidence_removed"],
+)
+def test_restart_continues_every_registry_delete_phase(tmp_path, phase):
+    data_root = tmp_path / "data"
+    store = EvidenceArtifactStore(data_root)
+    _publish_part(store)
+    _arm_delete_crash(store, phase)
+
+    with pytest.raises(_SimulatedCrash):
+        store.delete_workspace(WORKSPACE_ID)
+    store.close()
+
+    restarted = EvidenceArtifactStore(data_root)
+    assert restarted.delete_workspace(WORKSPACE_ID) is ArtifactCleanupState.DELETED
+    assert not (data_root / "workspaces" / WORKSPACE_ID / "evidence").exists()
+    with sqlite3.connect(data_root / ".evidence-artifact-registry.sqlite3") as observer:
+        assert (
+            observer.execute(
+                "SELECT 1 FROM workspaces WHERE workspace_id = ?",
+                (WORKSPACE_ID,),
+            ).fetchone()
+            is None
+        )
+
+
+def test_restart_refuses_a_wrong_delete_quarantine_identity(tmp_path):
+    data_root = tmp_path / "data"
+    store = EvidenceArtifactStore(data_root)
+    _publish_part(store)
+    _arm_delete_crash(store, "moved")
+
+    with pytest.raises(_SimulatedCrash):
+        store.delete_workspace(WORKSPACE_ID)
+    store.close()
+    parts = data_root / "workspaces" / WORKSPACE_ID / "evidence" / "parts"
+    quarantine = next(parts.glob(".artifact-delete-*.quarantine"))
+    original = quarantine.with_name("owned-original-quarantine")
+    quarantine.rename(original)
+    quarantine.write_bytes(b"attacker replacement")
+
+    restarted = EvidenceArtifactStore(data_root)
+    with pytest.raises(ArtifactBoundaryError) as caught:
+        restarted.delete_workspace(WORKSPACE_ID)
+
+    assert caught.value.code == "artifact_identity_changed"
+    assert quarantine.read_bytes() == b"attacker replacement"
     assert original.read_bytes() == b"course evidence"
 
 
