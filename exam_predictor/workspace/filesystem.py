@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import ntpath
 import os
+import secrets
 import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,6 +35,38 @@ class RootAnchor:
     identity: tuple[int, int] | None = None
 
 
+class OwnedFilesystemError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True)
+class OwnedDirectoryAnchor:
+    path: Path
+    platform: str
+    identity: tuple[int, int]
+    descriptor: int
+
+
+@dataclass(frozen=True)
+class OwnedOpenFile:
+    parent: OwnedDirectoryAnchor
+    name: str
+    descriptor: int
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class OwnedMutationResult:
+    identity: tuple[int, int]
+    sha256: str
+    size: int
+    rename_write_through: bool
+    final_file_flushed: bool
+    parent_directory_flushed: bool
+
+
 class _WindowsAdapter(Protocol):
     def create_file(self, path: str, *, flags: int, share_mode: int) -> int: ...
 
@@ -60,10 +94,7 @@ def _validate_relative_path(relative_path: PurePosixPath) -> tuple[str, ...]:
         not parts
         or relative_path.is_absolute()
         or ".." in parts
-        or any(
-            part in {"", "."} or "\\" in part or "\x00" in part or ":" in part
-            for part in parts
-        )
+        or any(part in {"", "."} or "\\" in part or "\x00" in part or ":" in part for part in parts)
     ):
         raise SecureOpenError("source_path_invalid")
     return parts
@@ -174,13 +205,9 @@ class _NativeWindowsAdapter:
 
     def get_file_identity(self, handle: int) -> tuple[int, int]:
         information = self._file_information_type()
-        if not self._kernel32.GetFileInformationByHandle(
-            handle, self._ctypes.byref(information)
-        ):
+        if not self._kernel32.GetFileInformationByHandle(handle, self._ctypes.byref(information)):
             raise self._ctypes.WinError(self._ctypes.get_last_error())
-        file_index = (int(information.nFileIndexHigh) << 32) | int(
-            information.nFileIndexLow
-        )
+        file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
         return int(information.dwVolumeSerialNumber), file_index
 
     def get_final_path(self, handle: int) -> str:
@@ -317,18 +344,14 @@ class SecureFileOpener:
             yield directory_fd
 
     @contextmanager
-    def _anchor_posix_directory(
-        self, canonical_root: Path, parts: tuple[str, ...]
-    ) -> Iterator[int]:
+    def _anchor_posix_directory(self, canonical_root: Path, parts: tuple[str, ...]) -> Iterator[int]:
         directory_fds: list[int] = []
         try:
             directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
             directory_flags |= getattr(os, "O_NOFOLLOW", 0)
             directory_fds.append(os.open(canonical_root, directory_flags))
             for part in parts:
-                directory_fds.append(
-                    os.open(part, directory_flags, dir_fd=directory_fds[-1])
-                )
+                directory_fds.append(os.open(part, directory_flags, dir_fd=directory_fds[-1]))
             yield directory_fds[-1]
         except SecureOpenError:
             raise
@@ -370,11 +393,7 @@ class SecureFileOpener:
         try:
             root_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
             root_flags |= getattr(os, "O_NOFOLLOW", 0)
-            directory_fds.append(
-                os.open(canonical_root, root_flags)
-                if root_fd is None
-                else os.dup(root_fd)
-            )
+            directory_fds.append(os.open(canonical_root, root_flags) if root_fd is None else os.dup(root_fd))
             directory_flags = root_flags
             for part in parts[:-1]:
                 directory_fds.append(os.open(part, directory_flags, dir_fd=directory_fds[-1]))
@@ -456,9 +475,7 @@ class SecureFileOpener:
                 adapter.close_handle(directory_handle)
 
     @contextmanager
-    def _anchor_windows_directory(
-        self, canonical_root: Path, parts: tuple[str, ...]
-    ) -> Iterator[None]:
+    def _anchor_windows_directory(self, canonical_root: Path, parts: tuple[str, ...]) -> Iterator[None]:
         adapter = self._windows_adapter or _NativeWindowsAdapter()
         root_path = ntpath.abspath(str(canonical_root))
         directory_handles: list[int] = []
@@ -511,9 +528,7 @@ class SecureFileOpener:
                 raise SecureOpenError("source_root_invalid")
             if adapter.get_file_type(root_handle) != FILE_TYPE_DISK:
                 raise SecureOpenError("source_root_invalid")
-            canonical_root = Path(
-                _normalize_windows_final_path(adapter.get_final_path(root_handle))
-            )
+            canonical_root = Path(_normalize_windows_final_path(adapter.get_final_path(root_handle)))
             yield RootAnchor(
                 canonical_root=canonical_root,
                 platform="windows",
@@ -526,3 +541,848 @@ class SecureFileOpener:
         finally:
             if root_handle is not None:
                 adapter.close_handle(root_handle)
+
+
+class OwnedArtifactFilesystem:
+    """Identity-bound filesystem mutations beneath held directory anchors."""
+
+    MOVEFILE_REPLACE_EXISTING = 0x00000001
+    MOVEFILE_WRITE_THROUGH = 0x00000008
+
+    _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
+    _DELETE = 0x00010000
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _FILE_SHARE_DELETE = 0x00000004
+    _CREATE_NEW = 1
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_DIRECTORY = 0x10
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_TYPE_DISK = 0x0001
+    _FILE_DISPOSITION_INFO = 4
+
+    def __init__(self) -> None:
+        self._platform = "windows" if os.name == "nt" else "posix"
+        self._kernel32 = None
+        self._file_information_type = None
+        self._file_disposition_type = None
+        if self._platform == "windows":
+            self._configure_windows()
+
+    @contextmanager
+    def anchor_directory(self, path: Path) -> Iterator[OwnedDirectoryAnchor]:
+        absolute = Path(path).absolute()
+        anchor: OwnedDirectoryAnchor | None = None
+        try:
+            anchor = self._open_directory(absolute)
+            self._assert_anchor(anchor, anchor.identity)
+            yield anchor
+        except OwnedFilesystemError:
+            raise
+        except FileNotFoundError:
+            raise OwnedFilesystemError("owned_root_missing") from None
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if anchor is not None:
+                self._close_directory(anchor)
+
+    @contextmanager
+    def create_child_directory(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+    ) -> Iterator[OwnedDirectoryAnchor]:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        child_path = parent.path / name
+        try:
+            child_stat = os.lstat(child_path)
+        except FileNotFoundError:
+            self._mkdir_child(parent, name)
+        except OSError:
+            raise OwnedFilesystemError("owned_identity_changed") from None
+        else:
+            if (
+                stat.S_ISLNK(child_stat.st_mode)
+                or self._is_reparse_stat(child_stat)
+                or not stat.S_ISDIR(child_stat.st_mode)
+            ):
+                raise OwnedFilesystemError("owned_identity_changed")
+        child = self._open_child_directory(parent, name)
+        try:
+            self._assert_anchor(parent, expected_parent_identity)
+            yield child
+        finally:
+            self._close_directory(child)
+
+    @contextmanager
+    def anchor_child_directory(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+    ) -> Iterator[OwnedDirectoryAnchor]:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        child: OwnedDirectoryAnchor | None = None
+        try:
+            child = self._open_child_directory(parent, name)
+            self._assert_anchor(parent, expected_parent_identity)
+            yield child
+        except FileNotFoundError:
+            raise OwnedFilesystemError("owned_not_found") from None
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if child is not None:
+                self._close_directory(child)
+
+    @contextmanager
+    def create_temporary_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+    ) -> Iterator[OwnedOpenFile]:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        descriptor: int | None = None
+        try:
+            if self._platform == "posix":
+                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(name, flags, 0o600, dir_fd=parent.descriptor)
+            else:
+                descriptor = self._create_temporary_windows(parent.path / name)
+            opened = os.fstat(descriptor)
+            self._validate_regular(opened)
+            temporary = OwnedOpenFile(
+                parent=parent,
+                name=name,
+                descriptor=descriptor,
+                identity=(opened.st_dev, opened.st_ino),
+            )
+            self._assert_named_file(parent, name, temporary.identity)
+            self._assert_anchor(parent, expected_parent_identity)
+            yield temporary
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @contextmanager
+    def open_claimed_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_source_identity: tuple[int, int],
+        expected_sha256: str,
+        expected_size: int,
+    ) -> Iterator[OwnedOpenFile]:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        descriptor: int | None = None
+        try:
+            if self._platform == "posix":
+                flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+            else:
+                descriptor = self._open_file_windows(parent.path / name)
+            opened = os.fstat(descriptor)
+            self._validate_regular(opened, expected_source_identity)
+            source = OwnedOpenFile(parent, name, descriptor, expected_source_identity)
+            digest, size = self.hash_open_file(source)
+            if digest != expected_sha256 or size != expected_size:
+                raise OwnedFilesystemError("owned_identity_changed")
+            self._assert_named_file(parent, name, expected_source_identity)
+            self._assert_anchor(parent, expected_parent_identity)
+            yield source
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def hash_open_file(self, source: OwnedOpenFile) -> tuple[str, int]:
+        try:
+            opened = os.fstat(source.descriptor)
+            self._validate_regular(opened, source.identity)
+            os.lseek(source.descriptor, 0, os.SEEK_SET)
+            digest = hashlib.sha256()
+            while chunk := os.read(source.descriptor, 1024 * 1024):
+                digest.update(chunk)
+            os.lseek(source.descriptor, 0, os.SEEK_SET)
+            return digest.hexdigest(), opened.st_size
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+
+    def read_named_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        maximum_bytes: int,
+    ) -> tuple[tuple[int, int], bytes]:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        descriptor: int | None = None
+        try:
+            if self._platform == "posix":
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+            else:
+                descriptor = self._open_file_windows(parent.path / name)
+            opened = os.fstat(descriptor)
+            self._validate_regular(opened)
+            identity = (opened.st_dev, opened.st_ino)
+            self._assert_named_file(parent, name, identity)
+            content = os.read(descriptor, maximum_bytes + 1)
+            self._assert_anchor(parent, expected_parent_identity)
+            return identity, content
+        except OwnedFilesystemError:
+            raise
+        except FileNotFoundError:
+            raise OwnedFilesystemError("owned_not_found") from None
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def replace_open_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        source: OwnedOpenFile,
+        source_name: str,
+        destination_name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_source_identity: tuple[int, int],
+        expected_sha256: str,
+        expected_size: int,
+        replace_existing: bool,
+    ) -> OwnedMutationResult:
+        self._validate_name(source_name)
+        self._validate_name(destination_name)
+        self._assert_anchor(parent, expected_parent_identity)
+        opened = os.fstat(source.descriptor)
+        self._validate_regular(opened, expected_source_identity)
+        self._assert_named_file(parent, source_name, expected_source_identity)
+        digest, size = self.hash_open_file(source)
+        if digest != expected_sha256 or size != expected_size:
+            raise OwnedFilesystemError("owned_identity_changed")
+        self.before_mutation("replace", parent, source_name)
+        self._assert_named_file(parent, source_name, expected_source_identity)
+        if self._platform == "posix":
+            if not replace_existing and self._name_exists(parent, destination_name):
+                raise OwnedFilesystemError("owned_destination_exists")
+            if replace_existing:
+                os.replace(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=parent.descriptor,
+                    dst_dir_fd=parent.descriptor,
+                )
+            else:
+                os.rename(
+                    source_name,
+                    destination_name,
+                    src_dir_fd=parent.descriptor,
+                    dst_dir_fd=parent.descriptor,
+                )
+            os.fsync(source.descriptor)
+            os.fsync(parent.descriptor)
+            write_through = False
+            parent_flushed = True
+        else:
+            flags = self.MOVEFILE_WRITE_THROUGH
+            if replace_existing:
+                flags |= self.MOVEFILE_REPLACE_EXISTING
+            self._move_file_ex_windows(
+                parent.path / source_name,
+                parent.path / destination_name,
+                flags,
+            )
+            self._flush_file_windows(source.descriptor)
+            parent_flushed = self._flush_directory_windows(parent)
+            write_through = True
+        try:
+            self._assert_named_file(parent, destination_name, expected_source_identity)
+        except OwnedFilesystemError:
+            self._quarantine_untrusted(parent, destination_name)
+            raise
+        self._assert_anchor(parent, expected_parent_identity)
+        return OwnedMutationResult(
+            identity=expected_source_identity,
+            sha256=digest,
+            size=size,
+            rename_write_through=write_through,
+            final_file_flushed=True,
+            parent_directory_flushed=parent_flushed,
+        )
+
+    def move_claimed_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        source_name: str,
+        destination_name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_source_identity: tuple[int, int],
+        expected_sha256: str,
+        expected_size: int,
+        replace_existing: bool,
+    ) -> OwnedMutationResult:
+        with self.open_claimed_file(
+            parent,
+            source_name,
+            expected_parent_identity=expected_parent_identity,
+            expected_source_identity=expected_source_identity,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+        ) as source:
+            return self.replace_open_file(
+                parent,
+                source,
+                source_name,
+                destination_name,
+                expected_parent_identity=expected_parent_identity,
+                expected_source_identity=expected_source_identity,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                replace_existing=replace_existing,
+            )
+
+    def delete_claimed_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        source_name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_source_identity: tuple[int, int],
+        expected_sha256: str,
+        expected_size: int,
+    ) -> None:
+        quarantine_name = f".owned-quarantine-{secrets.token_hex(16)}"
+        with self.open_claimed_file(
+            parent,
+            source_name,
+            expected_parent_identity=expected_parent_identity,
+            expected_source_identity=expected_source_identity,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+        ) as source:
+            self.replace_open_file(
+                parent,
+                source,
+                source_name,
+                quarantine_name,
+                expected_parent_identity=expected_parent_identity,
+                expected_source_identity=expected_source_identity,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+                replace_existing=False,
+            )
+            self._assert_named_file(parent, quarantine_name, expected_source_identity)
+            if self._platform == "posix":
+                os.unlink(quarantine_name, dir_fd=parent.descriptor)
+                os.fsync(parent.descriptor)
+            else:
+                self._mark_delete_windows(source.descriptor)
+
+    def list_names(self, anchor: OwnedDirectoryAnchor) -> tuple[str, ...]:
+        self._assert_anchor(anchor, anchor.identity)
+        try:
+            with os.scandir(anchor.descriptor if self._platform == "posix" else anchor.path) as iterator:
+                return tuple(
+                    sorted(
+                        (entry.name for entry in iterator),
+                        key=lambda value: (value.casefold(), value),
+                    )
+                )
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+
+    def name_exists(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+    ) -> bool:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        return self._name_exists(parent, name)
+
+    def remove_empty_directory(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_child_identity: tuple[int, int],
+    ) -> None:
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        quarantine = f".owned-directory-{secrets.token_hex(16)}"
+        if self._platform == "posix":
+            child = self._open_child_directory(parent, name)
+            try:
+                if child.identity != expected_child_identity or self.list_names(child):
+                    raise OwnedFilesystemError("owned_identity_changed")
+                os.rename(
+                    name,
+                    quarantine,
+                    src_dir_fd=parent.descriptor,
+                    dst_dir_fd=parent.descriptor,
+                )
+                moved = os.stat(
+                    quarantine,
+                    dir_fd=parent.descriptor,
+                    follow_symlinks=False,
+                )
+                if (moved.st_dev, moved.st_ino) != expected_child_identity:
+                    raise OwnedFilesystemError("owned_identity_changed")
+                os.rmdir(quarantine, dir_fd=parent.descriptor)
+                os.fsync(parent.descriptor)
+            finally:
+                self._close_directory(child)
+            return
+        child = self._open_directory_windows(parent.path / name, delete_access=True)
+        try:
+            if child.identity != expected_child_identity or self.list_names(child):
+                raise OwnedFilesystemError("owned_identity_changed")
+            destination = parent.path / quarantine
+            self._rename_handle_windows(child.descriptor, destination)
+            if self._identity_windows(child.descriptor, destination) != expected_child_identity:
+                raise OwnedFilesystemError("owned_identity_changed")
+            self._mark_delete_handle_windows(child.descriptor)
+        finally:
+            self._close_directory(child)
+
+    def anchor_identity(self, anchor: OwnedDirectoryAnchor) -> tuple[int, int]:
+        self._assert_anchor(anchor, anchor.identity)
+        return anchor.identity
+
+    def before_mutation(self, operation: str, parent: OwnedDirectoryAnchor, source_name: str) -> None:
+        del operation, parent, source_name
+
+    @staticmethod
+    def _validate_name(name: str) -> None:
+        if (
+            not isinstance(name, str)
+            or name in {"", ".", ".."}
+            or "/" in name
+            or "\\" in name
+            or ":" in name
+            or "\x00" in name
+        ):
+            raise OwnedFilesystemError("owned_path_invalid")
+
+    @staticmethod
+    def _is_reparse_stat(value: os.stat_result) -> bool:
+        return bool(getattr(value, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
+
+    @staticmethod
+    def _validate_regular(value: os.stat_result, expected: tuple[int, int] | None = None) -> None:
+        identity = (value.st_dev, value.st_ino)
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or value.st_nlink != 1
+            or OwnedArtifactFilesystem._is_reparse_stat(value)
+            or (expected is not None and identity != expected)
+        ):
+            raise OwnedFilesystemError("owned_identity_changed")
+
+    def _open_directory(self, path: Path) -> OwnedDirectoryAnchor:
+        if self._platform == "posix":
+            flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                os.close(descriptor)
+                raise OwnedFilesystemError("owned_identity_changed")
+            return OwnedDirectoryAnchor(
+                path=path,
+                platform="posix",
+                identity=(opened.st_dev, opened.st_ino),
+                descriptor=descriptor,
+            )
+        return self._open_directory_windows(path)
+
+    def _open_child_directory(self, parent: OwnedDirectoryAnchor, name: str) -> OwnedDirectoryAnchor:
+        if self._platform == "windows":
+            return self._open_directory_windows(parent.path / name)
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            os.close(descriptor)
+            raise OwnedFilesystemError("owned_identity_changed")
+        return OwnedDirectoryAnchor(
+            path=parent.path / name,
+            platform="posix",
+            identity=(opened.st_dev, opened.st_ino),
+            descriptor=descriptor,
+        )
+
+    def _mkdir_child(self, parent: OwnedDirectoryAnchor, name: str) -> None:
+        self._assert_anchor(parent, parent.identity)
+        if self._platform == "posix":
+            os.mkdir(name, mode=0o700, dir_fd=parent.descriptor)
+            os.fsync(parent.descriptor)
+        else:
+            os.mkdir(parent.path / name, mode=0o700)
+        self._assert_anchor(parent, parent.identity)
+
+    def _assert_anchor(self, anchor: OwnedDirectoryAnchor, expected: tuple[int, int]) -> None:
+        if anchor.platform != self._platform or anchor.identity != expected:
+            raise OwnedFilesystemError("owned_identity_changed")
+        try:
+            if self._platform == "posix":
+                opened = os.fstat(anchor.descriptor)
+                current = (opened.st_dev, opened.st_ino)
+                if not stat.S_ISDIR(opened.st_mode) or current != expected:
+                    raise OwnedFilesystemError("owned_identity_changed")
+                return
+            current = self._identity_windows(anchor.descriptor, anchor.path)
+            final_path = _normalize_windows_final_path(self._final_path_windows(anchor.descriptor))
+            if current != expected or final_path != ntpath.normcase(ntpath.abspath(str(anchor.path))):
+                raise OwnedFilesystemError("owned_identity_changed")
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_identity_changed") from None
+
+    def _assert_named_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        expected: tuple[int, int],
+    ) -> None:
+        try:
+            if self._platform == "posix":
+                named = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+            else:
+                named = os.lstat(parent.path / name)
+            self._validate_regular(named, expected)
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_identity_changed") from None
+
+    def _name_exists(self, parent: OwnedDirectoryAnchor, name: str) -> bool:
+        try:
+            if self._platform == "posix":
+                os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+            else:
+                os.lstat(parent.path / name)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise OwnedFilesystemError("owned_identity_changed") from None
+        return True
+
+    def _close_directory(self, anchor: OwnedDirectoryAnchor) -> None:
+        if self._platform == "posix":
+            os.close(anchor.descriptor)
+        else:
+            self._close_handle_windows(anchor.descriptor)
+
+    def _configure_windows(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        class FileDispositionInformation(ctypes.Structure):
+            _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.GetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(ByHandleFileInformation),
+        ]
+        kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+        kernel32.GetFileType.restype = wintypes.DWORD
+        kernel32.GetFinalPathNameByHandleW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        kernel32.MoveFileExW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+        ]
+        kernel32.MoveFileExW.restype = wintypes.BOOL
+        kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+        kernel32.FlushFileBuffers.restype = wintypes.BOOL
+        kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+        self._kernel32 = kernel32
+        self._file_information_type = ByHandleFileInformation
+        self._file_disposition_type = FileDispositionInformation
+
+    def _open_directory_windows(self, path: Path, *, delete_access: bool = False) -> OwnedDirectoryAnchor:
+        handle = self._create_file_windows(
+            path,
+            access=self._DELETE if delete_access else 0,
+            share_mode=self._FILE_SHARE_READ | self._FILE_SHARE_WRITE,
+            disposition=self._OPEN_EXISTING,
+            flags=self._FILE_FLAG_BACKUP_SEMANTICS | self._FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        try:
+            information = self._information_windows(handle)
+            if (
+                not information.dwFileAttributes & self._FILE_ATTRIBUTE_DIRECTORY
+                or information.dwFileAttributes & self._FILE_ATTRIBUTE_REPARSE_POINT
+                or self._kernel32.GetFileType(handle) != self._FILE_TYPE_DISK
+            ):
+                raise OwnedFilesystemError("owned_identity_changed")
+            identity = self._identity_windows(handle, path)
+            final_path = _normalize_windows_final_path(self._final_path_windows(handle))
+            if final_path != ntpath.normcase(ntpath.abspath(str(path))):
+                raise OwnedFilesystemError("owned_identity_changed")
+            return OwnedDirectoryAnchor(path, "windows", identity, handle)
+        except BaseException:
+            self._close_handle_windows(handle)
+            raise
+
+    def _create_temporary_windows(self, path: Path) -> int:
+        import msvcrt
+
+        handle = self._create_file_windows(
+            path,
+            access=self._GENERIC_READ | self._GENERIC_WRITE | self._DELETE,
+            share_mode=(self._FILE_SHARE_READ | self._FILE_SHARE_WRITE | self._FILE_SHARE_DELETE),
+            disposition=self._CREATE_NEW,
+            flags=self._FILE_ATTRIBUTE_NORMAL | self._FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+        except BaseException:
+            self._close_handle_windows(handle)
+            raise
+
+    def _open_file_windows(self, path: Path) -> int:
+        import msvcrt
+
+        handle = self._create_file_windows(
+            path,
+            access=self._GENERIC_READ | self._GENERIC_WRITE | self._DELETE,
+            share_mode=(self._FILE_SHARE_READ | self._FILE_SHARE_WRITE | self._FILE_SHARE_DELETE),
+            disposition=self._OPEN_EXISTING,
+            flags=self._FILE_ATTRIBUTE_NORMAL | self._FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+        except BaseException:
+            self._close_handle_windows(handle)
+            raise
+
+    def _create_file_windows(
+        self,
+        path: Path,
+        *,
+        access: int,
+        share_mode: int,
+        disposition: int,
+        flags: int,
+    ) -> int:
+        import ctypes
+
+        handle = self._kernel32.CreateFileW(str(path), access, share_mode, None, disposition, flags, None)
+        invalid = ctypes.c_void_p(-1).value
+        value = handle if isinstance(handle, int) else handle.value
+        if value == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(value)
+
+    def _information_windows(self, handle: int):
+        import ctypes
+
+        information = self._file_information_type()
+        if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return information
+
+    def _identity_windows(self, handle: int, path: Path) -> tuple[int, int]:
+        information = self._information_windows(handle)
+        file_id = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+        named = os.lstat(path)
+        if named.st_ino != file_id:
+            raise OwnedFilesystemError("owned_identity_changed")
+        return named.st_dev, file_id
+
+    def _final_path_windows(self, handle: int) -> str:
+        import ctypes
+
+        size = self._kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0)
+        if not size:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        written = self._kernel32.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if not written or written >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buffer.value
+
+    def _move_file_ex_windows(self, source: Path, destination: Path, flags: int) -> None:
+        import ctypes
+
+        if not self._kernel32.MoveFileExW(str(source), str(destination), flags):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _flush_file_windows(self, descriptor: int) -> None:
+        import ctypes
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(descriptor)
+        if not self._kernel32.FlushFileBuffers(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _flush_directory_windows(self, anchor: OwnedDirectoryAnchor) -> bool:
+        import ctypes
+
+        handle = self._create_file_windows(
+            anchor.path,
+            access=self._GENERIC_WRITE,
+            share_mode=self._FILE_SHARE_READ | self._FILE_SHARE_WRITE,
+            disposition=self._OPEN_EXISTING,
+            flags=self._FILE_FLAG_BACKUP_SEMANTICS | self._FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        try:
+            if self._kernel32.FlushFileBuffers(handle):
+                return True
+            error = ctypes.get_last_error()
+            if error in {1, 6, 50}:
+                return False
+            raise ctypes.WinError(error)
+        finally:
+            self._close_handle_windows(handle)
+
+    def _mark_delete_windows(self, descriptor: int) -> None:
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(descriptor)
+        self._mark_delete_handle_windows(handle)
+
+    def _mark_delete_handle_windows(self, handle: int) -> None:
+        import ctypes
+
+        information = self._file_disposition_type(True)
+        if not self._kernel32.SetFileInformationByHandle(
+            handle,
+            self._FILE_DISPOSITION_INFO,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _rename_handle_windows(self, handle: int, destination: Path) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        destination_text = str(destination)
+
+        class FileRenameInformation(ctypes.Structure):
+            _fields_ = [
+                ("ReplaceIfExists", wintypes.BOOLEAN),
+                ("RootDirectory", wintypes.HANDLE),
+                ("FileNameLength", wintypes.DWORD),
+                ("FileName", wintypes.WCHAR * (len(destination_text) + 1)),
+            ]
+
+        information = FileRenameInformation()
+        information.ReplaceIfExists = False
+        information.RootDirectory = None
+        information.FileNameLength = len(destination_text.encode("utf-16-le"))
+        information.FileName = destination_text
+        if not self._kernel32.SetFileInformationByHandle(
+            handle,
+            3,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _close_handle_windows(self, handle: int) -> None:
+        self._kernel32.CloseHandle(handle)
+
+    def _quarantine_untrusted(self, parent: OwnedDirectoryAnchor, source_name: str) -> None:
+        quarantine = f".owned-untrusted-{secrets.token_hex(16)}"
+        try:
+            if self._platform == "posix":
+                os.rename(
+                    source_name,
+                    quarantine,
+                    src_dir_fd=parent.descriptor,
+                    dst_dir_fd=parent.descriptor,
+                )
+                os.fsync(parent.descriptor)
+            else:
+                self._move_file_ex_windows(
+                    parent.path / source_name,
+                    parent.path / quarantine,
+                    self.MOVEFILE_WRITE_THROUGH,
+                )
+        except OSError:
+            pass
