@@ -95,6 +95,38 @@ _SCHEMA = (
       ON study_map_snapshots(workspace_id, revision_id, created_at)""",
 )
 
+_REQUIRED_INDEXES = {
+    "idx_evidence_parts_workspace_revision_state": (
+        ("workspace_id", "revision_id", "state", "priority"),
+        """CREATE INDEX idx_evidence_parts_workspace_revision_state
+           ON evidence_parts(workspace_id, revision_id, state, priority)""",
+    ),
+    "idx_evidence_parts_source_sha256": (
+        ("source_sha256",),
+        """CREATE INDEX idx_evidence_parts_source_sha256
+           ON evidence_parts(source_sha256)""",
+    ),
+    "idx_evidence_parts_next_attempt_at": (
+        ("next_attempt_at",),
+        """CREATE INDEX idx_evidence_parts_next_attempt_at
+           ON evidence_parts(next_attempt_at)""",
+    ),
+    "idx_evidence_cache_digest": (
+        ("cache_digest",),
+        "CREATE INDEX idx_evidence_cache_digest ON evidence_cache(cache_digest)",
+    ),
+    "idx_evidence_cache_source_sha256": (
+        ("source_sha256",),
+        """CREATE INDEX idx_evidence_cache_source_sha256
+           ON evidence_cache(source_sha256)""",
+    ),
+    "idx_study_map_snapshots_workspace_revision": (
+        ("workspace_id", "revision_id", "created_at"),
+        """CREATE INDEX idx_study_map_snapshots_workspace_revision
+           ON study_map_snapshots(workspace_id, revision_id, created_at)""",
+    ),
+}
+
 
 class EvidenceStore:
     def __init__(self, database_path: str | Path) -> None:
@@ -165,10 +197,42 @@ class EvidenceStore:
     def _digest(value: str) -> str:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
+    @classmethod
+    def _claim_fingerprint(cls, plan_json: str) -> str:
+        return f"evidence-plan-v1:{cls._digest(plan_json)}"
+
     @staticmethod
     def _locator_contains(part_locator: str, citation_locator: str) -> bool:
-        part = part_locator.strip().casefold()
-        citation = citation_locator.strip().casefold()
+        part_raw = part_locator.strip()
+        citation_raw = citation_locator.strip()
+        part_member = re.fullmatch(r"member\s+(.+)", part_raw, re.IGNORECASE)
+        if part_member is not None:
+            citation_member = re.fullmatch(
+                r"member\s+(.+)", citation_raw, re.IGNORECASE
+            )
+            if citation_member is None:
+                return False
+            member_name = part_member.group(1)
+            citation_body = citation_member.group(1)
+            if citation_body == member_name:
+                return True
+            numeric = re.compile(
+                r"^(pages?|slides?|sheets?|rows?)\s+(\d+)"
+                r"(?:\s*[-\N{EN DASH}]\s*(\d+))?$",
+                re.IGNORECASE,
+            )
+            for delimiter in (":", ",", ";"):
+                prefix = member_name + delimiter
+                if citation_body.startswith(prefix):
+                    nested = numeric.fullmatch(citation_body[len(prefix) :].strip())
+                    if nested is None:
+                        return False
+                    nested_start = int(nested.group(2))
+                    nested_end = int(nested.group(3) or nested.group(2))
+                    return nested_start <= nested_end
+            return False
+        part = part_raw.casefold()
+        citation = citation_raw.casefold()
         if part == citation:
             return True
         numeric = re.compile(
@@ -188,16 +252,6 @@ class EvidenceStore:
                 part_kind == citation_kind
                 and part_start <= citation_start <= citation_end <= part_end
             )
-        if part.startswith("member "):
-            for delimiter in (":", ",", ";"):
-                prefix = part + delimiter
-                if citation.startswith(prefix):
-                    nested = numeric.fullmatch(citation[len(prefix) :].strip())
-                    if nested is None:
-                        return False
-                    nested_start = int(nested.group(2))
-                    nested_end = int(nested.group(3) or nested.group(2))
-                    return nested_start <= nested_end
         return False
 
     @classmethod
@@ -216,6 +270,16 @@ class EvidenceStore:
         with self._transaction() as connection:
             for statement in _SCHEMA:
                 connection.execute(statement)
+            for index_name, (expected_columns, statement) in _REQUIRED_INDEXES.items():
+                actual_columns = tuple(
+                    str(item["name"])
+                    for item in connection.execute(
+                        f'PRAGMA index_info("{index_name}")'
+                    )
+                )
+                if actual_columns != expected_columns:
+                    connection.execute(f'DROP INDEX IF EXISTS "{index_name}"')
+                    connection.execute(statement)
             row = connection.execute(
                 "SELECT value FROM evidence_meta WHERE name = 'schema_version'"
             ).fetchone()
@@ -394,7 +458,12 @@ class EvidenceStore:
                 dict(row) | {"state": PartState.RUNNING.value} for row in rows
             ]
         return tuple(
-            self._part(self._row_from_mapping(row)) for row in claimed_rows
+            self._part(self._row_from_mapping(row)).model_copy(
+                update={
+                    "idempotency_key": self._claim_fingerprint(str(row["plan_json"]))
+                }
+            )
+            for row in claimed_rows
         )
 
     @staticmethod
@@ -563,8 +632,14 @@ class EvidenceStore:
             ).fetchone()
             if current is None or current["value"] != part["revision_id"]:
                 raise ValueError("evidence part revision is no longer current")
+            if part["state"] not in {
+                PartState.RUNNING.value,
+                PartState.PROCESSED.value,
+            }:
+                raise ValueError("evidence part must still be running before publication")
             persisted_plan = SourcePartPlan.model_validate_json(part["plan_json"])
-            if cache_digest != self._digest(persisted_plan.idempotency_key):
+            expected_fingerprint = self._claim_fingerprint(part["plan_json"])
+            if cache_digest != self._digest(expected_fingerprint):
                 raise ValueError("cache identity does not match the persisted plan")
             if any(
                 citation.relative_path != persisted_plan.relative_path
@@ -735,27 +810,16 @@ class EvidenceStore:
         self,
         workspace_id: str,
         revision_id: str,
-        entry_id: str | None = None,
+        entry_id: str,
     ) -> tuple[str, ...]:
-        if entry_id is None:
-            entry_id = revision_id
-            revision_id = ""
         now = self._timestamp(self._now())
         with self._transaction() as connection:
-            if revision_id:
-                rows = connection.execute(
-                    """SELECT part_id FROM evidence_parts
-                       WHERE workspace_id = ? AND revision_id = ? AND entry_id = ?
-                       ORDER BY part_id ASC""",
-                    (workspace_id, revision_id, entry_id),
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    """SELECT part_id FROM evidence_parts
-                       WHERE workspace_id = ? AND entry_id = ?
-                       ORDER BY part_id ASC""",
-                    (workspace_id, entry_id),
-                ).fetchall()
+            rows = connection.execute(
+                """SELECT part_id FROM evidence_parts
+                   WHERE workspace_id = ? AND revision_id = ? AND entry_id = ?
+                   ORDER BY part_id ASC""",
+                (workspace_id, revision_id, entry_id),
+            ).fetchall()
             part_ids = tuple(str(row["part_id"]) for row in rows)
             if not part_ids:
                 return ()
