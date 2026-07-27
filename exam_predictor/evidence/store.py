@@ -16,6 +16,7 @@ from exam_predictor.evidence.models import (
     PartState,
     SourcePartPlan,
     StudyMapSnapshot,
+    validate_safe_evidence_text,
 )
 
 
@@ -88,6 +89,8 @@ _SCHEMA = (
       ON evidence_parts(next_attempt_at)""",
     """CREATE INDEX IF NOT EXISTS idx_evidence_cache_digest
       ON evidence_cache(cache_digest)""",
+    """CREATE INDEX IF NOT EXISTS idx_evidence_cache_source_sha256
+      ON evidence_cache(source_sha256)""",
     """CREATE INDEX IF NOT EXISTS idx_study_map_snapshots_workspace_revision
       ON study_map_snapshots(workspace_id, revision_id, created_at)""",
 )
@@ -128,11 +131,13 @@ class EvidenceStore:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 yield self._connection
-            except BaseException:
-                self._connection.rollback()
-                raise
-            else:
                 self._connection.commit()
+            except BaseException:
+                try:
+                    self._connection.rollback()
+                except BaseException:
+                    pass
+                raise
 
     @staticmethod
     def _now() -> datetime:
@@ -160,6 +165,53 @@ class EvidenceStore:
     def _digest(value: str) -> str:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _locator_contains(part_locator: str, citation_locator: str) -> bool:
+        part = part_locator.strip().casefold()
+        citation = citation_locator.strip().casefold()
+        if part == citation:
+            return True
+        numeric = re.compile(
+            r"^(pages?|slides?|sheets?|rows?)\s+(\d+)"
+            r"(?:\s*[-\N{EN DASH}]\s*(\d+))?$"
+        )
+        part_match = numeric.fullmatch(part)
+        citation_match = numeric.fullmatch(citation)
+        if part_match is not None and citation_match is not None:
+            part_kind = part_match.group(1).removesuffix("s")
+            citation_kind = citation_match.group(1).removesuffix("s")
+            part_start = int(part_match.group(2))
+            part_end = int(part_match.group(3) or part_match.group(2))
+            citation_start = int(citation_match.group(2))
+            citation_end = int(citation_match.group(3) or citation_match.group(2))
+            return (
+                part_kind == citation_kind
+                and part_start <= citation_start <= citation_end <= part_end
+            )
+        if part.startswith("member "):
+            for delimiter in (":", ",", ";"):
+                prefix = part + delimiter
+                if citation.startswith(prefix):
+                    nested = numeric.fullmatch(citation[len(prefix) :].strip())
+                    if nested is None:
+                        return False
+                    nested_start = int(nested.group(2))
+                    nested_end = int(nested.group(3) or nested.group(2))
+                    return nested_start <= nested_end
+        return False
+
+    @classmethod
+    def _validate_serialized_strings(cls, value: object) -> None:
+        if isinstance(value, str):
+            validate_safe_evidence_text(value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                cls._validate_serialized_strings(key)
+                cls._validate_serialized_strings(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                cls._validate_serialized_strings(item)
+
     def migrate(self) -> None:
         with self._transaction() as connection:
             for statement in _SCHEMA:
@@ -186,6 +238,7 @@ class EvidenceStore:
     def upsert_part_plans(self, plans: Sequence[SourcePartPlan]) -> None:
         revisions: dict[str, str] = {}
         for plan in plans:
+            self._validate_serialized_strings(plan.model_dump(mode="json"))
             previous = revisions.setdefault(plan.workspace_id, plan.revision_id)
             if previous != plan.revision_id:
                 raise ValueError("one upsert cannot mix revisions for a workspace")
@@ -199,45 +252,77 @@ class EvidenceStore:
                 )
             for plan in plans:
                 plan_json = self._canonical_json(plan.model_dump(mode="json"))
+                existing = connection.execute(
+                    """SELECT workspace_id, revision_id, plan_json
+                       FROM evidence_parts WHERE part_id = ?""",
+                    (plan.part_id,),
+                ).fetchone()
+                values = (
+                    plan.workspace_id,
+                    plan.revision_id,
+                    plan.entry_id,
+                    plan.source_sha256,
+                    plan.part_sha256,
+                    plan.priority,
+                    plan.ordinal,
+                    plan.state.value,
+                    plan_json,
+                )
+                if existing is None:
+                    connection.execute(
+                        """INSERT INTO evidence_parts(
+                               part_id, workspace_id, revision_id, entry_id,
+                               source_sha256, part_sha256, priority, ordinal,
+                               state, plan_json, attempt_count, next_attempt_at,
+                               created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)""",
+                        (plan.part_id, *values, now, now),
+                    )
+                    continue
+                if existing["plan_json"] == plan_json:
+                    connection.execute(
+                        "UPDATE evidence_parts SET updated_at = ? WHERE part_id = ?",
+                        (now, plan.part_id),
+                    )
+                    continue
+                unit_rows = connection.execute(
+                    """SELECT evidence_unit_id FROM evidence_units
+                       WHERE source_part_id = ?""",
+                    (plan.part_id,),
+                ).fetchall()
+                unit_ids = tuple(str(row["evidence_unit_id"]) for row in unit_rows)
+                if unit_ids:
+                    placeholders = ",".join("?" for _ in unit_ids)
+                    connection.execute(
+                        f"""DELETE FROM study_map_snapshots
+                            WHERE workspace_id = ? AND revision_id = ?
+                              AND snapshot_id IN (
+                                SELECT snapshot_id FROM study_map_dependencies
+                                WHERE evidence_unit_id IN ({placeholders})
+                              )""",
+                        (
+                            existing["workspace_id"],
+                            existing["revision_id"],
+                            *unit_ids,
+                        ),
+                    )
                 connection.execute(
-                    """INSERT INTO evidence_parts(
-                           part_id, workspace_id, revision_id, entry_id,
-                           source_sha256, part_sha256, priority, ordinal, state, plan_json,
-                           attempt_count, next_attempt_at, created_at, updated_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
-                       ON CONFLICT(part_id) DO UPDATE SET
-                           workspace_id = excluded.workspace_id,
-                           revision_id = excluded.revision_id,
-                           entry_id = excluded.entry_id,
-                           source_sha256 = excluded.source_sha256,
-                           part_sha256 = excluded.part_sha256,
-                           priority = excluded.priority,
-                           ordinal = excluded.ordinal,
-                           state = CASE
-                             WHEN evidence_parts.workspace_id = excluded.workspace_id
-                              AND evidence_parts.revision_id = excluded.revision_id
-                              AND evidence_parts.entry_id = excluded.entry_id
-                              AND evidence_parts.source_sha256 = excluded.source_sha256
-                              AND evidence_parts.part_sha256 = excluded.part_sha256
-                             THEN evidence_parts.state
-                             ELSE excluded.state
-                           END,
-                           plan_json = excluded.plan_json,
-                           updated_at = excluded.updated_at""",
-                    (
-                        plan.part_id,
-                        plan.workspace_id,
-                        plan.revision_id,
-                        plan.entry_id,
-                        plan.source_sha256,
-                        plan.part_sha256,
-                        plan.priority,
-                        plan.ordinal,
-                        plan.state.value,
-                        plan_json,
-                        now,
-                        now,
-                    ),
+                    "DELETE FROM evidence_units WHERE source_part_id = ?",
+                    (plan.part_id,),
+                )
+                connection.execute(
+                    "DELETE FROM evidence_attempts WHERE part_id = ?",
+                    (plan.part_id,),
+                )
+                connection.execute(
+                    """UPDATE evidence_parts SET
+                           workspace_id = ?, revision_id = ?, entry_id = ?,
+                           source_sha256 = ?, part_sha256 = ?, priority = ?,
+                           ordinal = ?, state = ?, plan_json = ?,
+                           attempt_count = 0, next_attempt_at = NULL,
+                           created_at = ?, updated_at = ?
+                       WHERE part_id = ?""",
+                    (*values, now, now, plan.part_id),
                 )
 
     def get_part(self, part_id: str) -> SourcePartPlan:
@@ -450,6 +535,8 @@ class EvidenceStore:
         cache_key: str,
         completed_at: datetime,
     ) -> bool:
+        unit_payload = unit.model_dump(mode="json")
+        self._validate_serialized_strings(unit_payload)
         if unit.source_part_id != part_id:
             raise ValueError("evidence unit does not belong to the source part")
         if any(
@@ -459,25 +546,48 @@ class EvidenceStore:
         ):
             raise ValueError("evidence citations do not match their evidence unit")
         published_at = self._timestamp(completed_at)
-        unit_json = self._canonical_json(unit.model_dump(mode="json"))
+        unit_json = self._canonical_json(unit_payload)
         unit_sha256 = self._digest(unit_json)
         cache_digest = self._digest(cache_key)
         with self._transaction() as connection:
             part = connection.execute(
-                "SELECT source_sha256 FROM evidence_parts WHERE part_id = ?",
+                """SELECT workspace_id, revision_id, source_sha256, state, plan_json
+                   FROM evidence_parts WHERE part_id = ?""",
                 (part_id,),
             ).fetchone()
             if part is None:
                 raise KeyError(f"Evidence part '{part_id}' was not found.")
+            current = connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(part['workspace_id'])}",),
+            ).fetchone()
+            if current is None or current["value"] != part["revision_id"]:
+                raise ValueError("evidence part revision is no longer current")
+            persisted_plan = SourcePartPlan.model_validate_json(part["plan_json"])
+            if cache_digest != self._digest(persisted_plan.idempotency_key):
+                raise ValueError("cache identity does not match the persisted plan")
+            if any(
+                citation.relative_path != persisted_plan.relative_path
+                or not self._locator_contains(
+                    persisted_plan.locator, citation.locator
+                )
+                for citation in unit.citations
+            ):
+                raise ValueError("evidence citation is outside the persisted source part")
             cached = connection.execute(
                 """SELECT unit_sha256 FROM evidence_cache
                    WHERE cache_digest = ?""",
                 (cache_digest,),
             ).fetchone()
             if cached is not None:
-                if cached["unit_sha256"] == unit_sha256:
+                if (
+                    cached["unit_sha256"] == unit_sha256
+                    and part["state"] == PartState.PROCESSED.value
+                ):
                     return False
                 raise ValueError("cache identity is already bound to different evidence")
+            if part["state"] != PartState.RUNNING.value:
+                raise ValueError("evidence part must still be running before publication")
             existing_unit = connection.execute(
                 """SELECT source_part_id, unit_sha256 FROM evidence_units
                    WHERE evidence_unit_id = ?""",
@@ -537,7 +647,19 @@ class EvidenceStore:
         return None if row is None else self._snapshot(row)
 
     def save_snapshot(self, snapshot: StudyMapSnapshot) -> bool:
-        snapshot_json = self._canonical_json(snapshot.model_dump(mode="json"))
+        snapshot_payload = snapshot.model_dump(mode="json")
+        self._validate_serialized_strings(snapshot_payload)
+        dependency_ids = set(snapshot.evidence_unit_ids)
+        node_dependency_ids = {
+            evidence_unit_id
+            for node in snapshot.nodes
+            for evidence_unit_id in node.evidence_unit_ids
+        }
+        if dependency_ids != node_dependency_ids:
+            raise ValueError(
+                "snapshot top-level and node evidence IDs must have one dependency closure"
+            )
+        snapshot_json = self._canonical_json(snapshot_payload)
         created_at = self._timestamp(snapshot.created_at)
         with self._transaction() as connection:
             existing = connection.execute(
@@ -549,6 +671,29 @@ class EvidenceStore:
                 if existing["snapshot_json"] == snapshot_json:
                     return False
                 raise ValueError("snapshot identity is already in use")
+            if dependency_ids:
+                placeholders = ",".join("?" for _ in dependency_ids)
+                dependency_rows = connection.execute(
+                    f"""SELECT units.evidence_unit_id,
+                               parts.workspace_id, parts.revision_id
+                        FROM evidence_units AS units
+                        JOIN evidence_parts AS parts
+                          ON parts.part_id = units.source_part_id
+                        WHERE units.evidence_unit_id IN ({placeholders})""",
+                    tuple(sorted(dependency_ids)),
+                ).fetchall()
+                if len(dependency_rows) != len(dependency_ids):
+                    raise sqlite3.IntegrityError(
+                        "snapshot evidence dependencies do not exist"
+                    )
+                if any(
+                    row["workspace_id"] != snapshot.workspace_id
+                    or row["revision_id"] != snapshot.revision_id
+                    for row in dependency_rows
+                ):
+                    raise ValueError(
+                        "snapshot evidence must belong to its workspace and revision"
+                    )
             connection.execute(
                 """INSERT INTO study_map_snapshots(
                        snapshot_id, workspace_id, revision_id, status,
@@ -628,8 +773,8 @@ class EvidenceStore:
                         WHERE snapshot_id IN (
                           SELECT snapshot_id FROM study_map_dependencies
                           WHERE evidence_unit_id IN ({unit_placeholders})
-                        )""",
-                    unit_ids,
+                        ) AND workspace_id = ? AND revision_id = ?""",
+                    (*unit_ids, workspace_id, revision_id),
                 )
             connection.execute(
                 f"DELETE FROM evidence_units WHERE source_part_id IN ({placeholders})",
