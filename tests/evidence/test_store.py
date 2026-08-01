@@ -229,7 +229,7 @@ def test_migration_adds_persistent_generation_columns_to_a_legacy_parts_table(
     tmp_path: Path,
 ):
     path = tmp_path / "legacy-evidence.sqlite3"
-    plan = part_plan()
+    plan = part_plan().model_copy(update={"ordinal": 7})
     plan_json = EvidenceStore._canonical_json(plan.model_dump(mode="json"))
     with sqlite3.connect(path) as connection:
         connection.execute(
@@ -277,15 +277,79 @@ def test_migration_adds_persistent_generation_columns_to_a_legacy_parts_table(
             for row in store._connection.execute("PRAGMA table_info(evidence_parts)")
         }
         generations = store._connection.execute(
-            """SELECT plan_generation, claim_generation
+            """SELECT scheduling_rank, plan_generation, claim_generation
                FROM evidence_parts WHERE part_id = ?""",
             (plan.part_id,),
         ).fetchone()
 
-    assert {"plan_generation", "claim_generation"} <= columns
-    assert tuple(generations) == (1, 0)
+    assert {"scheduling_rank", "plan_generation", "claim_generation"} <= columns
+    assert tuple(generations) == (0, 1, 0)
     assert store.get_part(plan.part_id) == plan
     store.close()
+
+
+def test_legacy_part_migration_restores_representative_scheduling_order(
+    tmp_path: Path,
+):
+    path = tmp_path / "legacy-representative.sqlite3"
+    plans = tuple(
+        part_plan(part_id=f"part-{ordinal}").model_copy(update={"ordinal": ordinal})
+        for ordinal in range(15)
+    )
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TABLE evidence_parts (
+              part_id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              revision_id TEXT NOT NULL,
+              entry_id TEXT NOT NULL,
+              source_sha256 TEXT NOT NULL,
+              part_sha256 TEXT NOT NULL,
+              priority INTEGER NOT NULL CHECK(priority >= 0),
+              ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+              state TEXT NOT NULL,
+              plan_json TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+              next_attempt_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )"""
+        )
+        for plan in plans:
+            connection.execute(
+                """INSERT INTO evidence_parts VALUES (
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?
+                   )""",
+                (
+                    plan.part_id,
+                    plan.workspace_id,
+                    plan.revision_id,
+                    plan.entry_id,
+                    plan.source_sha256,
+                    plan.part_sha256,
+                    plan.priority,
+                    plan.ordinal,
+                    plan.state.value,
+                    EvidenceStore._canonical_json(plan.model_dump(mode="json")),
+                    NOW.isoformat(),
+                    NOW.isoformat(),
+                ),
+            )
+
+    store = EvidenceStore(path)
+    try:
+        with store._lock:
+            scheduled = tuple(
+                int(row[0])
+                for row in store._connection.execute(
+                    """SELECT ordinal FROM evidence_parts
+                       ORDER BY priority, scheduling_rank, ordinal"""
+                )
+            )
+        assert scheduled[:3] == (0, 7, 14)
+        assert sorted(scheduled) == list(range(15))
+    finally:
+        store.close()
 
 
 def test_migration_adds_unassociated_generations_to_a_legacy_cache_table(
@@ -347,6 +411,8 @@ def test_schema_runtime_invariants_are_executable_and_persisted(tmp_path: Path):
                 "revision_id",
                 "state",
                 "priority",
+                "scheduling_rank",
+                "ordinal",
             ),
             "idx_evidence_parts_source_sha256": ("source_sha256",),
             "idx_evidence_parts_next_attempt_at": ("next_attempt_at",),
@@ -579,6 +645,36 @@ def test_upsert_cannot_create_a_running_part_without_a_claim(tmp_path: Path):
     with pytest.raises(KeyError, match=running_plan.part_id):
         store.get_part(running_plan.part_id)
     store.close()
+
+
+def test_run_deadline_is_persistent_and_cannot_be_extended_after_restart(
+    tmp_path: Path,
+):
+    path = tmp_path / "evidence.sqlite3"
+    first_expiry = NOW + timedelta(minutes=60)
+    store = EvidenceStore(path)
+    assert store.ensure_run_deadline(
+        "run-deadline-1",
+        "workspace-1",
+        expires_at=first_expiry,
+    ) == first_expiry
+    store.close()
+
+    restarted = EvidenceStore(path)
+    try:
+        assert restarted.ensure_run_deadline(
+            "run-deadline-1",
+            "workspace-1",
+            expires_at=first_expiry + timedelta(hours=4),
+        ) == first_expiry
+        with pytest.raises(ValueError, match="identity changed"):
+            restarted.ensure_run_deadline(
+                "run-deadline-1",
+                "different-workspace",
+                expires_at=first_expiry,
+            )
+    finally:
+        restarted.close()
 
 
 def test_record_attempt_cannot_reenter_running_with_a_recovered_claim_token(

@@ -76,11 +76,18 @@ class SourcePartPlan(EvidenceFrozenModel):
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     part_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     ordinal: int = Field(ge=0)
+    scheduling_rank: int = Field(default=0, ge=0)
     locator: str
     media_type: str
     size_bytes: int = Field(ge=0)
     scheduling_class: str
     priority: int = Field(ge=0)
+    preparation_policy_version: str = Field(default="evidence-v1", min_length=1, max_length=128)
+    preparation_schema_version: str = Field(
+        default="evidence-schema-v1",
+        min_length=1,
+        max_length=128,
+    )
     state: PartState
     idempotency_key: str
     safe_error_code: str | None = None
@@ -143,6 +150,7 @@ class EvidenceUnit(EvidenceFrozenModel):
 class CoverageItem(EvidenceFrozenModel):
     topic: str
     covered: bool
+    excluded: bool = False
     entry_id: str | None = None
     relative_path: str | None = None
     approved_bytes: int = Field(default=0, ge=0)
@@ -204,6 +212,30 @@ class CoverageItem(EvidenceFrozenModel):
     @model_validator(mode="after")
     def validate_entry_ledger(self) -> CoverageItem:
         if self.entry_id is None:
+            if self.excluded:
+                raise ValueError("excluded coverage items must identify a manifest entry")
+            return self
+        if self.excluded:
+            if (
+                self.covered
+                or self.approved_bytes
+                or self.planned_part_count
+                or self.processed_part_count
+                or self.running_part_count
+                or self.pending_part_count
+                or self.retrying_part_count
+                or self.failed_part_count
+                or self.invalidated_part_count
+                or self.processed_locators
+                or self.current_locator is not None
+                or self.failure_codes
+                or self.last_successful_evidence_at is not None
+                or self.influenced_current_snapshot
+                or self.next_action != "none"
+            ):
+                raise ValueError("excluded coverage items cannot enter the evidence ledger")
+            if self.relative_path is None:
+                raise ValueError("excluded coverage items must retain their manifest path")
             return self
         counts = (
             self.processed_part_count
@@ -230,6 +262,7 @@ class CoverageSummary(EvidenceFrozenModel):
     items: tuple[CoverageItem, ...]
     covered_count: int = Field(ge=0)
     total_count: int = Field(ge=1)
+    excluded_count: int = Field(default=0, ge=0)
     approved_bytes: int = Field(default=0, ge=0)
     part_total_count: int = Field(default=0, ge=0)
     part_processed_count: int = Field(default=0, ge=0)
@@ -240,8 +273,14 @@ class CoverageSummary(EvidenceFrozenModel):
     part_invalidated_count: int = Field(default=0, ge=0)
 
     @property
+    def included_count(self) -> int:
+        return self.total_count - self.excluded_count
+
+    @property
     def coverage_fraction(self) -> float:
-        return self.covered_count / self.total_count
+        if self.included_count == 0:
+            return 0.0
+        return self.covered_count / self.included_count
 
     @property
     def part_coverage_fraction(self) -> float:
@@ -252,7 +291,7 @@ class CoverageSummary(EvidenceFrozenModel):
     @property
     def is_partial(self) -> bool:
         return (
-            0 < self.covered_count < self.total_count
+            0 < self.covered_count < self.included_count
             or 0 < self.part_processed_count < self.part_total_count
         )
 
@@ -262,8 +301,17 @@ class CoverageSummary(EvidenceFrozenModel):
             raise ValueError("total_count must equal the number of coverage items")
         if self.covered_count != sum(item.covered for item in self.items):
             raise ValueError("covered_count must equal the covered coverage items")
-        if len({item.topic.casefold() for item in self.items}) != len(self.items):
-            raise ValueError("coverage topics must be unique")
+        if self.excluded_count != sum(item.excluded for item in self.items):
+            raise ValueError("excluded_count must equal the excluded coverage items")
+        entry_ids = tuple(
+            item.entry_id for item in self.items if item.entry_id is not None
+        )
+        if len(set(entry_ids)) != len(entry_ids):
+            raise ValueError("coverage entry IDs must be unique")
+        if len(entry_ids) != len(self.items) and (
+            len({item.topic.casefold() for item in self.items}) != len(self.items)
+        ):
+            raise ValueError("non-entry coverage topics must be unique")
         if all(item.entry_id is not None for item in self.items):
             exact = {
                 "approved_bytes": sum(item.approved_bytes for item in self.items),

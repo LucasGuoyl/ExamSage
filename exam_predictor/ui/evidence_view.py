@@ -73,6 +73,7 @@ _SOURCE_CHANGED_CODES = frozenset(
 class EvidenceViewModel:
     phase: EvidencePhase
     source_count: int = 0
+    excluded_source_count: int = 0
     covered_source_count: int = 0
     part_count: int = 0
     processed_part_count: int = 0
@@ -188,7 +189,8 @@ def build_evidence_view_model(
     )
     return EvidenceViewModel(
         phase=phase,
-        source_count=coverage.total_count,
+        source_count=coverage.included_count,
+        excluded_source_count=coverage.excluded_count,
         covered_source_count=coverage.covered_count,
         part_count=coverage.part_total_count,
         processed_part_count=coverage.part_processed_count,
@@ -265,9 +267,12 @@ def _render_source_progress(model: EvidenceViewModel, language: str) -> None:
     if not model.items:
         return
     for item in model.items:
+        label = item.relative_path or item.topic
+        if item.excluded:
+            st.caption(f"{label} · {text('source_excluded', language)}")
+            continue
         total = item.planned_part_count
         progress = 0.0 if total == 0 else item.processed_part_count / total
-        label = item.relative_path or item.topic
         st.progress(progress, text=label)
         details = [
             text(
@@ -387,6 +392,14 @@ def render_evidence_panel(
         f"{model.processed_part_count}/{model.part_count}",
     )
     byte_metric.metric(text("approved_bytes", language), model.approved_bytes)
+    if model.excluded_source_count:
+        st.caption(
+            text(
+                "sources_excluded",
+                language,
+                count=model.excluded_source_count,
+            )
+        )
 
     if model.current_source is not None:
         st.caption(f"{text('current_source', language)}: {model.current_source}")

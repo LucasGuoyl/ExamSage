@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 from threading import Event
@@ -238,12 +238,15 @@ def _service(
     run_guard=None,
     scheduler_emit=None,
     synthesizer=None,
+    policy=None,
+    wall_clock=None,
+    monotonic_clock=None,
 ):
     artifact_root = tmp_path / "artifacts"
-    artifact_root.mkdir()
+    artifact_root.mkdir(exist_ok=True)
     artifacts = EvidenceArtifactStore(artifact_root)
     evidence_store = EvidenceStore(tmp_path / "evidence.sqlite3")
-    policy = EvidencePolicy(multimodal_concurrency=1)
+    policy = policy or EvidencePolicy(multimodal_concurrency=1)
     gate = RecordingGate(workspace_store)
     builder = StudyMapBuilder(
         evidence_store,
@@ -252,6 +255,7 @@ def _service(
         coverage_source=_coverage_source(workspace_store),
         policy=policy,
         now=lambda: NOW,
+        monotonic_clock=monotonic_clock,
     )
     scheduler = EvidenceScheduler(
         evidence_store,
@@ -261,7 +265,8 @@ def _service(
         RunControlRegistry(),
         emit=scheduler_emit,
         policy=policy,
-        wall_clock=lambda: NOW,
+        wall_clock=wall_clock or (lambda: NOW),
+        monotonic_clock=monotonic_clock,
     )
     service = EvidenceService(
         workspace_store=workspace_store,
@@ -273,8 +278,27 @@ def _service(
         study_map_builder=builder,
         answer_composer=answer_composer,
         run_guard=run_guard,
+        policy=policy,
+        wall_clock=wall_clock or (lambda: NOW),
+        monotonic_clock=monotonic_clock,
     )
     return service, gate, evidence_store, artifacts
+
+
+class _ServiceClock:
+    def __init__(self) -> None:
+        self.current = NOW
+        self.monotonic_value = 0.0
+
+    def wall(self) -> datetime:
+        return self.current
+
+    def monotonic(self) -> float:
+        return self.monotonic_value
+
+    def advance(self, seconds: float) -> None:
+        self.current += timedelta(seconds=seconds)
+        self.monotonic_value += seconds
 
 
 @pytest.fixture
@@ -427,6 +451,143 @@ def test_service_consumes_one_gate_spool_and_provider_receives_only_prepared_byt
     finally:
         artifacts.close()
         evidence_store.close()
+
+
+def test_one_run_keeps_one_deadline_across_frontiers(
+    tmp_path: Path,
+    workspace_store: WorkspaceStore,
+):
+    _workspace(
+        workspace_store,
+        tmp_path,
+        {"a.txt": b"first", "b.txt": b"second"},
+    )
+    clock = _ServiceClock()
+    provider = RecordingProvider()
+    policy = EvidencePolicy(
+        multimodal_concurrency=1,
+        tool_deadline_seconds=60,
+    )
+    service, _gate, evidence_store, artifacts = _service(
+        tmp_path,
+        workspace_store,
+        provider,
+        policy=policy,
+        wall_clock=clock.wall,
+        monotonic_clock=clock.monotonic,
+    )
+    try:
+        inspection = service.prepare_analysis(WORKSPACE_ID)
+        assert inspection.revision_id is not None
+        first = service.analyze_frontier(
+            WORKSPACE_ID,
+            inspection.revision_id,
+            "run_deadline_0001",
+        )
+        clock.advance(61)
+        second = service.analyze_frontier(
+            WORKSPACE_ID,
+            inspection.revision_id,
+            "run_deadline_0001",
+        )
+    finally:
+        artifacts.close()
+        evidence_store.close()
+
+    assert first.outcome.processed_part_ids
+    assert second.outcome.status.value == "paused"
+    assert len(provider.requests) == 1
+
+
+def test_expired_run_deadline_prevents_new_synthesis_after_frontier(
+    tmp_path: Path,
+    workspace_store: WorkspaceStore,
+):
+    _workspace(workspace_store, tmp_path, {"notes.txt": b"only source"})
+    clock = _ServiceClock()
+
+    class RecordingSynthesizer(Synthesizer):
+        def __init__(self) -> None:
+            self.requests: list[StudyMapSynthesisRequest] = []
+
+        def synthesize_study_map(self, request: StudyMapSynthesisRequest) -> str:
+            self.requests.append(request)
+            return super().synthesize_study_map(request)
+
+    synthesizer = RecordingSynthesizer()
+    provider = RecordingProvider(on_call=lambda *_args: clock.advance(61))
+    service, _gate, evidence_store, artifacts = _service(
+        tmp_path,
+        workspace_store,
+        provider,
+        synthesizer=synthesizer,
+        policy=EvidencePolicy(
+            multimodal_concurrency=1,
+            tool_deadline_seconds=60,
+        ),
+        wall_clock=clock.wall,
+        monotonic_clock=clock.monotonic,
+    )
+    run_id = "run_publish_deadline_0001"
+    try:
+        inspection = service.prepare_analysis(WORKSPACE_ID, run_id)
+        assert inspection.revision_id is not None
+        frontier = service.analyze_frontier(
+            WORKSPACE_ID,
+            inspection.revision_id,
+            run_id,
+        )
+        result = service.publish_frontier(
+            WORKSPACE_ID,
+            inspection.revision_id,
+            frontier.outcome,
+            run_id=run_id,
+        )
+    finally:
+        artifacts.close()
+        evidence_store.close()
+
+    assert frontier.outcome.processed_part_ids
+    assert result.status == "paused"
+    assert synthesizer.requests == []
+
+
+def test_preparation_policy_upgrade_reprepares_current_revision(
+    tmp_path: Path,
+    workspace_store: WorkspaceStore,
+):
+    _root, revision = _workspace(
+        workspace_store,
+        tmp_path,
+        {"notes.txt": b"approved evidence"},
+    )
+    first_service, _gate, first_store, first_artifacts = _service(
+        tmp_path,
+        workspace_store,
+        RecordingProvider(),
+        policy=EvidencePolicy(policy_version="evidence-v1"),
+    )
+    first_service.prepare_analysis(WORKSPACE_ID)
+    first_parts = first_store.list_parts(WORKSPACE_ID, revision.revision_id)
+    first_artifacts.close()
+    first_store.close()
+
+    second_service, _gate, second_store, second_artifacts = _service(
+        tmp_path,
+        workspace_store,
+        RecordingProvider(),
+        policy=EvidencePolicy(policy_version="evidence-v2"),
+    )
+    try:
+        second_service.prepare_analysis(WORKSPACE_ID)
+        second_parts = second_store.list_parts(WORKSPACE_ID, revision.revision_id)
+    finally:
+        second_artifacts.close()
+        second_store.close()
+
+    assert len(first_parts) == len(second_parts) == 1
+    assert second_parts[0].part_id != first_parts[0].part_id
+    assert second_parts[0].preparation_policy_version == "evidence-v2"
 
 
 def test_exclusion_between_frontiers_pauses_before_the_second_provider_call(

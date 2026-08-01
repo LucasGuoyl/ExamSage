@@ -124,7 +124,10 @@ def build_evidence_graph(
 
     def prepare(state: EvidenceGraphState) -> dict[str, Any]:
         try:
-            inspection = deps.tools.prepare_analysis(state["workspace_id"])
+            inspection = deps.tools.prepare_analysis(
+                state["workspace_id"],
+                state["run_id"],
+            )
         except SourceAuthorizationError as error:
             return {"authority_error": _authority_error(error)}
         if inspection.approval_required or inspection.revision_id is None:
@@ -169,6 +172,7 @@ def build_evidence_graph(
                 state["workspace_id"],
                 state["revision_id"],
                 frontier.outcome,
+                run_id=state["run_id"],
                 response_language=arguments.response_language,
             )
         except SourceAuthorizationError as error:
@@ -187,6 +191,8 @@ def build_evidence_graph(
         result = EvidencePublicationState.model_validate(state["evidence_result"])
         if result.status == "complete":
             return "complete"
+        if result.safe_error_code == "provider_timeout":
+            return "deadline"
         if state.get("resumed_from_stop") and not frontier.outcome.failed_part_ids:
             return "continue"
         if frontier.outcome.status is SchedulerStatus.PAUSED:
@@ -344,6 +350,7 @@ def build_evidence_graph(
         {
             "complete": "finish_evidence_tool",
             "continue": "stop_before_frontier",
+            "deadline": "finish_evidence_tool",
             "paused": "pause_evidence_frontier",
             "source_changed": "pause_source_changed",
         },

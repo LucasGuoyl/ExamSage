@@ -30,7 +30,11 @@ EVIDENCE_TOOL_NAMES: tuple[EvidenceToolName, ...] = (
 class EvidenceServiceProtocol(Protocol):
     def inspect(self, workspace_id: str) -> EvidenceInspection: ...
 
-    def prepare_analysis(self, workspace_id: str) -> EvidenceInspection: ...
+    def prepare_analysis(
+        self,
+        workspace_id: str,
+        run_id: str | None = None,
+    ) -> EvidenceInspection: ...
 
     def analyze_frontier(
         self,
@@ -45,6 +49,7 @@ class EvidenceServiceProtocol(Protocol):
         revision_id: str,
         outcome: SchedulerOutcome,
         *,
+        run_id: str,
         response_language: str | None = None,
     ) -> EvidenceRunResult: ...
 
@@ -167,8 +172,12 @@ class EvidenceToolRegistry:
             )
         raise ValueError(f"Evidence tool '{tool}' requires the resumable graph.")
 
-    def prepare_analysis(self, workspace_id: str) -> EvidenceInspection:
-        return self.service.prepare_analysis(workspace_id)
+    def prepare_analysis(
+        self,
+        workspace_id: str,
+        run_id: str | None = None,
+    ) -> EvidenceInspection:
+        return self.service.prepare_analysis(workspace_id, run_id)
 
     def analyze_frontier(
         self,
@@ -184,12 +193,14 @@ class EvidenceToolRegistry:
         revision_id: str,
         outcome: SchedulerOutcome,
         *,
+        run_id: str,
         response_language: str | None = None,
     ) -> EvidenceRunResult:
         return self.service.publish_frontier(
             workspace_id,
             revision_id,
             outcome,
+            run_id=run_id,
             response_language=response_language,
         )
 
@@ -200,6 +211,11 @@ class EvidenceToolRegistry:
     ) -> EvidenceToolOutput:
         if result.status == "complete":
             content = "The cited study map is complete."
+        elif result.safe_error_code == "provider_timeout":
+            content = (
+                "The evidence deadline was reached after saved progress. "
+                "Start a new analysis run to continue with a fresh deadline."
+            )
         else:
             content = "Course evidence was saved and analysis is paused."
         return EvidenceToolOutput(

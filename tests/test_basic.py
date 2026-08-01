@@ -16,7 +16,23 @@ def test_public_version():
     """The importable package exposes the release version."""
     import exam_predictor
 
-    assert exam_predictor.__version__ == "0.5.0"
+    assert exam_predictor.__version__ == "0.6.0"
+
+
+def test_release_metadata_and_readme_describe_the_agent_product():
+    """All public release surfaces describe the same supported product."""
+    root = Path(__file__).resolve().parents[1]
+    metadata = (root / "pyproject.toml").read_text(encoding="utf-8")
+    readme = (root / "README.md").read_text(encoding="utf-8")
+
+    assert 'version = "0.6.0"' in metadata
+    assert "Current release: **0.6.0**" in readme
+    assert "Initial study map" in readme
+    assert "Complete study map" in readme
+    assert "one provider API key" in readme
+    assert "Opt-in live benchmark" in readme
+    assert "Legacy developer fallback" in readme
+    assert "legacy build flow remains the default" not in readme.lower()
 
 
 def test_imports():

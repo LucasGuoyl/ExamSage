@@ -20,9 +20,10 @@ from exam_predictor.evidence.models import (
     StudyMapSnapshot,
     validate_safe_evidence_text,
 )
+from exam_predictor.evidence.policy import representative_ordinals
 
 
-_SCHEMA_VERSION = "6"
+_SCHEMA_VERSION = "8"
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS evidence_meta (
@@ -38,6 +39,7 @@ _SCHEMA = (
       part_sha256 TEXT NOT NULL,
       priority INTEGER NOT NULL CHECK(priority >= 0),
       ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+      scheduling_rank INTEGER NOT NULL CHECK(scheduling_rank >= 0),
       state TEXT NOT NULL,
       plan_json TEXT NOT NULL,
       attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
@@ -97,8 +99,12 @@ _SCHEMA = (
       workspace_id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL
     )""",
-    """CREATE INDEX IF NOT EXISTS idx_evidence_parts_workspace_revision_state
-      ON evidence_parts(workspace_id, revision_id, state, priority)""",
+    """CREATE TABLE IF NOT EXISTS evidence_run_deadlines (
+      run_id TEXT PRIMARY KEY,
+      workspace_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )""",
     """CREATE INDEX IF NOT EXISTS idx_evidence_parts_source_sha256
       ON evidence_parts(source_sha256)""",
     """CREATE INDEX IF NOT EXISTS idx_evidence_parts_next_attempt_at
@@ -113,9 +119,18 @@ _SCHEMA = (
 
 _REQUIRED_INDEXES = {
     "idx_evidence_parts_workspace_revision_state": (
-        ("workspace_id", "revision_id", "state", "priority"),
+        (
+            "workspace_id",
+            "revision_id",
+            "state",
+            "priority",
+            "scheduling_rank",
+            "ordinal",
+        ),
         """CREATE INDEX idx_evidence_parts_workspace_revision_state
-           ON evidence_parts(workspace_id, revision_id, state, priority)""",
+           ON evidence_parts(
+             workspace_id, revision_id, state, priority, scheduling_rank, ordinal
+           )""",
     ),
     "idx_evidence_parts_source_sha256": (
         ("source_sha256",),
@@ -299,6 +314,32 @@ class EvidenceStore:
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(evidence_parts)")
             }
+            if "scheduling_rank" not in part_columns:
+                connection.execute(
+                    """ALTER TABLE evidence_parts ADD COLUMN scheduling_rank
+                       INTEGER NOT NULL DEFAULT 0 CHECK(scheduling_rank >= 0)"""
+                )
+                legacy_groups: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+                for item in connection.execute(
+                    """SELECT part_id, workspace_id, revision_id, entry_id, ordinal
+                       FROM evidence_parts
+                       ORDER BY workspace_id, revision_id, entry_id, ordinal, part_id"""
+                ):
+                    group = (
+                        str(item["workspace_id"]),
+                        str(item["revision_id"]),
+                        str(item["entry_id"]),
+                    )
+                    legacy_groups.setdefault(group, []).append(item)
+                for members in legacy_groups.values():
+                    for rank, index in enumerate(
+                        representative_ordinals(len(members))
+                    ):
+                        connection.execute(
+                            """UPDATE evidence_parts SET scheduling_rank = ?
+                               WHERE part_id = ?""",
+                            (rank, members[index]["part_id"]),
+                        )
             if "plan_generation" not in part_columns:
                 connection.execute(
                     """ALTER TABLE evidence_parts ADD COLUMN plan_generation
@@ -397,6 +438,7 @@ class EvidenceStore:
                     plan.part_sha256,
                     plan.priority,
                     plan.ordinal,
+                    plan.scheduling_rank,
                     plan.state.value,
                     plan_json,
                 )
@@ -405,10 +447,11 @@ class EvidenceStore:
                         """INSERT INTO evidence_parts(
                                part_id, workspace_id, revision_id, entry_id,
                                source_sha256, part_sha256, priority, ordinal,
-                               state, plan_json, attempt_count, next_attempt_at,
+                               scheduling_rank, state, plan_json,
+                               attempt_count, next_attempt_at,
                                plan_generation, claim_generation,
                                created_at, updated_at
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 1, 0, ?, ?)""",
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 1, 0, ?, ?)""",
                         (plan.part_id, *values, now, now),
                     )
                     continue
@@ -451,7 +494,7 @@ class EvidenceStore:
                     """UPDATE evidence_parts SET
                            workspace_id = ?, revision_id = ?, entry_id = ?,
                            source_sha256 = ?, part_sha256 = ?, priority = ?,
-                           ordinal = ?, state = ?, plan_json = ?,
+                           ordinal = ?, scheduling_rank = ?, state = ?, plan_json = ?,
                            attempt_count = 0, next_attempt_at = NULL,
                            plan_generation = plan_generation + 1,
                            created_at = ?, updated_at = ?
@@ -507,6 +550,51 @@ class EvidenceStore:
         if row is None:
             raise KeyError(f"Evidence part '{part_id}' was not found.")
         return int(row["attempt_count"])
+
+    def route_attempt_count(self, part_id: str, route: str) -> int:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", route):
+            raise ValueError("route must be a bounded stable identifier")
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT COUNT(*) AS count FROM evidence_attempts
+                   WHERE part_id = ? AND route = ?""",
+                (part_id, route),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Evidence part '{part_id}' was not found.")
+        return int(row["count"])
+
+    def ensure_run_deadline(
+        self,
+        run_id: str,
+        workspace_id: str,
+        *,
+        expires_at: datetime,
+    ) -> datetime:
+        if not run_id or len(run_id) > 128 or not workspace_id or len(workspace_id) > 128:
+            raise ValueError("evidence run deadline identity is invalid")
+        expires = self._timestamp(expires_at)
+        created = self._timestamp(self._now())
+        assert expires is not None and created is not None
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO evidence_run_deadlines(
+                       run_id, workspace_id, expires_at, created_at
+                   ) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(run_id) DO NOTHING""",
+                (run_id, workspace_id, expires, created),
+            )
+            row = connection.execute(
+                """SELECT workspace_id, expires_at FROM evidence_run_deadlines
+                   WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+        if row is None or row["workspace_id"] != workspace_id:
+            raise ValueError("evidence run deadline identity changed")
+        persisted = datetime.fromisoformat(str(row["expires_at"]))
+        if persisted.tzinfo is None or persisted.utcoffset() is None:
+            raise ValueError("evidence run deadline is invalid")
+        return persisted.astimezone(UTC)
 
     def latest_part_error_codes(
         self,
@@ -633,7 +721,7 @@ class EvidenceStore:
                    WHERE workspace_id = ? AND revision_id = ?
                      AND state IN (?, ?, ?, ?)
                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-                   ORDER BY priority ASC, ordinal ASC, part_id ASC
+                   ORDER BY priority ASC, scheduling_rank ASC, ordinal ASC, part_id ASC
                    LIMIT ?""",
                 (
                     workspace_id,
@@ -880,6 +968,52 @@ class EvidenceStore:
                 int(row["claim_generation"]),
             ),
         )
+
+    def fail_exhausted_claim(
+        self,
+        part_id: str,
+        *,
+        claim_token: str,
+        failed_at: datetime,
+    ) -> SourcePartPlan:
+        timestamp = self._timestamp(failed_at)
+        with self._transaction() as connection:
+            part = connection.execute(
+                """SELECT workspace_id, revision_id, state,
+                          plan_generation, claim_generation
+                   FROM evidence_parts WHERE part_id = ?""",
+                (part_id,),
+            ).fetchone()
+            if part is None:
+                raise KeyError(f"Evidence part '{part_id}' was not found.")
+            current = connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(part['workspace_id'])}",),
+            ).fetchone()
+            expected = self._claim_token(
+                part_id,
+                int(part["plan_generation"]),
+                int(part["claim_generation"]),
+            )
+            if (
+                current is None
+                or current["value"] != part["revision_id"]
+                or part["state"] != PartState.RUNNING.value
+                or not hmac.compare_digest(claim_token, expected)
+            ):
+                raise ValueError("claim token does not match the exhausted claim")
+            connection.execute(
+                """UPDATE evidence_parts
+                   SET state = ?, next_attempt_at = NULL, updated_at = ?
+                   WHERE part_id = ?""",
+                (PartState.FAILED.value, timestamp, part_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM evidence_parts WHERE part_id = ?",
+                (part_id,),
+            ).fetchone()
+        assert row is not None
+        return self._part(row)
 
     def publication_token(self, part_id: str) -> str:
         with self._lock:
@@ -1530,6 +1664,30 @@ class EvidenceStore:
             )
         return part_ids, snapshot_ids
 
+    def delete_invalidated_entry_parts(
+        self,
+        workspace_id: str,
+        revision_id: str,
+        entry_id: str,
+    ) -> tuple[str, ...]:
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """SELECT part_id, state FROM evidence_parts
+                   WHERE workspace_id = ? AND revision_id = ? AND entry_id = ?
+                   ORDER BY part_id ASC""",
+                (workspace_id, revision_id, entry_id),
+            ).fetchall()
+            if any(row["state"] != PartState.INVALIDATED.value for row in rows):
+                raise ValueError("only invalidated entry parts may be deleted")
+            part_ids = tuple(str(row["part_id"]) for row in rows)
+            if part_ids:
+                placeholders = ",".join("?" for _ in part_ids)
+                connection.execute(
+                    f"DELETE FROM evidence_parts WHERE part_id IN ({placeholders})",
+                    part_ids,
+                )
+        return part_ids
+
     def pending_snapshot_revocations(
         self,
         workspace_id: str,
@@ -1624,6 +1782,10 @@ class EvidenceStore:
     ) -> None:
         connection.execute(
             "DELETE FROM snapshot_artifact_revocations WHERE workspace_id = ?",
+            (workspace_id,),
+        )
+        connection.execute(
+            "DELETE FROM evidence_run_deadlines WHERE workspace_id = ?",
             (workspace_id,),
         )
         connection.execute(

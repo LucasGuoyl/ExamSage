@@ -117,6 +117,10 @@ class EvidenceRouteIdentity(_PrivateEvidenceModel):
         default="0" * 64,
         pattern=r"^[0-9a-f]{64}$",
     )
+    profile_fingerprint: str = Field(
+        default="0" * 64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @field_validator("model_id")
     @classmethod

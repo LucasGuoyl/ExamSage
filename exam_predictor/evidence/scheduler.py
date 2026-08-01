@@ -248,6 +248,7 @@ class EvidenceScheduler:
             route = self._provider.route_identity("balanced")
         except EvidenceProviderError as error:
             return self._record_recoverable_route_error(part, claim_token, error)
+        route_key = self._route_key(route)
         cache_key = self._cache_key(part, route)
         with self._authorization_context(authorize_part, part):
             cached = self._store.reuse_cached_evidence(
@@ -261,7 +262,22 @@ class EvidenceScheduler:
             return _PartOutcome(part.part_id, PartState.PROCESSED)
 
         attempt = self._store.attempt_count(part.part_id) + 1
-        route_attempt = 1
+        route_attempt = self._store.route_attempt_count(part.part_id, route_key) + 1
+        if route_attempt > self._policy.max_attempts_per_route:
+            self._store.fail_exhausted_claim(
+                part.part_id,
+                claim_token=claim_token,
+                failed_at=self._wall_clock(),
+            )
+            self._emit(
+                "part_failed",
+                part,
+                {
+                    "attempt": attempt - 1,
+                    "safe_error_code": "provider_attempts_exhausted",
+                },
+            )
+            return _PartOutcome(part.part_id, PartState.FAILED)
         while route_attempt <= self._policy.max_attempts_per_route:
             if self._must_pause(run_id, deadline):
                 self._pause_claim(part, claim_token)
@@ -279,7 +295,22 @@ class EvidenceScheduler:
                         self._pause_claim(part, claim_token)
                         return _PartOutcome(part.part_id, PartState.RETRY_WAIT)
                     provider_result = self._provider.analyze_source_part(request)
-                    unit = self._validator(provider_result, part)
+                    validate_with_deadline = getattr(
+                        self._validator,
+                        "validate",
+                        None,
+                    )
+                    if callable(validate_with_deadline):
+                        unit = validate_with_deadline(
+                            provider_result,
+                            part,
+                            deadline_seconds=max(
+                                0.0,
+                                deadline - self._monotonic_clock(),
+                            ),
+                        )
+                    else:
+                        unit = self._validator(provider_result, part)
                     # A stop is a boundary for new provider work, not for the
                     # local publication of an already-paid, validated result.
                     # Persist it under the still-held authority so Resume does
@@ -309,7 +340,7 @@ class EvidenceScheduler:
                     self._store.record_attempt(
                         part.part_id,
                         attempt=attempt,
-                        route=self._route_key(route),
+                        route=route_key,
                         outcome=PartState.RETRY_WAIT,
                         started_at=started_at,
                         finished_at=finished_at,
@@ -340,24 +371,16 @@ class EvidenceScheduler:
                     token_holder[0] = claim_token
                     continue
                 if error.retryable:
-                    self._store.record_attempt(
-                        part.part_id,
-                        attempt=attempt,
-                        route=self._route_key(route),
-                        outcome=PartState.RETRY_WAIT,
-                        started_at=started_at,
-                        finished_at=finished_at,
-                        safe_error_code=error.code,
-                        next_attempt_at=finished_at
-                        + timedelta(seconds=self._retry_delay(error, route_attempt)),
-                        claim_token=claim_token,
-                    )
-                    self._emit(
-                        "part_retrying",
+                    self._record_failed(
                         part,
-                        {"attempt": attempt, "safe_error_code": error.code},
+                        claim_token,
+                        attempt,
+                        route,
+                        error.code,
+                        started_at,
+                        finished_at,
                     )
-                    return _PartOutcome(part.part_id, PartState.RETRY_WAIT)
+                    return _PartOutcome(part.part_id, PartState.FAILED)
                 return self._record_recoverable_route_error(
                     part,
                     claim_token,
@@ -528,6 +551,7 @@ class EvidenceScheduler:
             "part_sha256": part.part_sha256,
             "policy_version": self._policy.policy_version,
             "prompt_version": self._policy.prompt_version,
+            "profile_fingerprint": route.profile_fingerprint,
             "provider": route.provider,
             "schema_version": self._policy.schema_version,
             "source_sha256": part.source_sha256,
@@ -541,7 +565,8 @@ class EvidenceScheduler:
     @staticmethod
     def _route_key(route: EvidenceRouteIdentity) -> str:
         model_digest = hashlib.sha256(route.model_id.encode("utf-8")).hexdigest()[:16]
-        return f"{route.provider}:{route.model_route}:{model_digest}"
+        profile_digest = route.profile_fingerprint[:16]
+        return f"{route.provider}:{route.model_route}:{model_digest}:{profile_digest}"
 
     def _must_pause(self, run_id: str, deadline: float) -> bool:
         return self._controls.is_stop_requested(run_id) or self._monotonic_clock() >= deadline

@@ -379,7 +379,7 @@ def test_kernel_composes_real_evidence_subgraph_without_legacy_build(
                 approved_bytes=20,
             )
 
-        def prepare_analysis(self, candidate):
+        def prepare_analysis(self, candidate, run_id=None):
             calls.append("prepare")
             return self.inspect(candidate)
 
@@ -401,6 +401,7 @@ def test_kernel_composes_real_evidence_subgraph_without_legacy_build(
             revision,
             outcome,
             *,
+            run_id,
             response_language=None,
         ):
             calls.append("publish")

@@ -9,9 +9,10 @@ from hashlib import sha256
 import json
 import re
 from threading import RLock
+import time
 from typing import Callable, ContextManager, Literal, Protocol
 
-from pydantic import ConfigDict, Field, ValidationError, field_validator
+from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from exam_predictor.evidence.artifacts import EvidenceArtifactStore
 from exam_predictor.evidence.models import (
@@ -60,8 +61,13 @@ class EvidenceValidationError(ValueError):
         super().__init__(_SAFE_VALIDATION_MESSAGES[code])
 
 
+class EvidenceSynthesisDeadlineExceeded(RuntimeError):
+    """No new synthesis request may start inside the final ten seconds."""
+
+
 class EvidenceRepairRequest(EvidenceFrozenModel):
     source_part_id: str
+    locator: str = Field(min_length=1, max_length=512)
     raw_output: str = Field(repr=False, exclude=True)
     errors: tuple[str, ...]
     deadline_seconds: float = Field(ge=10.0, le=300.0)
@@ -150,6 +156,19 @@ class EvidenceValidator:
         self._policy = policy
 
     def __call__(self, result: EvidencePartResult, plan: SourcePartPlan) -> EvidenceUnit:
+        return self.validate(
+            result,
+            plan,
+            deadline_seconds=self._policy.provider_timeout_seconds,
+        )
+
+    def validate(
+        self,
+        result: EvidencePartResult,
+        plan: SourcePartPlan,
+        *,
+        deadline_seconds: float,
+    ) -> EvidenceUnit:
         raw_output = result.raw_output
         issues: tuple[str, ...]
         try:
@@ -161,13 +180,19 @@ class EvidenceValidator:
 
         if self._repairer is None or self._policy.max_repair_attempts == 0:
             raise EvidenceValidationError("evidence_invalid", issues=issues) from None
+        if deadline_seconds < 10.0:
+            raise EvidenceValidationError("evidence_repair_failed") from None
         try:
             repaired = self._repairer.repair_evidence(
                 EvidenceRepairRequest(
                     source_part_id=plan.part_id,
+                    locator=plan.locator,
                     raw_output=raw_output,
                     errors=issues,
-                    deadline_seconds=self._policy.provider_timeout_seconds,
+                    deadline_seconds=min(
+                        self._policy.provider_timeout_seconds,
+                        deadline_seconds,
+                    ),
                 )
             )
         except Exception:
@@ -276,6 +301,13 @@ class ApprovedCoverageEntry(EvidenceFrozenModel):
     entry_id: str
     relative_path: str
     approved_bytes: int = Field(ge=0)
+    included: bool = True
+
+    @model_validator(mode="after")
+    def validate_inclusion(self) -> ApprovedCoverageEntry:
+        if not self.included and self.approved_bytes != 0:
+            raise ValueError("excluded manifest entries cannot have approved bytes")
+        return self
 
 
 CoverageSource = Callable[[str, str], tuple[ApprovedCoverageEntry, ...]]
@@ -294,6 +326,7 @@ class StudyMapBuilder:
         coverage_source: CoverageSource,
         policy: EvidencePolicy = EvidencePolicy(),
         now: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
         batch_size: int = _DEFAULT_SYNTHESIS_BATCH_SIZE,
     ) -> None:
         if not 1 <= batch_size <= 32:
@@ -303,6 +336,7 @@ class StudyMapBuilder:
         self._synthesizer = synthesizer
         self._policy = policy
         self._now = now or (lambda: datetime.now(UTC))
+        self._monotonic_clock = monotonic_clock or time.monotonic
         self._batch_size = batch_size
         self._coverage_source = coverage_source
         self._artifact_lock = RLock()
@@ -315,6 +349,7 @@ class StudyMapBuilder:
         publication_guard: PublicationGuard | None = None,
         synthesis_guard: PublicationGuard | None = None,
         response_language: str | None = None,
+        deadline: float | None = None,
     ) -> StudyMapSnapshot | None:
         if not self._store.is_current_revision(workspace_id, revision_id):
             return None
@@ -345,6 +380,7 @@ class StudyMapBuilder:
             publication_guard=publication_guard,
             synthesis_guard=synthesis_guard,
             response_language=response_language,
+            deadline=deadline,
         )
 
     def publish_complete(
@@ -355,6 +391,7 @@ class StudyMapBuilder:
         publication_guard: PublicationGuard | None = None,
         synthesis_guard: PublicationGuard | None = None,
         response_language: str | None = None,
+        deadline: float | None = None,
     ) -> StudyMapSnapshot | None:
         if not self._store.is_current_revision(workspace_id, revision_id):
             return None
@@ -369,12 +406,15 @@ class StudyMapBuilder:
         self._require_one_unit_per_processed_part(parts, units)
         coverage = self._coverage(workspace_id, revision_id, parts)
         if any(
-            item.planned_part_count == 0
-            or item.pending_part_count > 0
-            or item.retrying_part_count > 0
-            or item.invalidated_part_count > 0
-            or item.processed_part_count + item.failed_part_count
-            != item.planned_part_count
+            not item.excluded
+            and (
+                item.planned_part_count == 0
+                or item.pending_part_count > 0
+                or item.retrying_part_count > 0
+                or item.invalidated_part_count > 0
+                or item.processed_part_count + item.failed_part_count
+                != item.planned_part_count
+            )
             for item in coverage.items
         ):
             return None
@@ -405,6 +445,7 @@ class StudyMapBuilder:
             publication_guard=publication_guard,
             synthesis_guard=synthesis_guard,
             response_language=response_language,
+            deadline=deadline,
         )
 
     def answer_context(
@@ -424,7 +465,10 @@ class StudyMapBuilder:
         snapshot, all_units = context
         units = all_units[:max_units]
         limitations = list(snapshot.limitations)
-        if snapshot.coverage is not None and snapshot.coverage.covered_count < snapshot.coverage.total_count:
+        if (
+            snapshot.coverage is not None
+            and snapshot.coverage.covered_count < snapshot.coverage.included_count
+        ):
             limitations.append(
                 "The current map does not contain validated evidence for every planned source part."
             )
@@ -514,6 +558,7 @@ class StudyMapBuilder:
         publication_guard: PublicationGuard | None,
         synthesis_guard: PublicationGuard | None,
         response_language: str | None,
+        deadline: float | None,
     ) -> StudyMapSnapshot:
         with self._publication_context(synthesis_guard):
             payload = self._synthesize(
@@ -522,6 +567,7 @@ class StudyMapBuilder:
                 status,
                 units,
                 response_language=response_language,
+                deadline=deadline,
             )
         coverage = _mark_snapshot_influence(coverage, parts, units, payload)
         created_at = self._now()
@@ -646,6 +692,7 @@ class StudyMapBuilder:
         units: tuple[EvidenceUnit, ...],
         *,
         response_language: str | None,
+        deadline: float | None,
     ) -> _SynthesisPayload:
         if not units:
             return _SynthesisPayload(
@@ -669,7 +716,7 @@ class StudyMapBuilder:
                     status=status,
                     evidence=batches[0],
                     response_language=response_language,
-                    deadline_seconds=self._policy.provider_timeout_seconds,
+                    deadline_seconds=self._synthesis_deadline_seconds(deadline),
                 )
             )
             return _parse_synthesis(output, allowed)
@@ -683,7 +730,7 @@ class StudyMapBuilder:
                     status=status,
                     evidence=batch,
                     response_language=response_language,
-                    deadline_seconds=self._policy.provider_timeout_seconds,
+                    deadline_seconds=self._synthesis_deadline_seconds(deadline),
                 )
             )
             payload = _parse_synthesis(
@@ -706,10 +753,18 @@ class StudyMapBuilder:
                 evidence=(),
                 drafts=drafts,
                 response_language=response_language,
-                deadline_seconds=self._policy.provider_timeout_seconds,
+                deadline_seconds=self._synthesis_deadline_seconds(deadline),
             )
         )
         return _parse_synthesis(final, allowed)
+
+    def _synthesis_deadline_seconds(self, deadline: float | None) -> float:
+        if deadline is None:
+            return self._policy.provider_timeout_seconds
+        remaining = deadline - self._monotonic_clock()
+        if remaining < 10.0:
+            raise EvidenceSynthesisDeadlineExceeded
+        return min(self._policy.provider_timeout_seconds, remaining)
 
     def _call_synthesizer(self, request: StudyMapSynthesisRequest) -> str:
         try:
@@ -833,12 +888,26 @@ def _part_coverage(
     known_entries = {entry.entry_id for entry in entries}
     if any(part.entry_id not in known_entries for part in parts):
         raise EvidenceValidationError("study_map_invalid")
+    excluded_entries = {entry.entry_id for entry in entries if not entry.included}
+    if any(part.entry_id in excluded_entries for part in parts):
+        raise EvidenceValidationError("study_map_invalid")
     parts_by_entry = {
         entry.entry_id: tuple(part for part in parts if part.entry_id == entry.entry_id)
         for entry in entries
     }
     items: list[CoverageItem] = []
     for entry in entries:
+        if not entry.included:
+            items.append(
+                CoverageItem(
+                    topic=entry.relative_path,
+                    covered=False,
+                    excluded=True,
+                    entry_id=entry.entry_id,
+                    relative_path=entry.relative_path,
+                )
+            )
+            continue
         entry_parts = parts_by_entry[entry.entry_id]
         processed = tuple(
             part for part in entry_parts if part.state is PartState.PROCESSED
@@ -928,6 +997,7 @@ def _part_coverage(
         items=item_tuple,
         covered_count=sum(item.covered for item in item_tuple),
         total_count=len(item_tuple),
+        excluded_count=sum(item.excluded for item in item_tuple),
         approved_bytes=sum(item.approved_bytes for item in item_tuple),
         part_total_count=sum(item.planned_part_count for item in item_tuple),
         part_processed_count=sum(item.processed_part_count for item in item_tuple),

@@ -11,6 +11,7 @@ import pytest
 
 from exam_predictor.evidence.artifacts import ArtifactBoundaryError, EvidenceArtifactStore
 from exam_predictor.evidence.models import PartState, SnapshotStatus, SourcePartPlan
+from exam_predictor.evidence.policy import EvidencePolicy
 from exam_predictor.evidence.providers import EvidencePartResult
 from exam_predictor.evidence.store import EvidenceStore
 from exam_predictor.evidence.study_map import (
@@ -206,11 +207,27 @@ def test_validator_repairs_once_with_only_safe_schema_issues():
     assert unit.citations[0].locator == plan.locator
     assert len(repairer.calls) == 1
     repair = repairer.calls[0]
+    assert repair.locator == plan.locator
     assert repair.raw_output == '{"locator": 3}'
     assert repair.errors
     assert repair.deadline_seconds == 90.0
     assert all("input" not in issue.casefold() for issue in repair.errors)
     assert "raw_output" not in repr(repair)
+
+
+def test_validator_does_not_start_repair_inside_final_deadline_window():
+    plan = _plan("repair-deadline", priority=0)
+    repairer = _Repairer(_raw_evidence(plan.locator))
+
+    with pytest.raises(EvidenceValidationError) as caught:
+        EvidenceValidator(repairer=repairer).validate(
+            _result(plan, '{"locator": 3}'),
+            plan,
+            deadline_seconds=9.9,
+        )
+
+    assert caught.value.code == "evidence_repair_failed"
+    assert repairer.calls == []
 
 
 def test_validator_rejects_unknown_locator_after_the_single_repair():
@@ -521,6 +538,57 @@ def test_large_evidence_sets_use_bounded_batches_before_final_synthesis(tmp_path
     assert set(snapshot.evidence_unit_ids) == {
         unit.evidence_unit_id for unit in units
     }
+
+
+def test_hierarchical_synthesis_recomputes_remaining_run_deadline_per_call(
+    tmp_path: Path,
+):
+    plans = tuple(_plan(f"deadline-{index}", priority=index) for index in range(5))
+    store, artifacts = _seed(tmp_path, plans)
+    tuple(_publish_unit(store, plan) for plan in plans)
+
+    class Clock:
+        value = 0.0
+
+        def monotonic(self) -> float:
+            return self.value
+
+    clock = Clock()
+
+    class AdvancingSynthesizer(_Synthesizer):
+        def synthesize_study_map(self, request: StudyMapSynthesisRequest) -> str:
+            result = super().synthesize_study_map(request)
+            clock.value += 5.0
+            return result
+
+    synthesizer = AdvancingSynthesizer()
+    builder = StudyMapBuilder(
+        store,
+        artifacts,
+        synthesizer,
+        coverage_source=_coverage_source(plans),
+        policy=EvidencePolicy(synthesis_concurrency=1),
+        now=lambda: NOW,
+        monotonic_clock=clock.monotonic,
+        batch_size=2,
+    )
+    try:
+        snapshot = builder.publish_complete(
+            WORKSPACE_ID,
+            REVISION_ID,
+            deadline=25.0,
+        )
+    finally:
+        artifacts.close()
+        store.close()
+
+    assert snapshot is not None
+    assert [call.deadline_seconds for call in synthesizer.calls] == [
+        25.0,
+        20.0,
+        15.0,
+        10.0,
+    ]
 
 
 def test_builder_uses_only_the_latest_evidence_version_for_each_part(tmp_path: Path):

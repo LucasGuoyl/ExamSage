@@ -1664,7 +1664,7 @@ def test_coordinator_injects_evidence_service_into_the_real_kernel_graph(
                 approved_bytes=10,
             )
 
-        def prepare_analysis(self, candidate):
+        def prepare_analysis(self, candidate, run_id=None):
             service_calls.append("prepare")
             return self.inspect(candidate)
 
@@ -1689,6 +1689,7 @@ def test_coordinator_injects_evidence_service_into_the_real_kernel_graph(
             revision,
             outcome,
             *,
+            run_id,
             response_language=None,
         ):
             service_calls.append("publish")

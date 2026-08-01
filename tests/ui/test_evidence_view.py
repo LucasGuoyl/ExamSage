@@ -37,6 +37,7 @@ def coverage_item(
     invalidated: int = 0,
     next_action: str = "none",
     failure_codes: tuple[str, ...] = (),
+    excluded: bool = False,
 ) -> CoverageItem:
     total = processed + running + pending + retrying + failed + invalidated
     return CoverageItem(
@@ -44,7 +45,8 @@ def coverage_item(
         covered=bool(total and processed == total),
         entry_id=f"entry-{path}",
         relative_path=path,
-        approved_bytes=100,
+        approved_bytes=0 if excluded else 100,
+        excluded=excluded,
         planned_part_count=total,
         processed_part_count=processed,
         running_part_count=running,
@@ -64,6 +66,7 @@ def coverage(*items: CoverageItem) -> CoverageSummary:
         items=items,
         covered_count=sum(item.covered for item in items),
         total_count=len(items),
+        excluded_count=sum(item.excluded for item in items),
         approved_bytes=sum(item.approved_bytes for item in items),
         part_total_count=sum(item.planned_part_count for item in items),
         part_processed_count=sum(item.processed_part_count for item in items),
@@ -174,6 +177,19 @@ def test_view_model_uses_complete_server_coverage_and_exposes_source_locators():
     assert model.failed_sources == (
         ("week-3/tutorial.docx", ("converter_failed",)),
     )
+
+
+def test_view_model_keeps_excluded_manifest_sources_visible():
+    summary = coverage(
+        coverage_item("exam.pdf", processed=1),
+        coverage_item("optional.zip", excluded=True),
+    )
+
+    model = build_evidence_view_model(summary, None)
+
+    assert model.source_count == 1
+    assert model.excluded_source_count == 1
+    assert model.items[1].excluded is True
 
 
 def test_initial_map_keeps_tree_evidence_dependencies_and_limitations_visible():

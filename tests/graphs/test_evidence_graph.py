@@ -42,7 +42,11 @@ class StagedEvidenceService:
         self.calls.append(("inspect", workspace_id))
         return self._inspection(workspace_id)
 
-    def prepare_analysis(self, workspace_id: str) -> EvidenceInspection:
+    def prepare_analysis(
+        self,
+        workspace_id: str,
+        run_id: str | None = None,
+    ) -> EvidenceInspection:
         self.calls.append(("prepare", workspace_id))
         return self._inspection(workspace_id)
 
@@ -74,6 +78,7 @@ class StagedEvidenceService:
         revision_id: str,
         outcome: SchedulerOutcome,
         *,
+        run_id: str,
         response_language: str | None = None,
     ) -> EvidenceRunResult:
         self.calls.append(
@@ -177,6 +182,56 @@ def test_evidence_graph_runs_one_frontier_at_a_time_and_publishes_to_completion(
         "progress",
         "tool_completed",
     ]
+
+
+def test_expired_run_finishes_paused_without_offering_same_run_resume(
+    tmp_path: Path,
+):
+    class DeadlineService(StagedEvidenceService):
+        def analyze_frontier(self, workspace_id, revision_id, run_id):
+            outcome = SchedulerOutcome(
+                status=SchedulerStatus.COMPLETE,
+                processed_part_ids=("part-deadline",),
+                pending_count=0,
+            )
+            self.calls.append(("analyze", workspace_id, revision_id, run_id, 0))
+            return EvidenceFrontierResult(
+                workspace_id=workspace_id,
+                revision_id=revision_id,
+                outcome=outcome,
+            )
+
+        def publish_frontier(
+            self,
+            workspace_id,
+            revision_id,
+            outcome,
+            *,
+            run_id,
+            response_language=None,
+        ):
+            self.calls.append(
+                ("publish", workspace_id, revision_id, 0, response_language)
+            )
+            return EvidenceRunResult(
+                workspace_id=workspace_id,
+                revision_id=revision_id,
+                status="paused",
+                outcome=outcome,
+                safe_error_code="provider_timeout",
+            )
+
+    service = DeadlineService(RunControlRegistry())
+    config = {"configurable": {"thread_id": f"workspace:{WORKSPACE_ID}"}}
+    with SqliteSaver.from_conn_string(str(tmp_path / "deadline.sqlite3")) as saver:
+        graph = build_evidence_graph(_dependencies(service, []), saver)
+        result = graph.invoke(_initial_state("run-expired-deadline"), config)
+
+    assert "__interrupt__" not in result
+    assert result["tool_result"]["metadata"]["status"] == "paused"
+    assert result["tool_result"]["metadata"]["safe_error_code"] == "provider_timeout"
+    assert "new analysis run" in result["tool_result"]["content"]
+    assert [call[0] for call in service.calls] == ["prepare", "analyze", "publish"]
 
 
 def test_stop_after_validated_frontier_interrupts_before_snapshot_publication(
@@ -291,7 +346,11 @@ def test_empty_approved_source_selection_terminates_before_any_frontier(
     controls = RunControlRegistry()
 
     class EmptyService(StagedEvidenceService):
-        def prepare_analysis(self, workspace_id: str) -> EvidenceInspection:
+        def prepare_analysis(
+            self,
+            workspace_id: str,
+            run_id: str | None = None,
+        ) -> EvidenceInspection:
             self.calls.append(("prepare", workspace_id))
             return EvidenceInspection(
                 workspace_id=workspace_id,
@@ -326,7 +385,11 @@ def test_changed_source_after_analysis_resumes_from_current_revision(
             self.current_revision = REVISION_ID
             self.change_once = True
 
-        def prepare_analysis(self, workspace_id: str) -> EvidenceInspection:
+        def prepare_analysis(
+            self,
+            workspace_id: str,
+            run_id: str | None = None,
+        ) -> EvidenceInspection:
             self.calls.append(("prepare", workspace_id, self.current_revision))
             return EvidenceInspection(
                 workspace_id=workspace_id,
@@ -360,6 +423,7 @@ def test_changed_source_after_analysis_resumes_from_current_revision(
             revision_id: str,
             outcome: SchedulerOutcome,
             *,
+            run_id: str,
             response_language: str | None = None,
         ) -> EvidenceRunResult:
             self.calls.append(("publish", workspace_id, revision_id))

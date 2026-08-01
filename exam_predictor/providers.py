@@ -206,6 +206,15 @@ class BaseProvider:
     def create_chat_completion(self, **kwargs):
         raise NotImplementedError
 
+    def create_chat_completion_once(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        **kwargs,
+    ):
+        """Make one SDK chat attempt with an optional per-request deadline."""
+        raise NotImplementedError
+
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         raise NotImplementedError
 
@@ -247,6 +256,14 @@ class OpenAIProvider(BaseProvider):
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=12))
     def create_chat_completion(self, **kwargs):
+        return self.create_chat_completion_once(**kwargs)
+
+    def create_chat_completion_once(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        **kwargs,
+    ):
         message_chars = sum(len(_json_text(item.get("content", ""))) for item in kwargs.get("messages", []))
         input_guess = max(1, message_chars // 4)
         output_guess = int(kwargs.get("max_completion_tokens", kwargs.get("max_tokens", 2048)) or 2048)
@@ -254,17 +271,15 @@ class OpenAIProvider(BaseProvider):
             "language-model request",
             max(0.02, self._estimate_text_cost(input_guess, output_guess, kwargs.get("model"))),
         )
-        # Newer reasoning models use max_completion_tokens. Keep compatibility
-        # with custom/older endpoints by retrying the original name if needed.
+        # Newer reasoning models use max_completion_tokens and reject sampling.
         request = dict(kwargs)
+        if timeout_seconds is not None:
+            request["timeout"] = timeout_seconds
         if "max_tokens" in request and str(request.get("model", "")).startswith("gpt-5"):
             request["max_completion_tokens"] = request.pop("max_tokens")
             # GPT-5 reasoning modes do not accept sampling temperature.
             request.pop("temperature", None)
-        try:
-            response = self.client.chat.completions.create(**request)
-        except TypeError:
-            response = self.client.chat.completions.create(**kwargs)
+        response = self.client.chat.completions.create(**request)
         input_tokens, output_tokens = _usage_values(_attr(response, "usage"))
         self.ledger.record(
             "language-model request",
@@ -438,6 +453,14 @@ class GeminiProvider(BaseProvider):
         reraise=True,
     )
     def create_chat_completion(self, **kwargs):
+        return self.create_chat_completion_once(**kwargs)
+
+    def create_chat_completion_once(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        **kwargs,
+    ):
         message_chars = sum(len(_json_text(item.get("content", ""))) for item in kwargs.get("messages", []))
         input_guess = max(1, message_chars // 4)
         output_guess = int(kwargs.get("max_completion_tokens", kwargs.get("max_tokens", 2048)) or 2048)
@@ -454,6 +477,11 @@ class GeminiProvider(BaseProvider):
         token_limit = kwargs.get("max_completion_tokens", kwargs.get("max_tokens"))
         if token_limit:
             config_kwargs["max_output_tokens"] = token_limit
+        if timeout_seconds is not None:
+            config_kwargs["http_options"] = self._genai.types.HttpOptions(
+                timeout=max(1, int(timeout_seconds * 1000)),
+                retry_options=self._genai.types.HttpRetryOptions(attempts=1),
+            )
         config = self._genai.types.GenerateContentConfig(**config_kwargs)
         response = self.client.models.generate_content(
             model=kwargs.get("model") or self.models.balanced,

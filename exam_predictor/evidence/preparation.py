@@ -943,6 +943,7 @@ class SourcePartPreparer:
                     entry_id=request.entry_id,
                     source_identity_sha256=hashlib.sha256(request.relative_path.encode("utf-8")).hexdigest(),
                     policy_version=self._policy.policy_version,
+                    schema_version=self._policy.schema_version,
                     source_sha256=request.source_sha256,
                     part_sha256=part.sha256,
                     locator=part.locator,
@@ -958,11 +959,14 @@ class SourcePartPreparer:
                     source_sha256=request.source_sha256,
                     part_sha256=part.sha256,
                     ordinal=part.ordinal,
+                    scheduling_rank=part.ordinal,
                     locator=part.locator,
                     media_type=part.media_type,
                     size_bytes=part.size_bytes,
                     scheduling_class=scheduling_class,
                     priority=priority,
+                    preparation_policy_version=self._policy.policy_version,
+                    preparation_schema_version=self._policy.schema_version,
                     state=PartState.PREPARED,
                     idempotency_key=f"prepare_{identity}",
                 )
@@ -1005,7 +1009,10 @@ class SourcePartPreparer:
                         break
                     plans.append(candidate_plan)
             if failure is None:
-                result = tuple(plans[index] for index in representative_ordinals(len(plans)))
+                result = tuple(
+                    plans[index].model_copy(update={"scheduling_rank": rank})
+                    for rank, index in enumerate(representative_ordinals(len(plans)))
+                )
         except SourcePreparationError as error:
             failure = SourcePreparationError(error.code, error.locator)
         except Exception:
@@ -1430,6 +1437,7 @@ def _part_identity(
     entry_id: str,
     source_identity_sha256: str,
     policy_version: str,
+    schema_version: str,
     source_sha256: str,
     part_sha256: str,
     locator: str,
@@ -1442,6 +1450,7 @@ def _part_identity(
             "media_type": media_type,
             "part_sha256": part_sha256,
             "policy_version": policy_version,
+            "schema_version": schema_version,
             "revision_id": revision_id,
             "source_identity_sha256": source_identity_sha256,
             "source_sha256": source_sha256,

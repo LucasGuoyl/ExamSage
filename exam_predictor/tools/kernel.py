@@ -87,6 +87,7 @@ class KernelPlanner:
             ],
             temperature=0.0,
             max_tokens=500,
+            store=False,
         )
         raw = _content(response)
         start, end = raw.find("{"), raw.rfind("}")
@@ -183,6 +184,7 @@ class KernelToolRegistry:
             ],
             temperature=0.25,
             max_tokens=2000,
+            store=False,
         )
         return ToolResult(tool=tool, content=_content(response))
 

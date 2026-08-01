@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from datetime import UTC, datetime
 import hashlib
 from io import BytesIO
 from pathlib import Path
@@ -266,6 +267,26 @@ def test_long_pdf_plans_begin_middle_end_before_remaining_pages(artifact_store):
     assert [part.ordinal for part in parts[:3]] == [0, 7, 14]
     assert sorted(part.ordinal for part in parts) == list(range(15))
     assert all(part.size_bytes <= 10 * 1024 * 1024 for part in parts)
+
+
+def test_long_pdf_representative_order_survives_store_claiming(
+    artifact_store,
+    tmp_path,
+):
+    parts = _prepare_pdf(artifact_store, _pdf_bytes(pages=357))
+    store = EvidenceStore(tmp_path / "representative.sqlite3")
+    try:
+        store.upsert_part_plans(parts)
+        claimed = store.claim_parts(
+            WORKSPACE_ID,
+            REVISION_ID,
+            limit=3,
+            now=datetime(2026, 7, 27, tzinfo=UTC),
+        )
+    finally:
+        store.close()
+
+    assert [part.ordinal for part in claimed] == [0, 7, 14]
 
 
 def test_each_part_has_stable_hash_locator_and_idempotency_key(artifact_store):

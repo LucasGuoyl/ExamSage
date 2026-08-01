@@ -598,7 +598,18 @@ async def test_progressive_multimodal_evidence_survives_full_lifecycle(
             coverage = CoverageSummary.model_validate(coverage_response.json())
             snapshot = snapshot_response.json()
             assert snapshot["status"] == SnapshotStatus.COMPLETE.value
-            assert coverage.covered_count == coverage.total_count == 6
+            assert coverage.covered_count == 6
+            assert coverage.total_count > coverage.covered_count
+            assert coverage.excluded_count == coverage.total_count - 6
+            excluded_item = next(
+                item
+                for item in coverage.items
+                if item.relative_path == "safe-preview.zip"
+            )
+            assert excluded_item.excluded is True
+            assert excluded_item.planned_part_count == 0
+            assert excluded_item.approved_bytes == 0
+            assert excluded_item.influenced_current_snapshot is False
             assert coverage.part_processed_count == coverage.part_total_count
             assert coverage.part_processed_count >= 11
             assert {item["node_id"] for item in snapshot["nodes"]} == {
@@ -617,6 +628,7 @@ async def test_progressive_multimodal_evidence_survives_full_lifecycle(
             )
             assert ui_projection.phase is EvidencePhase.COMPLETE
             assert ui_projection.covered_source_count == 6
+            assert ui_projection.excluded_source_count == coverage.excluded_count
             assert ui_projection.processed_part_count == coverage.part_total_count
 
             run_events_response = await client.get(

@@ -1,254 +1,154 @@
-# ExamSage
+# ExamSage（押题宝）
 
-**A local, privacy-conscious agent that turns university course materials into a chapter map, evidence-aware exam focus ranking, adaptive practice bank, worked solutions, and an ongoing tutor.**
+**A local, privacy-conscious study Agent that turns approved university course material into a cited, progressively built study map.**
 
-ExamSage is designed for undergraduate courses across mathematics, physics, chemistry, biology, engineering, humanities, business, law, languages, and interdisciplinary subjects. It supports multilingual course material and global academic sources.
+Current release: **0.6.0** — multimodal evidence-engine alpha.
 
-> ExamSage predicts **revision priorities**, not actual exam questions. A ranking is uncertain evidence—not a promise that a topic will appear.
+> ExamSage predicts revision priorities, not future exam questions. Its rankings and generated answers are uncertain study aids and require human verification.
 
-## What makes it useful
+## What 0.6.0 delivers
 
-- Drop in PDFs, slides, Word documents, spreadsheets, scans, handwriting, images, Markdown, HTML, JSON, webpages, or a ZIP.
-- Describe the exam and your goal in normal language.
-- Review a cost estimate and approve a hard spending limit before any AI task starts.
-- Receive a hierarchical chapter tree, knowledge summaries, prerequisites, focus scores, confidence labels, and supporting evidence.
-- Get **6–24 questions per knowledge point**, adjusted by importance and similar past-question density.
-- Every generated question includes a worked answer, suggested total marks, and marks for each step or knowledge point.
-- When the uploaded evidence is sparse, ExamSage uses the selected provider's native web search and shows citations.
-- Continue asking questions in the same course conversation until the explanation is satisfactory.
-- Export the result as PDF, Markdown, or structured JSON.
+- A runtime-switchable English or Simplified-Chinese interface. Generated academic content follows the language of the current user message unless that message explicitly requests another output language.
+- A native folder picker, with a browser-directory snapshot fallback, followed by an exact visible manifest and explicit approval.
+- OpenAI or Google Gemini using **one provider API key**; no second credential is needed for multimodal analysis.
+- Local preparation of text, structured data, modern Office files, images, PDFs, and safe ZIP members, followed by bounded provider analysis of approved parts only.
+- A cited **Initial study map** as soon as representative evidence is ready, while remaining sources stay visibly pending, processing, retrying, or failed.
+- A cited **Complete study map** only after every approved source part reaches a terminal processed or visible-failure state.
+- Exact source/part/byte coverage, durable activity events, cooperative Stop, explicit Resume, bounded retries, and reuse of durably published validated source-part results after restart.
+- Content-addressed evidence caching and dependency-aware invalidation when an approved source changes.
 
-## Start in three steps
+This is Subproject 3 of the wider product roadmap. Request-specific web research, adaptive practice generation, worked solutions and rubrics, the final three-pane UI, packaging, and removal of the fixed legacy pipeline remain later work. Existing legacy reports remain readable.
 
-### Windows
+## Agent launch with one provider API key
 
-1. Install [Python 3.11 or 3.12](https://www.python.org/downloads/).
-2. Download or clone this repository.
-3. Double-click `launch_windows.bat`.
+Install Python 3.11 or 3.12, download this repository, then run the Agent route:
 
-### macOS
+### Windows PowerShell
 
-1. Install [Python 3.11 or 3.12](https://www.python.org/downloads/).
-2. Download or clone this repository.
-3. Control-click `launch_macos.command`, choose **Open**, and accept the first-run warning.
-
-The launcher creates an isolated environment, installs dependencies, and opens `localhost` in the browser. In the page, choose OpenAI or Google Gemini and enter **one API key**. The legacy build flow keeps the key in the browser session. In the optional Agent route, the authenticated local Worker saves it through the operating-system credential vault when that vault is available; it never writes a plaintext fallback.
-
-Manual launch:
-
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS: source .venv/bin/activate
-python -m pip install -r requirements.txt
-streamlit run app.py
+```powershell
+$env:EXAMSAGE_AGENT_V2 = "1"
+.\launch_windows.bat
 ```
 
-## Provider choice
+### macOS Terminal
 
-| Choice | One key | Files & images | Embeddings | Native web search | Status |
-|---|:---:|:---:|:---:|:---:|---|
-| OpenAI | Yes | Yes | Yes | Yes | First-class |
-| Google Gemini | Yes | Yes | Yes | Yes | First-class |
-| OpenAI-compatible URL | Yes | Provider-dependent | Usually | Provider-dependent | Experimental |
+```bash
+EXAMSAGE_AGENT_V2=1 ./launch_macos.command
+```
 
-ExamSage automatically routes bulk extraction to a cost-sensitive model, ordinary synthesis to a balanced model, and difficult reasoning/review to a stronger model—all under the selected provider and key. Advanced users can override model IDs in the UI.
+The launcher creates `.venv`, installs the pinned application dependencies, starts an authenticated Worker bound to `127.0.0.1`, and opens the local Streamlit interface. Choose OpenAI or Google Gemini and connect one key. The Agent Worker stores the key through Windows Credential Manager or macOS Keychain; if the OS vault is unavailable, connection fails without a plaintext fallback.
 
-This is how someone can avoid OpenAI pricing without making setup complicated: select **Google Gemini**, paste a Gemini key, and keep the rest of the workflow unchanged. Additional first-class providers should only be added when they can cover chat, multimodal files, embeddings, grounded search, citations, and privacy controls with one credential.
+The standard launch scripts without `EXAMSAGE_AGENT_V2=1` still open the compatibility route during this staged migration. That route is not the recommended evidence-engine evaluation path.
 
-## What “OCR” means
-
-OCR stands for **Optical Character Recognition**. A normal PDF often already contains selectable text; a scan or phone photo contains only pixels. OCR turns those pixels—printed words, labels, and sometimes handwriting—into text the agent can search and reason over.
-
-ExamSage does not install a local OCR or AI model. It sends the image or scanned page directly from the user's device to the chosen multimodal provider. The provider reads the text and also explains diagrams, formulas, tables, and charts. For `.docx`, `.pptx`, and `.xlsx`, ExamSage additionally extracts embedded images and submits them because some provider document parsers otherwise see only the text layer.
-
-## The agent workflow
+## Evidence flow
 
 ```mermaid
 flowchart LR
-    A["Upload + natural-language goal"] --> B["Local safety validation"]
-    B --> C["Selected provider: OCR + document understanding"]
-    C --> D["Local normalized course workspace"]
-    D --> E["Cloud embeddings + evidence alignment"]
-    E --> F["Focus ranking + confidence"]
-    F --> G{"Evidence sparse?"}
-    G -- Yes --> H["Provider-native web search + citations"]
-    G -- No --> I["Course report"]
-    H --> I
-    I --> J["Chapter tree + 6–24 questions/topic + worked rubrics"]
-    J --> K["Persistent local tutor conversation"]
+    A["Select course folder"] --> B["Local safe scan"]
+    B --> C["Review and exclude sources"]
+    C --> D["Approve exact revision and hashes"]
+    D --> E["Revalidate one approved read"]
+    E --> F["Prepare bounded source parts"]
+    F --> G["Selected provider analyzes approved bytes"]
+    G --> H["Validated local evidence cache"]
+    H --> I["Initial cited study map"]
+    I --> J["Complete coverage or visible failures"]
+    J --> K["Complete cited study map"]
 ```
 
-In agent terminology:
+Before approval, course bytes are ineligible for provider transmission. Approval binds the current manifest revision, included entry IDs, and SHA-256 hashes. Immediately before each use, ExamSage rechecks root containment, file identity, metadata, and hash, then grants a short-lived, single-use read. Only the exact prepared part needed by the active evidence operation is sent.
 
-- The **model** is the reasoning engine supplied by OpenAI or Gemini.
-- **Tools** are actions the model can use, such as file vision, embeddings, or web search.
-- **Memory** is the local course report and chat history.
-- The **orchestrator** is the Python code that decides which tool runs next, enforces the budget, and labels evidence.
-- **Grounding** means tying claims to uploaded material or cited public sources instead of relying only on model memory.
+The local evidence cache is keyed by source hash, prepared-part identity, provider route, schema, prompt, and policy versions. Unchanged approved content can be reused. A changed or substituted source requires rescan and reapproval, invalidates only evidence and study-map dependencies derived from that source, and never silently reuses its old result.
 
-ExamSage is an agent because it follows a conditional multi-step workflow, uses tools, maintains course state, and can continue acting in response to student questions. It is not just a single prompt.
+## Progressive coverage, timeouts, and retries
 
-## Agent kernel and secure course workspace alpha
+The Initial study map contains citations only to evidence that has already completed. Its coverage banner reports what is included and what remains pending or failed; it is not presented as complete. The Complete study map uses all successfully processed approved evidence and still exposes any terminal source failure.
 
-The LangGraph Agent route remains disabled by default. Developers can enable it with
-`EXAMSAGE_AGENT_V2=1`; the standard launchers then start Streamlit and an authenticated local Worker
-bound only to `127.0.0.1`. The legacy build flow remains the default, and its cost estimate and build
-controls apply only to that legacy route.
+Default evidence limits are deliberately bounded:
 
-The Agent workspace uses a native folder picker first. A development fallback can upload a browser
-directory snapshot when native selection is unavailable. Scanning is deterministic and local. The UI
-shows every discovered item as `pending approval`, `approved`, `excluded`, `failed`, `changed`, or
-`removed`, together with a safe reason when action is required. The aggregate workspace limit is
-1 GiB (1,073,741,824 bytes).
+- multimodal concurrency: 2, configurable only within 1–4;
+- provider request timeout: 90 seconds;
+- whole evidence-tool deadline: 60 minutes;
+- first-map target: 180 seconds, not a guarantee;
+- at most 3 attempts per provider route and at most 1 structured-output repair;
+- provider `Retry-After` is respected within the remaining deadline;
+- PDF preparation uses 24-page parts by default and prepared parts are capped at 10 MiB by default.
 
-Before approval, no course source is eligible to cross the provider boundary. Approval binds the exact
-manifest revision and SHA-256 hashes of the included files. Excluding a supported file keeps it local.
-A rescan preserves unchanged approved entries, while new, changed, moved, removed, substituted, or
-link-like sources require review. The transmission gate revalidates path containment, file identity,
-metadata, and content immediately before issuing a short-lived, single-use read token.
+Stop is cooperative at durable graph boundaries. Closing the launcher asks the Worker to pause, but an abrupt exit may resume from the most recent completed checkpoint rather than the exact instant the window closed. Resume is always explicit.
 
-Approved files are sent to the configured provider only when a later user task invokes a provider tool
-that needs them. The secure-workspace subproject itself performs no cloud source analysis, OCR,
-embedding, grounded research, or report generation.
+Durably published validated source-part results are reused and are not sent again on Resume. An abrupt crash after a provider returns but before the result is atomically published can repeat that unpublished attempt; an unpublished planner or synthesis call can likewise be repeated. ExamSage therefore provides bounded, checkpointed at-least-once execution around that crash window, not an external exactly-once guarantee.
 
-In the Agent route, one provider key is stored through Windows Credential Manager or macOS Keychain via
-the operating-system vault abstraction. If secure storage is unavailable, ExamSage does not create a
-plaintext credential file; reconnect after the vault is restored. `Forget API key` disconnects that
-provider profile and deletes its vault credential while leaving course workspaces intact.
+## Supported course sources
 
-Deleting a native workspace removes ExamSage's manifest, approval, run, event, and checkpoint metadata;
-it never deletes or edits the selected native folder. Deleting a browser snapshot may remove only the
-identity-verified snapshot below ExamSage's own data directory. Incomplete owned cleanup remains visibly
-`cleanup pending` for retry rather than widening the deletion target.
+| Category | Formats | Preparation behavior |
+|---|---|---|
+| Documents | PDF, DOCX, PPTX | PDFs are split into bounded page groups; OOXML text and embedded media are extracted locally. |
+| Legacy Office | DOC, PPT, XLS | Requires an explicitly available LibreOffice converter behind the secure sandbox interface; otherwise the source fails visibly as converter unavailable. |
+| Data | XLSX, CSV, TSV, JSON, YAML | Bounded local parsing; modern Office parts and images remain separately traceable. |
+| Text/web files | MD, TXT, HTML | Local files only. Arbitrary URLs are not fetched by the workspace scanner. |
+| Images | PNG, JPEG, WebP, GIF, BMP, TIFF | Sent as bounded multimodal parts to the chosen provider after approval. |
+| Bundles | ZIP | Members are checked for containment, links, count, expanded size, and compression ratio before use. |
 
-The kernel also provides durable ordered activity events, a globally serialized message queue,
-cooperative Stop at safe graph boundaries, SQLite checkpoints, and explicit Resume. Startup restores
-saved provider sessions from the OS vault and recovers unfinished `running` or `stopping` metadata as
-`paused`; work never resumes implicitly. Launcher shutdown requests a safe pause, but Resume still
-continues from the latest durable graph boundary.
+The selected workspace is capped at 1 GiB. Symlinks, junctions, reparse points, executable/unsupported formats, unsafe archive members, and unprovable substitutions fail closed. Audio and video are not supported in this release.
 
-## Scoring and question allocation
+## Provider privacy and retention
 
-The relative focus score combines:
+ExamSage has no maintainer-operated backend or telemetry. The selected provider nevertheless receives the approved parts required by the active task, and that provider's retention, safety-monitoring, regional-processing, account, and billing rules apply. Agent-mode OpenAI requests explicitly use `store: false`; legacy or custom-endpoint behavior can differ. Gemini temporary uploads are deleted best-effort after analysis, but provider-side operational retention may still apply.
 
-- similarity to uploaded past questions;
-- explicit instructor emphasis;
-- tutorial/problem-set overlap;
-- syllabus verbs and weighting;
-- structural signals such as definitions, theorems, proofs, applications, and comparisons;
-- a provider-model pedagogical prior, weighted more heavily when past exams are scarce.
+Do not process material unless you are authorized to share it with the chosen provider. Read [PRIVACY.md](PRIVACY.md) and [SECURITY.md](SECURITY.md) before using confidential, regulated, copyrighted, embargoed, or third-party personal data.
 
-Confidence is reported separately. External university sources can clarify a topic and seed original practice variants, but **never count as proof of what the user's instructor will test**.
+## Local storage and deletion
 
-Practice allocation is deterministic after scoring:
+Application state defaults to `~/.examsage`; set `EXAMSAGE_DATA_DIR` to choose another local location.
 
-- every detected knowledge point receives at least 6 questions;
-- high-priority topics receive more;
-- topics with more similar past questions receive more;
-- the cap is 24 per knowledge point;
-- external variants are visibly labelled and preserve source links.
+- A native workspace never copies, edits, or deletes the selected source folder. Deleting it removes only ExamSage-owned manifests, approvals, evidence, prepared artifacts, runs, events, and checkpoints.
+- The browser fallback creates an ExamSage-owned snapshot. Deletion is limited to its recorded, identity-verified tree below the application data root.
+- Unverifiable or partial cleanup remains visible as `cleanup pending`; ExamSage does not widen the target.
+- Old compatibility-route upload copies are only counted and removed through the explicit cleanup control. Active, substituted, linked, unknown, or otherwise unverified entries are not removed.
+- `Forget API key` deletes the provider credential from the OS vault but does not delete course workspaces.
 
-## Privacy and safety model
+## Opt-in live benchmark
 
-ExamSage has no developer-operated backend. The browser UI runs on the user's own computer.
+Automated tests use synthetic course material, fake providers, injected clocks, and fake vaults. They prove deterministic behavior but are not live-provider or native-platform evidence.
 
-- Raw files travel directly to the selected provider over its official SDK.
-- No local AI model is downloaded or executed.
-- Deterministic local operations—validation, safe ZIP extraction, chunking, SQLite storage, and export—do not infer content.
-- Legacy-flow API keys stay in Streamlit session memory. Agent credentials use the OS vault only and are never written to SQLite, checkpoints, reports, manifests, logs, exceptions, HTTP responses, or backups.
-- OpenAI requests use `store: false` where the Responses API supports it.
-- Gemini uploads are deleted on a best-effort basis immediately after analysis.
-- ZIP traversal, symlinks, extreme compression ratios, unsupported executable content, private-network URLs, and common prompt-injection phrases are blocked or flagged.
-- There is no telemetry. Streamlit usage reporting is disabled.
-- Courses and conversations live under `~/.examsage` unless `EXAMSAGE_DATA_DIR` is set.
-- The UI can delete a local course. `backup_windows.bat` and `backup_macos.command` create a local ZIP that excludes transient intake files and keys.
+The **Opt-in live benchmark** must be launched from an already running Agent Worker, uses an explicitly connected provider profile and the declared CC0 synthetic fixture, refuses to run in CI, and never accepts a real/private course folder. It records safe machine/provider/model metadata, source and page counts, durable logical provider-operation receipts, retries visible to ExamSage, first activity, initial/final timing, exact coverage, and safe error codes. Provider SDK-internal transport retries and a billing estimate are not observable.
 
-The provider still receives uploaded content and applies its own retention, abuse-monitoring, regional, and account policies. Users must review those policies before sending confidential, regulated, copyrighted, or third-party personal data. See [PRIVACY.md](PRIVACY.md) and [SECURITY.md](SECURITY.md).
-
-## Supported inputs
-
-| Category | Formats |
-|---|---|
-| Documents | PDF, DOC/DOCX, PPT/PPTX |
-| Data | XLS/XLSX, CSV, TSV, JSON, YAML |
-| Local text/web files | MD, TXT, HTML |
-| Images | PNG, JPEG, WebP, GIF, BMP, TIFF; printed scans and handwriting |
-| Bundles | ZIP with safe extraction |
-| Deferred web research | HTTPS webpages through a later grounded-research provider tool |
-
-The secure workspace can catalog and hash the local file formats above, including local `.html` files,
-subject to the 1 GiB aggregate limit. HTTPS webpages are not workspace files; grounded web research is
-deferred to a later provider tool. This release does not yet connect workspace sources to cloud OCR,
-parsing, embeddings, grounded research, or report generation. Audio, video, executables, and other
-unsupported extensions remain excluded. Legacy builds retain their existing direct-upload analysis
-behavior and provider-specific request limits.
-
-## Workspace troubleshooting
-
-- **Folder moved, renamed, or replaced:** the stored canonical path or root identity no longer matches.
-  Choose the folder again to create a new workspace. ExamSage will not silently follow a replacement.
-- **Vault unavailable:** no plaintext fallback is created. Restore Windows Credential Manager or macOS
-  Keychain access, then reconnect the provider.
-- **Cleanup pending:** ExamSage could not prove or remove an owned browser snapshot safely. Keep the data
-  directory available and retry deletion; do not manually repoint the workspace record.
-- **Approval stale or source changed:** rescan, review every changed/new/removed item, adjust inclusion,
-  and approve the current revision again. Old revision IDs and hashes are never reused automatically.
-- **Native picker unavailable:** use the browser directory fallback in the Agent workspace panel. It
-  creates an ExamSage-owned snapshot; deleting that workspace does not affect the original directory.
-
-## Cost controls
-
-Before a build, ExamSage shows a broad USD range broken down into:
-
-1. file/image understanding;
-2. knowledge analysis and report construction;
-3. questions, worked answers, and rubrics;
-4. optional grounded web searches.
-
-The estimate is not an invoice. Visual page density, model output length, retries, regional taxes, provider free tiers, and price changes can affect the actual charge. A run stops before its conservative in-memory ledger would cross the approved ceiling. The provider console remains the source of truth.
-
-## Development
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest
-python -m ruff check exam_predictor tests scripts app.py
-python -m compileall -q exam_predictor scripts app.py
+```powershell
+.\.venv\Scripts\python.exe scripts\benchmark_initial_map.py `
+  --live `
+  --provider-profile <saved-profile-id> `
+  --fixture <generated-cc0-reference-course> `
+  --output <new-report.json>
 ```
 
-The automated Agent-kernel and secure-workspace acceptance tests use fake providers and an in-memory
-fake vault at the external boundaries. They do not use a real API key, contact a provider, open a native
-picker or browser, access a real keyring, or launch application child processes. Live platform evidence
-is tracked separately under `docs/manual-tests/`.
+Output is created exclusively and will not overwrite an existing report. The benchmark excludes ZIP duplicates from the approved benchmark corpus. It does not print keys, absolute source paths, signed URLs, or source contents. Current live and platform results are listed in [the 0.6.0 manual checkpoints](docs/manual-tests/2026-07-27-multimodal-evidence-checkpoints.md).
 
-Key modules:
+## Known limitations
 
-```text
-exam_predictor/
-├── agent.py            # end-to-end decisions, web fallback, tree, tutor
-├── providers.py        # OpenAI/Gemini/custom adapters and budget ledger
-├── cloud_analyzer.py   # multimodal OCR/document normalization
-├── security.py         # upload, ZIP, URL and injection boundaries
-├── pipeline.py         # alignment, scoring, generation and report
-├── state.py            # local course/chat persistence; no keys
-└── exporter.py         # PDF export
-```
-
-Contributions are welcome. Good first additions include provider contract tests, richer humanities question types, accessibility work, evaluation datasets with clear licenses, and installer signing. Read [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Current status
-
-ExamSage is an alpha-quality open-source project. It needs broader real-course evaluation before anyone should rely on its ranking quality. Known limitations:
-
-- “exam likelihood” is relative and cannot be calibrated as a literal probability without a suitable evaluation dataset;
-- provider file and search behavior can change;
-- handwriting accuracy varies with image quality;
-- custom compatible endpoints cannot yet guarantee the full multimodal/search/privacy contract;
+- No real OpenAI or Gemini benchmark, OS keyring, native picker, browser fallback, or clean-launch result is claimed until the corresponding manual checkpoint is completed.
+- Initial-map timing depends on provider availability, source complexity, network conditions, and explicit model choices; 180 seconds is a target, not a service guarantee.
+- Handwriting, equations, diagrams, OCR, and model-produced evidence can be wrong.
+- Legacy DOC/PPT/XLS conversion is unavailable unless a secure sandbox runner is supplied; installing LibreOffice alone is insufficient.
+- OpenAI-compatible custom endpoints remain experimental and do not guarantee the full multimodal, citation, search, or privacy contract.
 - Windows and macOS launchers are not code-signed.
+- This release builds evidence-backed course maps. Later product stages add research, practice, rubrics, export, final UX, installers, and academic-quality evaluation.
 
-If this direction is useful, a GitHub star helps more students and contributors discover the project.
+## Legacy developer fallback
+
+The fixed legacy route remains only as a temporary compatibility and developer fallback. It uses the older all-or-nothing build path, has different key/storage behavior, and is not evidence-engine acceptance evidence. Start it by leaving `EXAMSAGE_AGENT_V2` unset or setting it to `0`. Existing saved reports remain readable, and abandoned upload copies are never imported as approved Agent evidence.
+
+## Development and verification
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m compileall -q app.py exam_predictor scripts tests
+.\.venv\Scripts\python.exe scripts\check_secret_patterns.py --root .
+.\.venv\Scripts\python.exe -m pip check
+```
+
+Tests run without API keys. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and live-test rules.
 
 ## License
 
-[MIT](LICENSE). Uploaded materials, generated reports, and third-party web sources retain their respective rights. Do not republish complete copyrighted exam papers without permission.
+[MIT](LICENSE). Uploaded materials, generated reports, and third-party sources retain their respective rights.

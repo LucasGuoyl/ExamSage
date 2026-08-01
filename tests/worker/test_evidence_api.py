@@ -16,11 +16,21 @@ from exam_predictor.evidence.models import (
     SnapshotStatus,
     StudyMapSnapshot,
 )
+from exam_predictor.evidence.study_map import (
+    EvidenceSynthesisItem,
+    StudyMapSynthesisRequest,
+)
 from exam_predictor.evidence.service import EvidenceInspection, EvidenceServiceError
 from exam_predictor.runtime.client import WorkerClient
-from exam_predictor.runtime.models import RunStatus
+from exam_predictor.providers import ProviderCapabilities
+from exam_predictor.runtime.models import (
+    ProviderDescriptor,
+    ProviderProfile,
+    RunStatus,
+)
 import exam_predictor.worker.api as worker_api
 from exam_predictor.worker.api import WorkerSettings, create_worker_app
+from exam_predictor.worker.evidence_runtime import ActiveRunEvidenceProvider
 from exam_predictor.workspace.models import WorkspaceJobStatus
 from exam_predictor.workspace.transmission import SourceAuthorizationError
 
@@ -287,6 +297,101 @@ def test_worker_client_returns_typed_evidence_models_and_quotes_workspace_id():
     assert all(b"workspace%2Fevidence-one" in path for path in raw_paths)
 
 
+def test_production_text_synthesis_forwards_deadline_and_disables_storage():
+    calls: list[dict[str, object]] = []
+
+    class Provider:
+        name = "openai"
+        models = SimpleNamespace(balanced="balanced-model")
+
+        def create_chat_completion_once(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "course_groups": [],
+                                    "nodes": [],
+                                    "limitations": [],
+                                    "evidence_unit_ids": [],
+                                }
+                            )
+                        )
+                    )
+                ]
+            )
+
+    runtime_store = SimpleNamespace(
+        active_run=lambda: SimpleNamespace(
+            run_id="run-text-deadline",
+            provider_profile_id="primary",
+        ),
+        append_event=lambda *args, **kwargs: None,
+    )
+    sessions = SimpleNamespace(get_provider=lambda _profile_id: Provider())
+    adapter = ActiveRunEvidenceProvider(runtime_store, sessions)
+    request = StudyMapSynthesisRequest(
+        phase="final",
+        workspace_id="workspace-text-deadline",
+        revision_id="revision-text-deadline",
+        status=SnapshotStatus.COMPLETE,
+        evidence=(
+            EvidenceSynthesisItem(
+                evidence_unit_id="unit-1",
+                source_part_id="part-1",
+                content="bounded evidence",
+                relative_path="notes.txt",
+                locator="lines 1-1",
+            ),
+        ),
+        deadline_seconds=10,
+    )
+
+    adapter.synthesize_study_map(request)
+
+    assert calls[0]["timeout_seconds"] == 10
+    assert calls[0]["store"] is False
+
+
+def test_production_route_identity_binds_the_connected_profile_configuration():
+    provider = SimpleNamespace(
+        name="openai",
+        capabilities=ProviderCapabilities(),
+        models=SimpleNamespace(fast="fast-model", balanced="balanced-model"),
+    )
+    run = SimpleNamespace(run_id="run-profile", provider_profile_id="primary")
+    runtime_store = SimpleNamespace(active_run=lambda: run)
+
+    def route_for(profile: ProviderProfile):
+        descriptor = ProviderDescriptor(profile=profile, capabilities={})
+        sessions = SimpleNamespace(
+            get_provider=lambda _profile_id: provider,
+            list_profiles=lambda: [descriptor],
+        )
+        return ActiveRunEvidenceProvider(runtime_store, sessions).route_identity(
+            "balanced"
+        )
+
+    first = route_for(
+        ProviderProfile(
+            profile_id="primary",
+            provider="openai",
+            balanced_model="balanced-model",
+        )
+    )
+    second = route_for(
+        ProviderProfile(
+            profile_id="primary",
+            provider="openai",
+            balanced_model="replacement-model",
+        )
+    )
+
+    assert first.profile_fingerprint != second.profile_fingerprint
+
+
 async def test_default_worker_composition_reaches_real_evidence_service(
     tmp_path,
 ):
@@ -339,27 +444,8 @@ async def test_default_worker_composition_reaches_real_evidence_service(
                 for line in prefix.splitlines()
                 if line.startswith("Locator: ")
             )
-            return SimpleNamespace(
-                text=json.dumps(
-                    {
-                        "locator": locator,
-                        "detected_language": "en",
-                        "material_role": "course notes",
-                        "headings": ["Limits"],
-                        "concepts": ["limit"],
-                        "definitions": [],
-                        "formulas": [],
-                        "procedures": [],
-                        "examples": [],
-                        "assessment_items": [],
-                        "visual_descriptions": [],
-                        "ocr_text": [],
-                        "limitations": [],
-                        "warnings": [],
-                        "prompt_injection_indicators": [],
-                    }
-                )
-            )
+            self.owner.expected_locator = locator
+            return SimpleNamespace(text='{"locator": 3}')
 
     class FakeProvider:
         name = "gemini"
@@ -382,6 +468,8 @@ async def test_default_worker_composition_reaches_real_evidence_service(
 
         def __init__(self) -> None:
             self.analyzed_bytes: list[bytes] = []
+            self.expected_locator = ""
+            self.repair_calls = 0
             self._genai = SimpleNamespace(types=FakeTypes)
             self.client = SimpleNamespace(models=FakeMediaModels(self))
 
@@ -417,6 +505,30 @@ async def test_default_worker_composition_reaches_real_evidence_service(
                         ],
                         "limitations": [],
                         "evidence_unit_ids": unit_ids,
+                    }
+                )
+            elif system.startswith("Repair one malformed ExamSage evidence response"):
+                self.repair_calls += 1
+                payload = json.loads(kwargs["messages"][1]["content"])
+                assert payload["locator"] == self.expected_locator
+                assert payload["raw_output"] == '{"locator": 3}'
+                content = json.dumps(
+                    {
+                        "locator": payload["locator"],
+                        "detected_language": "en",
+                        "material_role": "course notes",
+                        "headings": ["Limits"],
+                        "concepts": ["limit"],
+                        "definitions": [],
+                        "formulas": [],
+                        "procedures": [],
+                        "examples": [],
+                        "assessment_items": [],
+                        "visual_descriptions": [],
+                        "ocr_text": [],
+                        "limitations": [],
+                        "warnings": [],
+                        "prompt_injection_indicators": [],
                     }
                 )
             else:
@@ -502,6 +614,7 @@ async def test_default_worker_composition_reaches_real_evidence_service(
     assert coverage.json()["part_processed_count"] == 1
     assert snapshot.json()["status"] == "complete"
     assert provider.analyzed_bytes == [source_bytes]
+    assert provider.repair_calls == 1
     evidence_store, artifact_store = app.state.evidence_resources
     assert evidence_store._closed is True
     assert artifact_store._closed is True

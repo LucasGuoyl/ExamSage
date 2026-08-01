@@ -214,7 +214,7 @@ def test_scheduler_bounds_concurrency_and_preserves_claim_priority(tmp_path: Pat
     assert outcome.processed_part_ids[:5] == tuple(plan.part_id for plan in plans[:5])
 
 
-def test_retry_after_is_honored_and_third_route_failure_pauses(tmp_path: Path):
+def test_retry_after_is_honored_and_third_route_failure_is_terminal(tmp_path: Path):
     class UnavailableProvider(_ImmediateProvider):
         def analyze_source_part(self, request):
             self.calls.append(request.source_part_id)
@@ -245,7 +245,49 @@ def test_retry_after_is_honored_and_third_route_failure_pauses(tmp_path: Path):
     assert provider.calls == [plan.part_id] * 3
     assert sum(clock.waits) == 4.0
     assert max(clock.waits) <= 0.25
-    assert persisted.state is PartState.RETRY_WAIT
+    assert persisted.state is PartState.FAILED
+
+
+def test_route_attempt_limit_survives_multiple_resumes(tmp_path: Path):
+    class UnavailableProvider(_ImmediateProvider):
+        def analyze_source_part(self, request):
+            self.calls.append(request.source_part_id)
+            raise EvidenceProviderError(
+                "provider_unavailable",
+                retryable=True,
+                retry_after_seconds=61,
+            )
+
+    clock = _FakeClock()
+    provider = UnavailableProvider()
+    plan = _plan("resumed-route-limit", priority=0)
+    scheduler, store, artifacts = _scheduler(
+        tmp_path,
+        provider,
+        (plan,),
+        policy=EvidencePolicy(
+            multimodal_concurrency=1,
+            tool_deadline_seconds=60,
+        ),
+        clock=clock,
+    )
+    try:
+        for run_number in range(3):
+            scheduler.run_to_completion(
+                f"run-{run_number}",
+                WORKSPACE_ID,
+                REVISION_ID,
+            )
+            clock.current += timedelta(seconds=61)
+            clock.monotonic_value += 61
+        scheduler.run_to_completion("run-4", WORKSPACE_ID, REVISION_ID)
+        persisted = store.get_part(plan.part_id)
+    finally:
+        artifacts.close()
+        store.close()
+
+    assert provider.calls == [plan.part_id] * 3
+    assert persisted.state is PartState.FAILED
 
 
 def test_stop_after_publication_prevents_next_call_and_resume_skips_completed(tmp_path: Path):
@@ -318,6 +360,58 @@ def test_unchanged_part_uses_validated_cache_across_revision_without_provider_ca
     assert second_outcome.status is SchedulerStatus.COMPLETE
     assert provider.calls == [first.part_id]
     assert persisted.state is PartState.PROCESSED
+
+
+def test_equal_bytes_do_not_cross_provider_profile_cache_identity(tmp_path: Path):
+    class ProfileProvider(_ImmediateProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.profile_fingerprint = "a" * 64
+
+        def route_identity(self, model_route: str) -> EvidenceRouteIdentity:
+            return super().route_identity(model_route).model_copy(
+                update={"profile_fingerprint": self.profile_fingerprint}
+            )
+
+    provider = ProfileProvider()
+    first = _plan("profile-a", priority=0, revision_id="revision-profile-a")
+    scheduler, store, artifacts = _scheduler(tmp_path, provider, (first,))
+    try:
+        scheduler.run_to_completion(
+            "run-profile-a",
+            WORKSPACE_ID,
+            "revision-profile-a",
+        )
+        second = _plan(
+            "profile-b",
+            priority=0,
+            revision_id="revision-profile-b",
+        ).model_copy(
+            update={
+                "entry_id": first.entry_id,
+                "relative_path": first.relative_path,
+                "part_sha256": first.part_sha256,
+                "size_bytes": first.size_bytes,
+            }
+        )
+        store.upsert_part_plans((second,))
+        artifacts.publish_part(
+            WORKSPACE_ID,
+            second.part_id,
+            f"content:{first.part_id}".encode(),
+            expected_sha256=second.part_sha256,
+        )
+        provider.profile_fingerprint = "b" * 64
+        scheduler.run_to_completion(
+            "run-profile-b",
+            WORKSPACE_ID,
+            "revision-profile-b",
+        )
+    finally:
+        artifacts.close()
+        store.close()
+
+    assert provider.calls == [first.part_id, second.part_id]
 
 
 def test_cache_key_separates_equal_bytes_at_different_relative_paths(tmp_path: Path):

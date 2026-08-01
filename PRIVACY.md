@@ -1,76 +1,60 @@
 # ExamSage Privacy Model
 
-Last updated: 26 July 2026
+Last updated: 1 August 2026
 
-ExamSage is a local application, not a hosted service. The project maintainers do not operate an ExamSage API relay, account database, analytics endpoint, or file server.
+ExamSage is a local application, not a hosted service. The maintainers do not operate an ExamSage API relay, account database, analytics endpoint, or file server. ExamSage adds no telemetry, and Streamlit usage reporting is disabled in `.streamlit/config.toml`.
 
-## Data flow
+## Agent data flow
 
-The default legacy build keeps its existing direct-upload workflow: local deterministic checks run
-first, selected files and embedded Office images are sent directly to the chosen provider, and the
-returned normalized course data is stored locally.
+1. A native picker records a canonical reference to a selected folder, or the browser fallback streams an ExamSage-owned snapshot below the application data directory.
+2. Local deterministic code inventories supported paths, rejects link-like or unsafe entries, previews archive metadata, hashes regular files, and displays the manifest. It does not infer course meaning at this stage.
+3. The user excludes unwanted sources and approves the exact included entry IDs, manifest revision, policy version, and hashes.
+4. Before every source use, the transmission gate rechecks the canonical root, file identity, metadata, and hash, then grants one short-lived, single-use read.
+5. ExamSage locally prepares bounded source parts. Only the exact approved part required by an active evidence operation is sent directly to the selected provider.
+6. Validated evidence units, coverage, citations, and initial/complete study-map snapshots are cached locally so unchanged work can be reused and resumed.
 
-The optional Agent workspace has a separate approval boundary:
+No Agent source is eligible for provider transmission before approval. Excluded sources remain local. Approval can limit what ExamSage sends, but it cannot control what a provider retains after receipt.
 
-1. The native picker records a canonical reference to a user-selected folder, or the browser fallback
-   creates a streamed snapshot below ExamSage's data directory.
-2. Local deterministic code inventories supported paths, hashes regular files, previews ZIP metadata,
-   and records a visible manifest state/reason. It does not infer or analyze course content.
-3. The user excludes unwanted sources and approves the exact remaining manifest revision and hashes.
-4. The transmission gate rechecks the canonical root, file identity, metadata, and hash before granting
-   one short-lived read.
-5. An approved file is sent to the configured provider only when a later user task invokes a provider
-   tool that needs it. The secure-workspace subproject itself performs no cloud source analysis.
+## Provider processing and retention
+
+The selected provider receives approved prepared parts and prompts needed for the active operation. Its privacy, retention, safety-monitoring, regional-processing, account, and billing policies apply.
+
+- Agent-mode OpenAI requests explicitly set `store: false`; legacy mode and custom endpoints may behave differently.
+- Gemini temporary provider files are deleted best-effort after analysis.
+- Provider-side operational, security, or abuse-prevention retention may still apply.
+- OpenAI-compatible endpoints are experimental; their storage and deletion behavior depends on their operator.
+
+Do not process material unless you are authorized to share it with that provider. Review current provider terms before using personal data, unreleased exams, embargoed research, NDA material, medical or legal records, export-controlled information, or institution-restricted content.
 
 ## API keys
 
-The legacy build keeps its API key in Streamlit session memory only. The Agent route sends the key once
-to the authenticated loopback Worker, which stores it through Windows Credential Manager or macOS
-Keychain via the operating-system vault abstraction. There is no plaintext fallback when the vault is
-unavailable.
+The Agent route sends the key once to the authenticated loopback Worker and stores it through Windows Credential Manager or macOS Keychain. There is no plaintext fallback when the OS vault is unavailable. On restart, the Worker may restore an eligible provider session from the vault; it never puts the key in durable application state.
 
-Credentials are excluded from SQLite, LangGraph checkpoints, manifests, normalized files, reports,
-events, logs, exceptions, HTTP responses, exports, diagnostics, and backups. `Forget API key`
-disconnects the provider and deletes its vault credential; it does not delete course workspaces.
+Credentials are excluded from SQLite, LangGraph checkpoints, manifests, evidence, prepared parts, maps, reports, events, logs, exceptions, HTTP responses, exports, benchmark reports, diagnostics, and backups. `Forget API key` disconnects that provider profile and removes its vault credential; it does not delete course workspaces.
 
-## Agent kernel alpha credentials and local processes
+The temporary legacy route keeps its key in Streamlit session memory. It is a compatibility/developer fallback, not the recommended evidence-engine path.
 
-In the hidden Agent route, Streamlit sends the provider API key once to the local Worker over an
-authenticated loopback request. The Worker accepts Agent API requests only on `127.0.0.1`, using a
-random per-launch token shared with the Streamlit child process through their environment. Authentication
-is checked before JSON or multipart bodies are parsed.
+## Local evidence, caching, and invalidation
 
-Closing ExamSage clears in-process provider clients. On restart, the Worker restores eligible provider
-sessions from the OS vault without placing the key in durable application state. The automated
-acceptance test injects an in-memory fake vault and fake provider; it never reads a real keyring or sends
-a real provider request.
+Application data defaults to `~/.examsage`; set `EXAMSAGE_DATA_DIR` to use another local location. ExamSage stores manifests, approvals, run/checkpoint metadata, prepared parts, validated evidence, citations, coverage, and study-map snapshots under its local data boundary. Evidence and map content are derived from course sources and can still be sensitive.
 
-## Provider processing
+The cache identity includes source and part hashes plus provider route, schema, prompt, and policy versions. Unchanged approved content can be reused. If a source hash changes, ExamSage requires a new scan and approval and invalidates evidence and study-map dependencies derived from that source. It does not silently attach old evidence to changed bytes.
 
-The selected provider receives only content that the active workflow sends: direct legacy uploads, or
-exactly approved Agent workspace files when a later provider tool is invoked. Its privacy, retention,
-safety-monitoring, regional-processing, and billing policies apply. OpenAI requests set `store: false`
-where supported. Gemini temporary files are deleted after analysis on a best-effort basis;
-provider-side operational retention may still apply.
+Backups exclude transient intake files and known secret-file extensions, but may include derived study content. The user remains responsible for OS account security, file permissions, disk encryption, malware protection, and backup access.
 
-Do not upload data unless you are authorized to share it with the chosen provider. Review the provider's current terms before processing personal data, unreleased exams, research under NDA, medical/legal records, export-controlled material, or institution-restricted content.
+## Deletion
 
-## Local storage and backup
+- Deleting a native workspace removes ExamSage-owned metadata, evidence, prepared artifacts, runs, events, and checkpoints. It never edits or deletes the selected native source folder.
+- Deleting a browser fallback workspace may remove only the recorded identity-verified snapshot below the ExamSage data root.
+- Unverifiable or partial deletion remains `cleanup pending` and can be retried; ExamSage does not expand the target.
+- Old compatibility-route upload copies are removed only through an explicit cleanup control that refuses active, replaced, linked, unknown, or unverified entries.
 
-By default, application data is stored in `~/.examsage`. Set `EXAMSAGE_DATA_DIR` to choose another
-local location. A native workspace stores metadata and approvals but leaves every source byte in the
-selected folder unchanged. Deleting it removes only ExamSage-owned metadata, linked settled runs/events,
-and checkpoints. A browser fallback stores an ExamSage-owned snapshot and may delete only that
-identity-verified tree below the application data root. A deletion that cannot prove those boundaries
-remains `cleanup pending`.
-
-Backups exclude transient intake files and known secret-file extensions. The user is responsible for
-operating-system accounts, disk encryption, backups, malware protection, and access permissions.
-
-## Telemetry
-
-ExamSage adds no telemetry. Streamlit's usage-stat collection is disabled in `.streamlit/config.toml`.
+Deleting local data does not retroactively delete data already processed or retained by a provider. Use the provider's own controls where applicable.
 
 ## Web research
 
-When course evidence is sparse—or when a student asks for fresh sources—ExamSage sends a generated query to the selected provider's native web-search/grounding tool. Returned source URLs become part of the local report or chat.
+The 0.6.0 evidence-engine workspace does not fetch arbitrary webpages. Request-specific grounded web research is a later product stage. The temporary legacy route may use the selected provider's native web-search feature and can store returned source URLs in local reports.
+
+## Automated and live evidence
+
+Automated acceptance uses synthetic material, fake providers, injected clocks, and fake vaults. It does not use a real keyring or contact a real provider. Opt-in live benchmarks use only the declared CC0 synthetic reference course and record sanitized measurements; outstanding platform and provider checks are listed in `docs/manual-tests/`.

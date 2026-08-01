@@ -17,7 +17,13 @@ from exam_predictor.evidence.providers import (
     EvidenceProviderError,
     ProviderEvidenceAdapter,
 )
-from exam_predictor.providers import ModelRouting, ProviderCapabilities
+from exam_predictor.providers import (
+    GeminiProvider,
+    ModelRouting,
+    OpenAIProvider,
+    ProviderCapabilities,
+    UsageLedger,
+)
 
 
 _SECRET = "private-provider-response-sentinel-123456789"
@@ -138,6 +144,58 @@ def _gemini_provider(
         _genai=genai,
         inline_file_limit_bytes=inline_limit,
     )
+
+
+def test_openai_text_completion_once_forwards_timeout_without_sdk_retry():
+    calls: list[dict[str, object]] = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+            usage=None,
+        )
+
+    provider = OpenAIProvider.__new__(OpenAIProvider)
+    provider.models = _MODELS
+    provider.ledger = UsageLedger()
+    provider.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    provider.create_chat_completion_once(
+        model="balanced-model",
+        messages=[{"role": "user", "content": "bounded"}],
+        max_tokens=20,
+        timeout_seconds=7.5,
+        store=False,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == 7.5
+    assert calls[0]["store"] is False
+
+
+def test_gemini_text_completion_once_forwards_timeout_without_sdk_retry():
+    models = _GeminiModels(
+        response=SimpleNamespace(text="{}", usage_metadata=None)
+    )
+    provider = GeminiProvider.__new__(GeminiProvider)
+    provider.models = _MODELS
+    provider.ledger = UsageLedger()
+    provider._genai = genai
+    provider.client = SimpleNamespace(models=models)
+
+    provider.create_chat_completion_once(
+        model="balanced-model",
+        messages=[{"role": "user", "content": "bounded"}],
+        max_tokens=20,
+        timeout_seconds=7.5,
+        store=False,
+    )
+
+    assert len(models.calls) == 1
+    assert models.calls[0]["config"].http_options.timeout == 7_500
 
 
 def test_openai_adapter_sends_one_versioned_structured_request_and_exact_model():

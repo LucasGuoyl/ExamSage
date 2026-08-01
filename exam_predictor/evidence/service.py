@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+import time
 from typing import Literal, Protocol
 
 from pydantic import ConfigDict, Field, field_validator
@@ -21,7 +23,7 @@ from exam_predictor.evidence.models import (
     StudyMapSnapshot,
     validate_safe_evidence_text,
 )
-from exam_predictor.evidence.policy import source_priority
+from exam_predictor.evidence.policy import EvidencePolicy, source_priority
 from exam_predictor.evidence.preparation import (
     ArchivePreviewAuthority,
     PreparedPartRequest,
@@ -37,6 +39,7 @@ from exam_predictor.evidence.scheduler import (
 from exam_predictor.evidence.store import EvidenceStore
 from exam_predictor.evidence.study_map import (
     EvidenceAnswerContext,
+    EvidenceSynthesisDeadlineExceeded,
     StudyMapBuilder,
 )
 from exam_predictor.workspace.models import (
@@ -154,6 +157,9 @@ class EvidenceService:
         answer_composer: EvidenceAnswerComposer | None = None,
         run_guard: EvidenceRunGuard | None = None,
         emit: EventEmitter | None = None,
+        policy: EvidencePolicy = EvidencePolicy(),
+        wall_clock: Callable[[], datetime] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         self._workspace_store = workspace_store
         self._transmission_gate = transmission_gate
@@ -165,6 +171,9 @@ class EvidenceService:
         self._answer_composer = answer_composer
         self._run_guard = run_guard
         self._emit = emit or (lambda _event_type, _payload: None)
+        self._policy = policy
+        self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
+        self._monotonic_clock = monotonic_clock or time.monotonic
 
     def start(self) -> tuple[str, ...]:
         """Recover interrupted local state without starting provider work."""
@@ -224,11 +233,18 @@ class EvidenceService:
         run_id: str,
     ) -> EvidenceRunResult:
         authority = self._require_authority(workspace_id)
+        deadline = self._run_deadline(run_id, workspace_id)
         self._prepare_current(authority)
-        return self._analyze_current(authority, run_id)
+        return self._analyze_current(authority, run_id, deadline)
 
-    def prepare_analysis(self, workspace_id: str) -> EvidenceInspection:
+    def prepare_analysis(
+        self,
+        workspace_id: str,
+        run_id: str | None = None,
+    ) -> EvidenceInspection:
         authority = self._require_authority(workspace_id)
+        if run_id is not None:
+            self._run_deadline(run_id, workspace_id)
         self._prepare_current(authority)
         inspection = self._inspection_from_authority(authority)
         if not self._authority_matches(authority):
@@ -246,7 +262,11 @@ class EvidenceService:
         run_id: str,
     ) -> EvidenceFrontierResult:
         authority = self._require_revision(workspace_id, revision_id)
-        outcome = self._run_one_frontier(authority, run_id)
+        outcome = self._run_one_frontier(
+            authority,
+            run_id,
+            self._run_deadline(run_id, workspace_id),
+        )
         return EvidenceFrontierResult(
             workspace_id=workspace_id,
             revision_id=revision_id,
@@ -259,12 +279,14 @@ class EvidenceService:
         revision_id: str,
         outcome: SchedulerOutcome,
         *,
+        run_id: str,
         response_language: str | None = None,
     ) -> EvidenceRunResult:
         authority = self._require_revision(workspace_id, revision_id)
         return self._publish_one_frontier(
             authority,
             outcome,
+            deadline=self._run_deadline(run_id, workspace_id),
             response_language=response_language,
         )
 
@@ -274,8 +296,9 @@ class EvidenceService:
         run_id: str,
     ) -> EvidenceRunResult:
         authority = self._require_authority(workspace_id)
+        deadline = self._run_deadline(run_id, workspace_id)
         self._prepare_current(authority)
-        return self._analyze_current(authority, run_id)
+        return self._analyze_current(authority, run_id, deadline)
 
     def answer_from_evidence(
         self,
@@ -391,6 +414,44 @@ class EvidenceService:
             revision.revision_id,
         )
         existing = self._evidence_store.list_parts(workspace_id, revision.revision_id)
+        current_entries = {entry.entry_id: entry for entry in approved_entries}
+        entry_parts = {
+            entry_id: tuple(part for part in existing if part.entry_id == entry_id)
+            for entry_id in current_entries
+        }
+        for entry_id, parts in entry_parts.items():
+            if not parts:
+                continue
+            policy_changed = any(
+                part.preparation_policy_version != self._policy.policy_version
+                or part.preparation_schema_version != self._policy.schema_version
+                for part in parts
+            )
+            if policy_changed and any(
+                part.state is not PartState.INVALIDATED for part in parts
+            ):
+                self._builder.invalidate_entry(
+                    workspace_id,
+                    revision.revision_id,
+                    entry_id,
+                )
+                parts = self._evidence_store.list_parts(
+                    workspace_id,
+                    revision.revision_id,
+                )
+                parts = tuple(part for part in parts if part.entry_id == entry_id)
+            if parts and all(part.state is PartState.INVALIDATED for part in parts):
+                try:
+                    for part in parts:
+                        self._artifact_store.revoke_part(workspace_id, part.part_id)
+                except Exception:
+                    raise EvidenceServiceError("evidence_invalidation_failed") from None
+                self._evidence_store.delete_invalidated_entry_parts(
+                    workspace_id,
+                    revision.revision_id,
+                    entry_id,
+                )
+        existing = self._evidence_store.list_parts(workspace_id, revision.revision_id)
         prepared_entries = {
             part.entry_id
             for part in existing
@@ -434,7 +495,7 @@ class EvidenceService:
                     ) as stream:
                         plans = self._preparer.prepare(request, stream)
                 except SourcePreparationError as error:
-                    plans = (_failed_plan(request, entry, error),)
+                    plans = (_failed_plan(request, entry, error, self._policy),)
                     self._emit(
                         "part_failed",
                         {
@@ -463,6 +524,7 @@ class EvidenceService:
         self,
         authority: TransmissionAuthoritySnapshot,
         run_id: str,
+        deadline: float,
     ) -> EvidenceRunResult:
         revision = authority.revision
         assert revision is not None
@@ -475,10 +537,11 @@ class EvidenceService:
         )
         while True:
             try:
-                last_outcome = self._run_one_frontier(authority, run_id)
+                last_outcome = self._run_one_frontier(authority, run_id, deadline)
                 result = self._publish_one_frontier(
                     authority,
                     last_outcome,
+                    deadline=deadline,
                     response_language=None,
                 )
             except SourceAuthorizationError:
@@ -490,6 +553,8 @@ class EvidenceService:
                 )
             if result.status == "complete":
                 return result
+            if result.safe_error_code == "provider_timeout":
+                return result
             if last_outcome.status is SchedulerStatus.PAUSED:
                 return result
 
@@ -497,6 +562,7 @@ class EvidenceService:
         self,
         authority: TransmissionAuthoritySnapshot,
         run_id: str,
+        deadline: float,
     ) -> SchedulerOutcome:
         revision = authority.revision
         approval = authority.approval
@@ -527,6 +593,7 @@ class EvidenceService:
             run_id,
             workspace_id,
             revision.revision_id,
+            deadline=deadline,
             authorize_part=part_authority_guard,
         )
         self._ensure_workspace_active(workspace_id)
@@ -538,17 +605,46 @@ class EvidenceService:
             )
         return outcome
 
+    def _run_deadline(self, run_id: str, workspace_id: str) -> float:
+        now = self._wall_clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("evidence deadline clock must be timezone-aware")
+        expires = self._evidence_store.ensure_run_deadline(
+            run_id,
+            workspace_id,
+            expires_at=now + timedelta(seconds=self._policy.tool_deadline_seconds),
+        )
+        remaining = max(0.0, (expires - now.astimezone(UTC)).total_seconds())
+        return self._monotonic_clock() + remaining
+
     def _publish_one_frontier(
         self,
         authority: TransmissionAuthoritySnapshot,
         outcome: SchedulerOutcome,
         *,
+        deadline: float,
         response_language: str | None,
     ) -> EvidenceRunResult:
         revision = authority.revision
         approval = authority.approval
         assert revision is not None and approval is not None
         workspace_id = authority.workspace.workspace_id
+
+        def deadline_result() -> EvidenceRunResult:
+            return EvidenceRunResult(
+                workspace_id=workspace_id,
+                revision_id=revision.revision_id,
+                status="paused",
+                snapshot=self._evidence_store.current_snapshot(
+                    workspace_id,
+                    revision.revision_id,
+                ),
+                outcome=outcome,
+                safe_error_code="provider_timeout",
+            )
+
+        if deadline - self._monotonic_clock() < 10.0:
+            return deadline_result()
 
         @contextmanager
         def publication_guard():
@@ -567,6 +663,7 @@ class EvidenceService:
                 publication_guard=publication_guard,
                 synthesis_guard=publication_guard,
                 response_language=response_language,
+                deadline=deadline,
             )
             complete = (
                 self._builder.publish_complete(
@@ -575,10 +672,13 @@ class EvidenceService:
                     publication_guard=publication_guard,
                     synthesis_guard=publication_guard,
                     response_language=response_language,
+                    deadline=deadline,
                 )
                 if outcome.pending_count == 0
                 else None
             )
+        except EvidenceSynthesisDeadlineExceeded:
+            return deadline_result()
         except TransmissionAuthorityRevokedError:
             raise SourceAuthorizationError(
                 "source_approval_revoked",
@@ -755,6 +855,7 @@ def _failed_plan(
     request: PreparedPartRequest,
     entry: ManifestEntry,
     error: SourcePreparationError,
+    policy: EvidencePolicy,
 ) -> SourcePartPlan:
     priority, scheduling_class = source_priority(
         request.relative_path,
@@ -763,7 +864,8 @@ def _failed_plan(
     identity = sha256(
         (
             f"{request.workspace_id}\0{request.revision_id}\0{request.entry_id}\0"
-            f"{request.source_sha256}\0{error.locator}\0{error.code}"
+            f"{request.source_sha256}\0{error.locator}\0{error.code}\0"
+            f"{policy.policy_version}\0{policy.schema_version}"
         ).encode("utf-8")
     ).hexdigest()
     return SourcePartPlan(
@@ -775,11 +877,14 @@ def _failed_plan(
         source_sha256=request.source_sha256,
         part_sha256=sha256(error.code.encode("utf-8")).hexdigest(),
         ordinal=0,
+        scheduling_rank=0,
         locator=error.locator,
         media_type="application/octet-stream",
         size_bytes=entry.size_bytes,
         scheduling_class=scheduling_class,
         priority=priority,
+        preparation_policy_version=policy.policy_version,
+        preparation_schema_version=policy.schema_version,
         state=PartState.FAILED,
         idempotency_key=f"prepare_failure_{identity}",
         safe_error_code=error.code,

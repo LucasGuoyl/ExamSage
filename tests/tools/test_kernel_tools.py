@@ -91,6 +91,7 @@ def test_planner_bounds_history_and_uses_fast_model():
     call = provider.calls[0]
     payload = json.loads(call["messages"][1]["content"])
     assert call["model"] == "fast"
+    assert call["store"] is False
     assert payload["history"] == history[-12:]
 
 
@@ -122,6 +123,7 @@ def test_tutor_tool_bounds_history_and_uses_balanced_model():
 
     call = provider.calls[0]
     assert call["model"] == "balanced"
+    assert call["store"] is False
     assert call["messages"][1:] == history[-20:]
 
 

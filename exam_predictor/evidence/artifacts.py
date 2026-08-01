@@ -256,6 +256,30 @@ class EvidenceArtifactStore:
         except Exception:
             raise ArtifactBoundaryError("artifact_publish_failed") from None
 
+    def revoke_part(self, workspace_id: str, part_id: str) -> None:
+        """Replace one obsolete prepared part with an empty owned tombstone."""
+
+        self._validate_identifier(workspace_id)
+        self._validate_identifier(part_id)
+        tombstone = b""
+        try:
+            self._publish_bytes(
+                workspace_id,
+                "parts",
+                part_id,
+                tombstone,
+                hashlib.sha256(tombstone).hexdigest(),
+                suffix="",
+            )
+        except ArtifactBoundaryError:
+            raise
+        except RegistryError as error:
+            self._raise_registry_boundary(error)
+        except OwnedFilesystemError as error:
+            self._raise_filesystem_boundary(error)
+        except Exception:
+            raise ArtifactBoundaryError("artifact_publish_failed") from None
+
     def delete_workspace(self, workspace_id: str) -> ArtifactCleanupState:
         self._validate_identifier(workspace_id)
         try:
