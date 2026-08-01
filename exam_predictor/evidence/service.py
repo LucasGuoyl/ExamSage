@@ -79,6 +79,7 @@ class EvidenceInspection(EvidenceFrozenModel):
     revision_id: str | None = None
     approval_id: str | None = None
     approval_required: bool
+    prior_approval_exists: bool = False
     approved_source_count: int = Field(default=0, ge=0)
     approved_bytes: int = Field(default=0, ge=0)
     coverage: CoverageSummary | None = None
@@ -193,6 +194,9 @@ class EvidenceService:
                     or workspace.current_draft_revision_id
                 ),
                 approval_required=True,
+                prior_approval_exists=(
+                    workspace.current_approved_revision_id is not None
+                ),
             )
         approval = authority.approval
         revision = authority.revision
@@ -204,6 +208,7 @@ class EvidenceService:
             revision_id=revision.revision_id,
             approval_id=approval.approval_id,
             approval_required=False,
+            prior_approval_exists=True,
             approved_source_count=len(entries),
             approved_bytes=sum(entry.size_bytes for entry in entries),
             coverage=coverage,
@@ -381,6 +386,10 @@ class EvidenceService:
             )
         if not approved_entries:
             raise EvidenceServiceError("evidence_sources_empty")
+        self._evidence_store.retry_failed_parts(
+            workspace_id,
+            revision.revision_id,
+        )
         existing = self._evidence_store.list_parts(workspace_id, revision.revision_id)
         prepared_entries = {
             part.entry_id
@@ -773,6 +782,7 @@ def _failed_plan(
         priority=priority,
         state=PartState.FAILED,
         idempotency_key=f"prepare_failure_{identity}",
+        safe_error_code=error.code,
     )
 
 

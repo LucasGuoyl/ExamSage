@@ -5,7 +5,11 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
 
-from exam_predictor.evidence.models import CoverageSummary, StudyMapSnapshot
+from exam_predictor.evidence.models import (
+    CoverageSummary,
+    EvidenceStatus,
+    StudyMapSnapshot,
+)
 from exam_predictor.evidence.service import EvidenceServiceError
 from exam_predictor.workspace.transmission import SourceAuthorizationError
 
@@ -43,6 +47,21 @@ def build_evidence_router(dependencies: EvidenceRouterDependencies) -> APIRouter
             return dependencies.evidence_service.inspect(workspace_id)
         except Exception as error:
             raise _domain_error(error) from None
+
+    @router.get(
+        "/workspaces/{workspace_id}/evidence/status",
+        response_model=EvidenceStatus,
+    )
+    def get_status(workspace_id: str) -> EvidenceStatus:
+        inspection = inspect(workspace_id)
+        return EvidenceStatus(
+            workspace_id=inspection.workspace_id,
+            revision_id=inspection.revision_id,
+            approval_required=inspection.approval_required,
+            prior_approval_exists=inspection.prior_approval_exists,
+            approved_source_count=inspection.approved_source_count,
+            approved_bytes=inspection.approved_bytes,
+        )
 
     @router.get(
         "/workspaces/{workspace_id}/evidence/coverage",

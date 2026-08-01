@@ -14,6 +14,7 @@ from exam_predictor.runtime.client import (
     WorkerClient,
     WorkerClientError,
 )
+from exam_predictor.ui.i18n import get_ui_language, text
 from exam_predictor.workspace.models import (
     EntryInclusionRequest,
     ManifestEntry,
@@ -31,6 +32,34 @@ WORKSPACE_JOB_MAX_POLLS = 8
 WORKSPACE_JOB_MAX_RERUNS = 8
 MANIFEST_WORKER_PAGE_SIZE = 500
 MANIFEST_DISPLAY_PAGE_SIZE = 100
+
+
+def _language() -> str:
+    return get_ui_language(st.session_state)
+
+
+def _copy(key: str, **values: object) -> str:
+    return text(key, _language(), **values)
+
+
+_ACTION_REASON_KEYS = {
+    "A scan is in progress.": "reason_scan_in_progress",
+    "Workspace deletion is in progress.": "reason_deletion_in_progress",
+    "A current draft requires review.": "reason_draft_review",
+    "No current draft is available.": "reason_no_draft",
+    "Review all manifest entries before approval.": "reason_review_all",
+    "The manifest needs attention before approval.": "reason_manifest_attention",
+    "Include at least one hashable file before approval.": "reason_include_file",
+}
+
+
+def _localized_reason(reason: str) -> str:
+    key = _ACTION_REASON_KEYS.get(reason)
+    return reason if key is None else _copy(key)
+
+
+def _state_label(value: SourceState | WorkspaceState) -> str:
+    return _copy(f"state_{value.value}")
 
 
 @dataclass(frozen=True)
@@ -206,7 +235,7 @@ def action_state(
 
 
 def _safe_workspace_error() -> None:
-    st.error("The course workspace request could not be completed. Please try again.")
+    st.error(_copy("workspace_request_failed"))
 
 
 def _format_modified(modified_ns: int | None) -> str:
@@ -231,12 +260,12 @@ def _start_job(job: WorkspaceJob) -> None:
 
 def _job_next_action(job: WorkspaceJob) -> str:
     if job.status is WorkspaceJobStatus.SUCCEEDED:
-        return "Review the updated manifest."
+        return _copy("job_review_manifest")
     if job.status is WorkspaceJobStatus.FAILED:
-        return "Review the manifest or choose the course folder again."
+        return _copy("job_review_or_choose")
     if job.status is WorkspaceJobStatus.CANCELLED:
-        return "Start a new scan when you are ready."
-    return "The local Worker is scanning your course files."
+        return _copy("job_start_scan")
+    return _copy("job_scanning")
 
 
 def _render_workspace_job(client: WorkerClient) -> None:
@@ -264,12 +293,12 @@ def _render_workspace_job(client: WorkerClient) -> None:
         return
 
     progress = st.session_state["workspace_job_progress"]
-    with st.status(f"Course workspace: {current.status.value}", expanded=True):
+    with st.status(_copy("job_status", status=current.status.value), expanded=True):
         left, middle, right = st.columns(3)
-        left.metric("Files discovered", progress.get("discovered_count", 0))
-        middle.metric("Bytes hashed", progress.get("bytes_hashed", 0))
-        right.metric("Failures", progress.get("failure_count", 0))
-        st.caption(f"Next action: {_job_next_action(current)}")
+        left.metric(_copy("files_discovered"), progress.get("discovered_count", 0))
+        middle.metric(_copy("bytes_hashed"), progress.get("bytes_hashed", 0))
+        right.metric(_copy("failures"), progress.get("failure_count", 0))
+        st.caption(_copy("next_action", action=_job_next_action(current)))
         for event in events[-8:]:
             st.write(event.message)
 
@@ -282,8 +311,8 @@ def _render_workspace_job(client: WorkerClient) -> None:
         return
     polls = int(st.session_state.get("workspace_job_polls", 0))
     if polls >= min(WORKSPACE_JOB_MAX_POLLS, WORKSPACE_JOB_MAX_RERUNS):
-        st.info("Scan updates are paused. Select Refresh workspace job to poll again.")
-        if st.button("Refresh workspace job"):
+        st.info(_copy("scan_polling_paused"))
+        if st.button(_copy("refresh_workspace_job")):
             st.session_state["workspace_job_polls"] = 0
             st.rerun()
         return
@@ -296,7 +325,7 @@ def _upload_directory(
 ) -> None:
     display_name = st.session_state.get("workspace_upload_name", "").strip()
     if not display_name:
-        st.warning("Give the uploaded course directory a display name.")
+        st.warning(_copy("display_name_required"))
         return
     try:
         _start_job(upload_directory(client, display_name, uploaded_files, str(uuid4())))
@@ -312,16 +341,27 @@ def _render_credentials(client: WorkerClient) -> None:
         return
     if not saved:
         return
-    with st.expander("Saved provider status"):
+    with st.expander(_copy("saved_provider_status")):
         for provider in saved:
-            state = "saved" if provider.credential_expected else "not saved"
-            if provider.reconnect_required:
-                state += "; reconnect required"
-            st.caption(f"{provider.profile.provider}: credential {state}.")
-            st.warning(
-                "Forgetting an API key disconnects this provider, but leaves course files and workspaces intact."
+            state = (
+                _copy("credential_saved")
+                if provider.credential_expected
+                else _copy("credential_not_saved")
             )
-            if st.button("Forget API key", key=f"forget-provider-{provider.profile.profile_id}"):
+            if provider.reconnect_required:
+                state += _copy("reconnect_required")
+            st.caption(
+                _copy(
+                    "credential_state",
+                    provider=provider.profile.provider,
+                    state=state,
+                )
+            )
+            st.warning(_copy("forget_key_warning"))
+            if st.button(
+                _copy("forget_api_key"),
+                key=f"forget-provider-{provider.profile.profile_id}",
+            ):
                 try:
                     client.forget_provider_credential(provider.profile.profile_id)
                 except WorkerClientError:
@@ -338,10 +378,10 @@ def _render_manifest_controls(
 ) -> None:
     state = action_state(workspace, approval_manifest)
     st.subheader(workspace.display_name)
-    st.caption(f"Workspace state: {workspace.state.value.replace('_', ' ')}")
+    st.caption(_copy("workspace_state", state=_state_label(workspace.state)))
     if state.reason:
-        st.info(state.reason)
-    if st.button("Rescan workspace", disabled=not state.can_rescan):
+        st.info(_localized_reason(state.reason))
+    if st.button(_copy("rescan_workspace"), disabled=not state.can_rescan):
         try:
             _start_job(client.rescan(workspace.workspace_id, str(uuid4())))
         except WorkerClientError:
@@ -350,32 +390,32 @@ def _render_manifest_controls(
     count_columns = st.columns(len(SourceState))
     for column, source_state in zip(count_columns, SourceState, strict=True):
         column.metric(
-            source_state.value.replace("_", " "),
+            _state_label(source_state),
             manifest_counts(approval_manifest.items)[source_state],
         )
 
     rows = [
         {
-            "Relative path": entry.relative_path,
-            "Category": entry.format_category or entry.item_kind,
-            "Bytes": entry.size_bytes,
-            "Modified": _format_modified(entry.modified_ns),
-            "State": entry.state.value,
-            "Hash": entry.sha256[:12] if entry.sha256 else "—",
-            "Group": entry.proposed_course_group,
-            "Reason": entry.safe_message
+            _copy("relative_path"): entry.relative_path,
+            _copy("category"): entry.format_category or entry.item_kind,
+            _copy("bytes"): entry.size_bytes,
+            _copy("modified"): _format_modified(entry.modified_ns),
+            _copy("state"): _state_label(entry.state),
+            _copy("hash"): entry.sha256[:12] if entry.sha256 else "—",
+            _copy("group"): entry.proposed_course_group,
+            _copy("reason"): entry.safe_message
             or entry.failure_code
             or entry.inclusion_reason
-            or entry.state.value.replace("_", " "),
+            or _state_label(entry.state),
         }
         for entry in manifest.items
     ]
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
 
     for entry in manifest.items:
         with st.expander(entry.relative_path):
             included = st.checkbox(
-                "Include this path",
+                _copy("include_path"),
                 value=entry.included,
                 key=f"workspace-include-{entry.entry_id}",
                 disabled=not state.can_edit_inclusion,
@@ -396,8 +436,10 @@ def _render_manifest_controls(
                     st.rerun()
             authority = subtree_authority(approval_manifest.items, entry)
             if authority is not None and st.button(
-                "Apply inclusion to "
-                f"{authority.relative_prefix or 'workspace root'}",
+                _copy(
+                    "apply_inclusion",
+                    path=authority.relative_prefix or _copy("workspace_root"),
+                ),
                 key=f"workspace-subtree-{entry.entry_id}",
                 disabled=not state.can_edit_inclusion,
             ):
@@ -416,7 +458,7 @@ def _render_manifest_controls(
                 else:
                     st.rerun()
 
-    if st.button("Approve current draft", disabled=not state.can_approve):
+    if st.button(_copy("approve_draft"), disabled=not state.can_approve):
         try:
             client.approve_workspace(
                 workspace.workspace_id, workspace.current_draft_revision_id or ""
@@ -426,13 +468,13 @@ def _render_manifest_controls(
         else:
             st.rerun()
 
-    with st.expander("Delete workspace"):
+    with st.expander(_copy("delete_workspace")):
         confirmation = st.text_input(
-            f"Type {workspace.display_name} to delete this workspace",
+            _copy("delete_workspace_confirmation", name=workspace.display_name),
             key=f"delete-workspace-confirmation-{workspace.workspace_id}",
         )
         if st.button(
-            "Delete workspace",
+            _copy("delete_workspace"),
             disabled=not state.can_delete or confirmation != workspace.display_name,
             key=f"delete-workspace-{workspace.workspace_id}",
         ):
@@ -447,28 +489,28 @@ def _render_manifest_controls(
 
 def render_workspace_panel(client: WorkerClient) -> str | None:
     """Render course workspace controls and return the selected public workspace ID."""
-    st.header("Course workspace")
-    if st.button("Choose course folder", type="primary"):
+    st.header(_copy("workspace_title"))
+    if st.button(_copy("choose_folder"), type="primary"):
         try:
             job = client.select_folder(str(uuid4()))
         except WorkerClientError:
             _safe_workspace_error()
         else:
             if job is None:
-                st.info("No course folder was selected.")
+                st.info(_copy("no_folder_selected"))
             else:
                 _start_job(job)
 
-    with st.expander("Development fallback: upload a course directory"):
+    with st.expander(_copy("upload_fallback")):
         uploaded_files = st.file_uploader(
-            "Upload a course directory",
+            _copy("upload_directory"),
             accept_multiple_files="directory",
             max_upload_size=1024,
             key="workspace_directory_upload",
         )
-        st.text_input("Course directory display name", key="workspace_upload_name")
+        st.text_input(_copy("directory_display_name"), key="workspace_upload_name")
         if st.button(
-            "Create uploaded workspace", disabled=not uploaded_files
+            _copy("create_uploaded_workspace"), disabled=not uploaded_files
         ):
             _upload_directory(client, uploaded_files)
 
@@ -480,13 +522,13 @@ def render_workspace_panel(client: WorkerClient) -> str | None:
         _safe_workspace_error()
         return None
     if not workspaces:
-        st.info("Choose a course folder to create a workspace.")
+        st.info(_copy("choose_folder_empty"))
         return None
 
     workspace_by_id = {item.workspace_id: item for item in workspaces}
     prior = st.session_state.get("selected_workspace_id")
     selected_id = st.selectbox(
-        "Course workspace",
+        _copy("workspace_select"),
         options=list(workspace_by_id),
         index=list(workspace_by_id).index(prior) if prior in workspace_by_id else 0,
         format_func=lambda workspace_id: workspace_by_id[workspace_id].display_name,
@@ -496,12 +538,18 @@ def render_workspace_panel(client: WorkerClient) -> str | None:
         workspace = client.get_workspace(selected_id)
         all_entries = load_complete_manifest(client, selected_id)
         source_filter = st.selectbox(
-            "Filter source state",
+            _copy("filter_source_state"),
             options=[None, *SourceState],
-            format_func=lambda value: "All states" if value is None else value.value,
+            format_func=lambda value: (
+                _copy("all_states") if value is None else _state_label(value)
+            ),
         )
         courses = sorted({entry.proposed_course_group for entry in all_entries})
-        course_filter = st.selectbox("Filter course group", options=[None, *courses])
+        course_filter = st.selectbox(
+            _copy("filter_course_group"),
+            options=[None, *courses],
+            format_func=lambda value: _copy("all_groups") if value is None else value,
+        )
         filtered_entries = tuple(
             entry
             for entry in all_entries
@@ -517,7 +565,7 @@ def render_workspace_panel(client: WorkerClient) -> str | None:
             // MANIFEST_DISPLAY_PAGE_SIZE,
         )
         page_number = st.selectbox(
-            "Manifest page", options=list(range(1, page_count + 1))
+            _copy("manifest_page"), options=list(range(1, page_count + 1))
         )
         display_offset = (page_number - 1) * MANIFEST_DISPLAY_PAGE_SIZE
         manifest = ManifestPage(
@@ -541,12 +589,12 @@ def render_workspace_panel(client: WorkerClient) -> str | None:
         return selected_id
     _render_manifest_controls(client, workspace, manifest, approval_manifest)
 
-    with st.expander("Delete all workspaces"):
+    with st.expander(_copy("delete_all")):
         confirmation = st.text_input(
-            "Type DELETE ALL to delete every workspace", key="delete-all-workspaces"
+            _copy("delete_all_confirmation"), key="delete-all-workspaces"
         )
         if st.button(
-            "Delete all workspaces",
+            _copy("delete_all"),
             disabled=(
                 confirmation != "DELETE ALL"
                 or not can_delete_all_workspaces(workspaces)

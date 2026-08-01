@@ -83,6 +83,7 @@ class SourcePartPlan(EvidenceFrozenModel):
     priority: int = Field(ge=0)
     state: PartState
     idempotency_key: str
+    safe_error_code: str | None = None
 
     @field_validator("relative_path")
     @classmethod
@@ -93,6 +94,13 @@ class SourcePartPlan(EvidenceFrozenModel):
     @classmethod
     def validate_locator(cls, value: str) -> str:
         return validate_safe_evidence_text(value)
+
+    @field_validator("safe_error_code")
+    @classmethod
+    def validate_safe_error_code(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"[a-z][a-z0-9_]{0,119}", value) is None:
+            raise ValueError("safe error code must be a bounded stable code")
+        return value
 
 
 class EvidenceCitation(EvidenceFrozenModel):
@@ -140,11 +148,14 @@ class CoverageItem(EvidenceFrozenModel):
     approved_bytes: int = Field(default=0, ge=0)
     planned_part_count: int = Field(default=0, ge=0)
     processed_part_count: int = Field(default=0, ge=0)
+    running_part_count: int = Field(default=0, ge=0)
     pending_part_count: int = Field(default=0, ge=0)
     retrying_part_count: int = Field(default=0, ge=0)
     failed_part_count: int = Field(default=0, ge=0)
     invalidated_part_count: int = Field(default=0, ge=0)
     processed_locators: tuple[str, ...] = ()
+    current_locator: str | None = None
+    failure_codes: tuple[str, ...] = ()
     last_successful_evidence_at: datetime | None = None
     influenced_current_snapshot: bool = False
     next_action: Literal[
@@ -176,12 +187,27 @@ class CoverageItem(EvidenceFrozenModel):
             raise ValueError("processed locators must be unique")
         return tuple(validate_safe_evidence_text(item) for item in value)
 
+    @field_validator("current_locator")
+    @classmethod
+    def validate_current_locator(cls, value: str | None) -> str | None:
+        return None if value is None else validate_safe_evidence_text(value)
+
+    @field_validator("failure_codes")
+    @classmethod
+    def validate_failure_codes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value) or any(
+            re.fullmatch(r"[a-z][a-z0-9_]{0,119}", item) is None for item in value
+        ):
+            raise ValueError("failure codes must be unique bounded stable codes")
+        return value
+
     @model_validator(mode="after")
     def validate_entry_ledger(self) -> CoverageItem:
         if self.entry_id is None:
             return self
         counts = (
             self.processed_part_count
+            + self.running_part_count
             + self.pending_part_count
             + self.retrying_part_count
             + self.failed_part_count
@@ -207,6 +233,7 @@ class CoverageSummary(EvidenceFrozenModel):
     approved_bytes: int = Field(default=0, ge=0)
     part_total_count: int = Field(default=0, ge=0)
     part_processed_count: int = Field(default=0, ge=0)
+    part_running_count: int = Field(default=0, ge=0)
     part_pending_count: int = Field(default=0, ge=0)
     part_retrying_count: int = Field(default=0, ge=0)
     part_failed_count: int = Field(default=0, ge=0)
@@ -244,6 +271,9 @@ class CoverageSummary(EvidenceFrozenModel):
                 "part_processed_count": sum(
                     item.processed_part_count for item in self.items
                 ),
+                "part_running_count": sum(
+                    item.running_part_count for item in self.items
+                ),
                 "part_pending_count": sum(item.pending_part_count for item in self.items),
                 "part_retrying_count": sum(
                     item.retrying_part_count for item in self.items
@@ -256,6 +286,15 @@ class CoverageSummary(EvidenceFrozenModel):
             if any(getattr(self, name) != count for name, count in exact.items()):
                 raise ValueError("coverage summary part and byte totals must be exact")
         return self
+
+
+class EvidenceStatus(EvidenceFrozenModel):
+    workspace_id: str
+    revision_id: str | None = None
+    approval_required: bool
+    prior_approval_exists: bool = False
+    approved_source_count: int = Field(default=0, ge=0)
+    approved_bytes: int = Field(default=0, ge=0)
 
 
 class CourseGroup(EvidenceFrozenModel):
@@ -354,12 +393,24 @@ class StudyMapSnapshot(EvidenceFrozenModel):
     created_at: datetime
     course_groups: tuple[CourseGroup, ...] = ()
     limitations: tuple[str, ...] = ()
+    citations: tuple[EvidenceCitation, ...] = ()
+    response_language: str | None = Field(default=None, max_length=40)
     superseded_snapshot_id: str | None = None
 
     @field_validator("limitations")
     @classmethod
     def validate_limitations(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(validate_safe_evidence_text(item.strip()) for item in value if item.strip())
+
+    @field_validator("response_language")
+    @classmethod
+    def validate_response_language(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("response language must not be empty")
+        return validate_safe_evidence_text(normalized)
 
     @model_validator(mode="after")
     def validate_initial_dependencies(self) -> StudyMapSnapshot:
@@ -369,6 +420,13 @@ class StudyMapSnapshot(EvidenceFrozenModel):
             raise ValueError("initial snapshots require coverage and evidence dependencies")
         if len(set(self.evidence_unit_ids)) != len(self.evidence_unit_ids):
             raise ValueError("evidence dependencies must be unique")
+        citation_ids = tuple(item.citation_id for item in self.citations)
+        if len(set(citation_ids)) != len(citation_ids):
+            raise ValueError("snapshot citation IDs must be unique")
+        if self.citations and {
+            item.evidence_unit_id for item in self.citations
+        } != set(self.evidence_unit_ids):
+            raise ValueError("snapshot citations must match evidence dependencies")
         node_ids = tuple(node.node_id for node in self.nodes)
         if len(set(node_ids)) != len(node_ids):
             raise ValueError("knowledge-node IDs must be unique")

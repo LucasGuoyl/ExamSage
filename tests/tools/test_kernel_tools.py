@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
+from exam_predictor.tools.kernel import (
+    KernelPlanner,
+    KernelToolRegistry,
+    _response_language,
+)
 
 
 class FakeProvider:
@@ -144,6 +148,21 @@ def test_describe_capabilities_returns_provider_metadata_without_calling_provide
     )
 
     assert result.tool == "describe_capabilities"
-    assert "Course folders and academic tools arrive in the next subprojects." in result.content
+    assert "Course evidence tools are unavailable in this session." in result.content
     assert result.metadata == {"provider": "fake", "capabilities": ["chat"]}
     assert provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("请用中文回答", "zh-CN"),
+        ("请使用简体中文生成学习图谱", "zh-CN"),
+        ("分析课程来源并生成学习图谱", "zh-CN"),
+        ("Answer in English", "en"),
+        ("请用英文回答", "en"),
+        ("Answer in French", "french"),
+    ],
+)
+def test_response_language_follows_explicit_message_language(message, expected):
+    assert _response_language(message) == expected

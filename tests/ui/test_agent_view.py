@@ -16,6 +16,7 @@ from exam_predictor.runtime.models import (
     RunStatus,
     SubmitMessageResponse,
 )
+from exam_predictor.evidence.models import EvidenceStatus
 from exam_predictor.workspace.models import (
     ManifestPage,
     SourceMode,
@@ -63,6 +64,7 @@ class FakeWorkerClient:
         self.fail_health_after_connect = False
         self.connected_keys: list[str] = []
         self.after_values: list[int] = []
+        self.event_attempts = 0
         self.stop_calls = 0
         self.resume_calls = 0
         self.submit_calls = 0
@@ -106,6 +108,7 @@ class FakeWorkerClient:
         )
 
     def events_after(self, _run_id: str, after: int = 0) -> list[AgentEvent]:
+        self.event_attempts += 1
         if self.events_error:
             raise self.events_error
         self.after_values.append(after)
@@ -138,6 +141,20 @@ class FakeWorkerClient:
 
     def list_saved_providers(self):
         return []
+
+    def get_evidence_coverage(self, _workspace_id: str):
+        raise WorkerClientError('{"detail":"evidence_not_ready"}')
+
+    def get_evidence_status(self, _workspace_id: str):
+        return EvidenceStatus(
+            workspace_id=self.workspace.workspace_id,
+            revision_id=self.workspace.current_draft_revision_id,
+            approval_required=True,
+            prior_approval_exists=False,
+        )
+
+    def get_current_evidence_snapshot(self, _workspace_id: str):
+        raise WorkerClientError('{"detail":"evidence_not_ready"}')
 
 
 def button(app: AppTest, label: str):
@@ -185,6 +202,19 @@ def test_event_reducer_tracks_pause_failure_and_resume_epochs():
 
     reduce_agent_events(state, [event(3, EventType.FAILED, "Provider failed")])
     assert state.settled and not state.paused and state.failed
+
+
+def test_event_reducer_marks_only_evidence_stage_runs_as_evidence_activity():
+    tutor = reduce_agent_events(
+        AgentViewState(),
+        [event(1, EventType.PAUSED, "Tutor paused")],
+    )
+    evidence_event = event(1, EventType.PROGRESS, "Analyzing")
+    evidence_event.stage = "evidence"
+    evidence = reduce_agent_events(AgentViewState(), [evidence_event])
+
+    assert not tutor.is_evidence_run
+    assert evidence.is_evidence_run
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -520,3 +550,84 @@ def test_submit_uses_the_selected_workspace_id_without_a_ui_thread_id(monkeypatc
     assert fake.last_submit_request is not None
     assert fake.last_submit_request.workspace_id == fake.workspace.workspace_id
     assert fake.last_submit_request.thread_id == "default"
+
+
+def test_switching_to_simplified_chinese_persists_without_provider_or_run_calls(
+    monkeypatch,
+):
+    fake = FakeWorkerClient()
+    monkeypatch.setattr(agent_view, "_new_client", lambda: fake)
+    academic_artifact = {"snapshot_id": "snapshot-1", "title": "Limits"}
+    app = AppTest.from_string(VIEW_SCRIPT)
+    app.session_state["academic_artifact"] = academic_artifact
+    app.run()
+
+    language = next(
+        item for item in app.selectbox if item.label == "Interface language"
+    )
+    language.set_value("zh-CN")
+    app.run()
+
+    assert app.session_state["ui_language"] == "zh-CN"
+    assert app.session_state["academic_artifact"] == academic_artifact
+    assert fake.connected_keys == []
+    assert fake.submit_calls == 0
+    assert app.title[0].value == "🎓 ExamSage"
+    assert any(item.label == "选择课程文件夹" for item in app.button)
+    assert any(item.label == "连接" for item in app.button)
+    assert app.chat_input[0].placeholder == "向 ExamSage 提问…"
+
+
+def test_active_run_polling_is_bounded_until_manual_refresh(monkeypatch):
+    fake = FakeWorkerClient()
+    monkeypatch.setattr(agent_view, "_new_client", lambda: fake)
+    monkeypatch.setattr(agent_view, "AGENT_ACTIVITY_MAX_POLLS", 1)
+    app = AppTest.from_string(VIEW_SCRIPT)
+    app.session_state["agent_messages"] = []
+    app.session_state["agent_active_run_id"] = "run-1"
+    app.session_state["agent_provider"] = {
+        "profile": {"profile_id": "primary", "provider": "gemini"},
+        "capabilities": {"chat": True},
+    }
+    app.run()
+    polls_at_limit = len(fake.after_values)
+
+    app.run()
+
+    assert len(fake.after_values) == polls_at_limit
+    assert any("Live updates paused" in item.value for item in app.info)
+    button(app, "Refresh activity").click()
+    app.run()
+    assert len(fake.after_values) > polls_at_limit
+
+
+def test_worker_errors_also_consume_the_bounded_poll_budget(monkeypatch):
+    fake = FakeWorkerClient()
+    fake.events_error = WorkerClientError("worker unavailable")
+    monkeypatch.setattr(agent_view, "_new_client", lambda: fake)
+    monkeypatch.setattr(agent_view, "AGENT_ACTIVITY_MAX_POLLS", 1)
+    app = AppTest.from_string(VIEW_SCRIPT)
+    app.session_state["agent_messages"] = []
+    app.session_state["agent_active_run_id"] = "run-1"
+    app.session_state["agent_provider"] = {
+        "profile": {"profile_id": "primary", "provider": "gemini"},
+        "capabilities": {"chat": True},
+    }
+    app.run()
+    attempts_at_limit = fake.event_attempts
+
+    app.run()
+
+    assert attempts_at_limit == 1
+    assert fake.event_attempts == attempts_at_limit
+    assert any("Live updates paused" in item.value for item in app.info)
+
+
+def test_retry_message_preserves_snapshot_language_independent_of_ui_language():
+    state = {"agent_academic_language": "zh-CN"}
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(agent_view.st, "session_state", state)
+        prompt, language = agent_view._retry_message("en")
+
+    assert language == "en"
+    assert "respond in English" in prompt

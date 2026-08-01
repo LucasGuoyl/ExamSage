@@ -508,6 +508,75 @@ class EvidenceStore:
             raise KeyError(f"Evidence part '{part_id}' was not found.")
         return int(row["attempt_count"])
 
+    def latest_part_error_codes(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> dict[str, str]:
+        """Return only stable error codes from each part's latest recorded attempt."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT attempts.part_id, attempts.safe_error_code
+                   FROM evidence_attempts AS attempts
+                   JOIN evidence_parts AS parts ON parts.part_id = attempts.part_id
+                   JOIN (
+                     SELECT part_id, MAX(attempt_number) AS attempt_number
+                     FROM evidence_attempts GROUP BY part_id
+                   ) AS latest
+                     ON latest.part_id = attempts.part_id
+                    AND latest.attempt_number = attempts.attempt_number
+                   WHERE parts.workspace_id = ? AND parts.revision_id = ?
+                     AND attempts.safe_error_code IS NOT NULL""",
+                (workspace_id, revision_id),
+            ).fetchall()
+        return {
+            str(row["part_id"]): str(row["safe_error_code"])
+            for row in rows
+        }
+
+    def retry_failed_parts(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> tuple[str, ...]:
+        """Requeue provider failures and discard synthetic preparation failures."""
+        now = self._timestamp(self._now())
+        with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(workspace_id)}",),
+            ).fetchone()
+            if current is None or current["value"] != revision_id:
+                return ()
+            rows = connection.execute(
+                """SELECT part_id, attempt_count FROM evidence_parts
+                   WHERE workspace_id = ? AND revision_id = ? AND state = ?
+                   ORDER BY priority ASC, ordinal ASC, part_id ASC""",
+                (workspace_id, revision_id, PartState.FAILED.value),
+            ).fetchall()
+            part_ids = tuple(str(row["part_id"]) for row in rows)
+            preparation_failures = tuple(
+                str(row["part_id"]) for row in rows if int(row["attempt_count"]) == 0
+            )
+            provider_failures = tuple(
+                str(row["part_id"]) for row in rows if int(row["attempt_count"]) > 0
+            )
+            if preparation_failures:
+                placeholders = ",".join("?" for _ in preparation_failures)
+                connection.execute(
+                    f"DELETE FROM evidence_parts WHERE part_id IN ({placeholders})",
+                    preparation_failures,
+                )
+            if provider_failures:
+                placeholders = ",".join("?" for _ in provider_failures)
+                connection.execute(
+                    f"""UPDATE evidence_parts
+                        SET state = ?, next_attempt_at = NULL, updated_at = ?
+                        WHERE part_id IN ({placeholders})""",
+                    (PartState.PREPARED.value, now, *provider_failures),
+                )
+        return part_ids
+
     def part_state_counts(
         self,
         workspace_id: str,

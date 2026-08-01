@@ -739,6 +739,44 @@ def test_coverage_keeps_approved_entries_that_have_no_prepared_part(tmp_path: Pa
     assert omitted.next_action == "prepare"
 
 
+def test_coverage_exposes_only_the_latest_stable_failure_reason_and_locator(
+    tmp_path: Path,
+):
+    plan = _plan("coverage-failure", priority=0)
+    store, artifacts = _seed(tmp_path, (plan,))
+    store.mark_running(
+        plan.part_id,
+        attempt=1,
+        expected_state=PartState.PREPARED,
+    )
+    store.record_attempt(
+        plan.part_id,
+        attempt=1,
+        route="primary",
+        outcome=PartState.FAILED,
+        started_at=NOW,
+        finished_at=NOW,
+        safe_error_code="office_conversion_failed",
+        claim_token=store.publication_token(plan.part_id),
+    )
+    builder = StudyMapBuilder(
+        store,
+        artifacts,
+        _Synthesizer(),
+        coverage_source=_coverage_source((plan,)),
+        now=lambda: NOW,
+    )
+    try:
+        summary = builder.coverage(WORKSPACE_ID, REVISION_ID)
+    finally:
+        artifacts.close()
+        store.close()
+
+    item = summary.items[0]
+    assert item.failure_codes == ("office_conversion_failed",)
+    assert item.current_locator == "pages 1-2"
+
+
 def test_complete_snapshot_refuses_an_approved_entry_without_a_terminal_part(
     tmp_path: Path,
 ):

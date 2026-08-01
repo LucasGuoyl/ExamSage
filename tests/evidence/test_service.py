@@ -10,7 +10,10 @@ import pytest
 
 from exam_predictor.evidence.artifacts import ArtifactCleanupState, EvidenceArtifactStore
 from exam_predictor.evidence.policy import EvidencePolicy
-from exam_predictor.evidence.preparation import SourcePartPreparer
+from exam_predictor.evidence.preparation import (
+    SourcePartPreparer,
+    SourcePreparationError,
+)
 from exam_predictor.evidence.providers import (
     AnalyzeSourcePartRequest,
     EvidencePartResult,
@@ -592,6 +595,101 @@ def test_inspection_does_not_read_or_transmit_unapproved_sources(
         assert inspection.coverage is None
         assert gate.descriptors == []
         assert provider.requests == []
+    finally:
+        artifacts.close()
+        evidence_store.close()
+
+
+def test_explicit_second_build_retries_a_terminal_provider_failure(
+    tmp_path: Path,
+    workspace_store: WorkspaceStore,
+):
+    _workspace(workspace_store, tmp_path, {"notes.txt": b"approved evidence"})
+    failing = True
+
+    def fail_while_enabled(_call_number, _request):
+        if failing:
+            raise RuntimeError("safe validation boundary")
+
+    provider = RecordingProvider(on_call=fail_while_enabled)
+    service, _gate, evidence_store, artifacts = _service(
+        tmp_path,
+        workspace_store,
+        provider,
+    )
+    try:
+        first = service.build_study_map(WORKSPACE_ID, "run_failed_first")
+        assert first.status == "complete"
+        first_inspection = service.inspect(WORKSPACE_ID)
+        assert first_inspection.coverage is not None
+        assert first_inspection.coverage.part_failed_count == 1
+        assert first_inspection.coverage.items[0].failure_codes == (
+            "evidence_validation_failed",
+        )
+        assert first.snapshot is not None
+        first_snapshot_id = first.snapshot.snapshot_id
+        calls_after_failure = len(provider.requests)
+
+        failing = False
+        second = service.build_study_map(WORKSPACE_ID, "run_failed_retry")
+        assert second.status == "complete"
+        second_inspection = service.inspect(WORKSPACE_ID)
+        assert second_inspection.coverage is not None
+        assert second_inspection.coverage.part_failed_count == 0
+        assert second_inspection.coverage.part_processed_count == 1
+        assert len(provider.requests) == calls_after_failure + 1
+        assert second.snapshot is not None
+        assert second.snapshot.snapshot_id != first_snapshot_id
+        assert len(second.snapshot.evidence_unit_ids) == 1
+        assert len(second.snapshot.citations) == 1
+        assert second.snapshot.coverage is not None
+        assert second.snapshot.coverage.part_processed_count == 1
+        assert second.snapshot.coverage.part_failed_count == 0
+    finally:
+        artifacts.close()
+        evidence_store.close()
+
+
+def test_explicit_second_build_reprepares_a_terminal_converter_failure(
+    tmp_path: Path,
+    workspace_store: WorkspaceStore,
+):
+    _workspace(workspace_store, tmp_path, {"notes.txt": b"approved evidence"})
+    provider = RecordingProvider()
+    service, _gate, evidence_store, artifacts = _service(
+        tmp_path,
+        workspace_store,
+        provider,
+    )
+    original = service._preparer
+
+    class FailOncePreparer:
+        calls = 0
+
+        def prepare(self, request, stream):
+            self.calls += 1
+            if self.calls == 1:
+                raise SourcePreparationError("converter_failed", "source")
+            return original.prepare(request, stream)
+
+    service._preparer = FailOncePreparer()
+    try:
+        first = service.build_study_map(WORKSPACE_ID, "run_prepare_failed")
+        assert first.status == "complete"
+        first_inspection = service.inspect(WORKSPACE_ID)
+        assert first_inspection.coverage is not None
+        assert first_inspection.coverage.items[0].failure_codes == (
+            "converter_failed",
+        )
+        assert provider.requests == []
+
+        second = service.build_study_map(WORKSPACE_ID, "run_prepare_retry")
+        assert second.status == "complete"
+        second_inspection = service.inspect(WORKSPACE_ID)
+        assert second_inspection.coverage is not None
+        assert second_inspection.coverage.part_failed_count == 0
+        assert second_inspection.coverage.part_processed_count == 1
+        assert len(provider.requests) == 1
     finally:
         artifacts.close()
         evidence_store.close()

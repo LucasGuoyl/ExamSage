@@ -142,8 +142,8 @@ class KernelToolRegistry:
                 return ToolResult(
                     tool=tool,
                     content=(
-                        "This Agent can currently chat and demonstrate durable tool execution. "
-                        "Course folders and academic tools arrive in the next subprojects."
+                        "This Agent can chat and run durable tools. Course evidence tools "
+                        "are unavailable in this session."
                     ),
                     metadata={"provider": provider.name, "capabilities": enabled},
                 )
@@ -174,8 +174,9 @@ class KernelToolRegistry:
                 {
                     "role": "system",
                     "content": (
-                        "You are the ExamSage kernel tutor. Answer clearly, state uncertainty, and do not "
-                        "claim access to course files until the source-workspace tools are available."
+                        "You are the ExamSage tutor. Answer clearly and state uncertainty. "
+                        "Do not claim that you inspected course files in a tutor-only response; "
+                        "course-file claims must come from cited evidence-tool results."
                     ),
                 },
                 *conversation,

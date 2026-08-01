@@ -11,6 +11,7 @@ import pytest
 from exam_predictor.evidence.models import (
     CoverageItem,
     CoverageSummary,
+    EvidenceStatus,
     KnowledgeNode,
     SnapshotStatus,
     StudyMapSnapshot,
@@ -150,12 +151,24 @@ async def test_evidence_routes_return_typed_public_models(evidence_client):
         f"/v1/workspaces/{WORKSPACE_ID}/evidence/snapshots/current",
         headers=headers,
     )
+    status = await client.get(
+        f"/v1/workspaces/{WORKSPACE_ID}/evidence/status",
+        headers=headers,
+    )
 
-    assert coverage.status_code == snapshot.status_code == 200
+    assert coverage.status_code == snapshot.status_code == status.status_code == 200
     assert CoverageSummary.model_validate(coverage.json()) == service.coverage
     assert StudyMapSnapshot.model_validate(snapshot.json()) == service.snapshot
-    assert service.calls == [WORKSPACE_ID, WORKSPACE_ID]
-    serialized = coverage.text + snapshot.text
+    assert EvidenceStatus.model_validate(status.json()) == EvidenceStatus(
+        workspace_id=WORKSPACE_ID,
+        revision_id="revision-1",
+        approval_required=False,
+        prior_approval_exists=False,
+        approved_source_count=1,
+        approved_bytes=12,
+    )
+    assert service.calls == [WORKSPACE_ID, WORKSPACE_ID, WORKSPACE_ID]
+    serialized = coverage.text + snapshot.text + status.text
     assert "canonical_root" not in serialized
     assert "content_bytes" not in serialized
 
@@ -165,6 +178,7 @@ async def test_evidence_routes_return_typed_public_models(evidence_client):
     [
         "/v1/workspaces/private%2Fid/evidence/coverage",
         "/v1/workspaces/private%2Fid/evidence/snapshots/current",
+        "/v1/workspaces/private%2Fid/evidence/status",
     ],
 )
 async def test_evidence_routes_authenticate_before_service_access(
@@ -238,12 +252,22 @@ async def test_evidence_routes_report_missing_public_state(evidence_client):
 def test_worker_client_returns_typed_evidence_models_and_quotes_workspace_id():
     coverage = _coverage()
     snapshot = _snapshot(coverage)
+    status = EvidenceStatus(
+        workspace_id=CLIENT_WORKSPACE_ID,
+        revision_id="revision-1",
+        approval_required=False,
+        prior_approval_exists=True,
+        approved_source_count=1,
+        approved_bytes=12,
+    )
     raw_paths: list[bytes] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         raw_paths.append(request.url.raw_path)
         if request.url.path.endswith("/evidence/coverage"):
             return httpx.Response(200, json=coverage.model_dump(mode="json"))
+        if request.url.path.endswith("/evidence/status"):
+            return httpx.Response(200, json=status.model_dump(mode="json"))
         if request.url.path.endswith("/evidence/snapshots/current"):
             return httpx.Response(200, json=snapshot.model_dump(mode="json"))
         raise AssertionError(request.url.path)
@@ -255,6 +279,7 @@ def test_worker_client_returns_typed_evidence_models_and_quotes_workspace_id():
     )
     try:
         assert client.get_evidence_coverage(CLIENT_WORKSPACE_ID) == coverage
+        assert client.get_evidence_status(CLIENT_WORKSPACE_ID) == status
         assert client.get_current_evidence_snapshot(CLIENT_WORKSPACE_ID) == snapshot
     finally:
         client.close()

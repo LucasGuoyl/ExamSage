@@ -9,7 +9,11 @@ from urllib.parse import quote, urlsplit
 import httpx
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from exam_predictor.evidence.models import CoverageSummary, StudyMapSnapshot
+from exam_predictor.evidence.models import (
+    CoverageSummary,
+    EvidenceStatus,
+    StudyMapSnapshot,
+)
 from .models import (
     AgentEvent,
     ConnectProviderRequest,
@@ -236,6 +240,13 @@ class WorkerClient:
             f"/v1/workspaces/{quote(workspace_id, safe='')}/evidence/coverage",
         )
         return self._model(response, CoverageSummary)
+
+    def get_evidence_status(self, workspace_id: str) -> EvidenceStatus:
+        response = self._request(
+            "GET",
+            f"/v1/workspaces/{quote(workspace_id, safe='')}/evidence/status",
+        )
+        return self._model(response, EvidenceStatus)
 
     def get_current_evidence_snapshot(
         self,

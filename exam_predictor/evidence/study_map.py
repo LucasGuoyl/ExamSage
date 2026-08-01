@@ -360,10 +360,6 @@ class StudyMapBuilder:
             return None
         self.recover_snapshot_revocations(workspace_id)
         current = self._store.current_snapshot(workspace_id, revision_id)
-        if current is not None and current.status is SnapshotStatus.COMPLETE:
-            with self._publication_context(publication_guard):
-                self._ensure_snapshot_artifact(current)
-            return current
         parts = self._store.list_parts(workspace_id, revision_id)
         if not parts or any(
             part.state not in {PartState.PROCESSED, PartState.FAILED} for part in parts
@@ -382,6 +378,22 @@ class StudyMapBuilder:
             for item in coverage.items
         ):
             return None
+        dependency_ids = tuple(sorted(unit.evidence_unit_id for unit in units))
+        if (
+            current is not None
+            and current.status is SnapshotStatus.COMPLETE
+            and current.coverage is not None
+            and _coverage_without_influence(current.coverage)
+            == _coverage_without_influence(coverage)
+            and current.evidence_unit_ids == dependency_ids
+            and (
+                response_language is None
+                or current.response_language == response_language
+            )
+        ):
+            with self._publication_context(publication_guard):
+                self._ensure_snapshot_artifact(current)
+            return current
         return self._publish(
             workspace_id,
             revision_id,
@@ -474,6 +486,7 @@ class StudyMapBuilder:
             parts,
             entries,
             self._store.latest_evidence_times(workspace_id, revision_id),
+            self._store.latest_part_error_codes(workspace_id, revision_id),
         )
 
     @staticmethod
@@ -513,6 +526,12 @@ class StudyMapBuilder:
         coverage = _mark_snapshot_influence(coverage, parts, units, payload)
         created_at = self._now()
         dependency_ids = tuple(sorted(payload.evidence_unit_ids))
+        units_by_id = {unit.evidence_unit_id: unit for unit in units}
+        citations = tuple(
+            citation
+            for evidence_unit_id in dependency_ids
+            for citation in units_by_id[evidence_unit_id].citations
+        )
         identity_payload = {
             "workspace_id": workspace_id,
             "revision_id": revision_id,
@@ -521,7 +540,9 @@ class StudyMapBuilder:
             "nodes": [node.model_dump(mode="json") for node in payload.nodes],
             "coverage": coverage.model_dump(mode="json"),
             "evidence_unit_ids": dependency_ids,
+            "citations": [item.model_dump(mode="json") for item in citations],
             "limitations": payload.limitations,
+            "response_language": response_language,
             "superseded_snapshot_id": superseded_snapshot_id,
         }
         snapshot_id = f"snapshot_{sha256(_canonical_json(identity_payload).encode()).hexdigest()}"
@@ -536,6 +557,8 @@ class StudyMapBuilder:
             created_at=created_at,
             course_groups=payload.course_groups,
             limitations=payload.limitations,
+            citations=citations,
+            response_language=response_language,
             superseded_snapshot_id=superseded_snapshot_id,
         )
         snapshot_document = snapshot.model_dump(mode="json")
@@ -803,6 +826,7 @@ def _part_coverage(
     parts: tuple[SourcePartPlan, ...],
     entries: tuple[ApprovedCoverageEntry, ...],
     latest_evidence_times: dict[str, datetime],
+    latest_error_codes: dict[str, str],
 ) -> CoverageSummary:
     if len({entry.entry_id for entry in entries}) != len(entries):
         raise EvidenceValidationError("study_map_invalid")
@@ -827,8 +851,10 @@ def _part_coverage(
                 PartState.PLANNED,
                 PartState.AUTHORIZED,
                 PartState.PREPARED,
-                PartState.RUNNING,
             }
+        )
+        running = tuple(
+            part for part in entry_parts if part.state is PartState.RUNNING
         )
         retrying = tuple(
             part for part in entry_parts if part.state is PartState.RETRY_WAIT
@@ -844,7 +870,7 @@ def _part_coverage(
             next_action = "reapprove"
         elif retrying:
             next_action = "resume"
-        elif pending:
+        elif running or pending:
             next_action = "analyze"
         elif failed:
             next_action = "retry"
@@ -864,11 +890,35 @@ def _part_coverage(
                 approved_bytes=entry.approved_bytes,
                 planned_part_count=len(entry_parts),
                 processed_part_count=len(processed),
+                running_part_count=len(running),
                 pending_part_count=len(pending),
                 retrying_part_count=len(retrying),
                 failed_part_count=len(failed),
                 invalidated_part_count=len(invalidated),
                 processed_locators=tuple(part.locator for part in processed),
+                current_locator=(
+                    next(
+                        (
+                            part.locator
+                            for part in (
+                                *running,
+                                *invalidated,
+                                *retrying,
+                                *pending,
+                                *failed,
+                                *processed[-1:],
+                            )
+                        ),
+                        None,
+                    )
+                ),
+                failure_codes=tuple(
+                    dict.fromkeys(
+                        latest_error_codes.get(part.part_id) or part.safe_error_code
+                        for part in (*retrying, *failed)
+                        if latest_error_codes.get(part.part_id) or part.safe_error_code
+                    )
+                ),
                 last_successful_evidence_at=(max(success_times) if success_times else None),
                 next_action=next_action,
             )
@@ -881,6 +931,7 @@ def _part_coverage(
         approved_bytes=sum(item.approved_bytes for item in item_tuple),
         part_total_count=sum(item.planned_part_count for item in item_tuple),
         part_processed_count=sum(item.processed_part_count for item in item_tuple),
+        part_running_count=sum(item.running_part_count for item in item_tuple),
         part_pending_count=sum(item.pending_part_count for item in item_tuple),
         part_retrying_count=sum(item.retrying_part_count for item in item_tuple),
         part_failed_count=sum(item.failed_part_count for item in item_tuple),
@@ -909,6 +960,17 @@ def _mark_snapshot_influence(
                         "influenced_current_snapshot": item.entry_id in influenced_entries
                     }
                 )
+                for item in coverage.items
+            )
+        }
+    )
+
+
+def _coverage_without_influence(coverage: CoverageSummary) -> CoverageSummary:
+    return coverage.model_copy(
+        update={
+            "items": tuple(
+                item.model_copy(update={"influenced_current_snapshot": False})
                 for item in coverage.items
             )
         }
