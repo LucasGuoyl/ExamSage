@@ -7,7 +7,7 @@
 - Parent design: `2026-07-17-langgraph-agent-design.md`
 - Dependency: completed secure course workspace at `90e1188`
 - Target platforms: Windows and macOS
-- User interface language: English
+- User interface languages: English and Simplified Chinese, switchable at runtime
 
 ## 1. Purpose
 
@@ -309,6 +309,8 @@ credentials, signed URLs, and raw exception messages.
 
 Before the final three-pane redesign, the functional Agent page adds:
 
+- shared English/Simplified-Chinese copy keys for every evidence-engine control and state introduced here,
+  with the interface preference persisted locally;
 - a `Build study map` chat action driven through the normal message box;
 - per-workspace file and part coverage;
 - current source/locator, processed count, pending count, retry count, and failures;
@@ -318,6 +320,8 @@ Before the final three-pane redesign, the functional Agent page adds:
 - no estimate page, dollar ceiling, or `Build my ExamSage agent` button in Agent mode.
 
 The UI never claims a file was read merely because it was discovered or approved.
+Generated study-map prose follows the current user-message language unless that message explicitly requests
+another output language; switching interface language does not rewrite or silently regenerate artifacts.
 
 ## 13. Error and recovery model
 

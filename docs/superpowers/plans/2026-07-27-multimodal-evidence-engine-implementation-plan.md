@@ -25,6 +25,9 @@
 - Agent study-map work must not call `ExamSageAgent.build_course()`.
 - Use TDD for every task, run the stated focused gate, request an independent review after each task, and make one focused commit per accepted task.
 - Do not implement Subproject 4 web/practice/rubric/export work or Subproject 5 final layout in this plan.
+- Every new evidence-engine UI string must use shared English/Simplified-Chinese copy keys. Persist the UI
+  language locally, and keep generated-content language tied to the current user message unless explicitly
+  overridden.
 
 ---
 
@@ -723,32 +726,39 @@ git commit -m "feat: expose evidence engine through local worker"
 ## Task 12: Functional progressive evidence UI
 
 **Files:**
+- Create: `exam_predictor/ui/i18n.py`
 - Create: `exam_predictor/ui/evidence_view.py`
 - Modify: `exam_predictor/ui/agent_view.py`
 - Modify: `exam_predictor/ui/workspace_view.py`
+- Create: `tests/ui/test_i18n.py`
 - Create: `tests/ui/test_evidence_view.py`
 - Modify: `tests/ui/test_agent_view.py`
 - Modify: `tests/ui/test_workspace_view.py`
 
 **Interfaces:**
-- Consumes: Task 11 client coverage/snapshot methods and existing durable run events.
-- Produces: visible file/part coverage, activity, initial/final snapshot, safe actions, and no indefinite spinner.
+- Consumes: Task 11 client coverage/snapshot methods, existing durable run events, and the persisted UI
+  language preference.
+- Produces: switchable English/Simplified-Chinese copy, visible file/part coverage, activity, initial/final
+  snapshot, safe actions, and no indefinite spinner. Generated academic prose continues to follow the
+  current user-message language unless explicitly overridden.
 
 - [ ] **Step 1: Write failing state-projection tests**
 
 Test zero-data, preparing, analyzing, retrying, paused, partial initial, complete, changed approval, converter
-failure, and provider-capacity states. Verify displayed counts match the complete server coverage, not the
-current manifest page.
+failure, and provider-capacity states in both supported interface languages. Verify every copy key is complete,
+the selected UI language persists, changing it does not mutate stored academic artifacts, and displayed counts
+match the complete server coverage rather than the current manifest page.
 
 - [ ] **Step 2: Verify RED**
 
-Run: `.\.venv\Scripts\python.exe -m pytest tests/ui/test_evidence_view.py -q`
+Run: `.\.venv\Scripts\python.exe -m pytest tests/ui/test_i18n.py tests/ui/test_evidence_view.py -q`
 
 - [ ] **Step 3: Implement functional renderer**
 
-Show file and part progress, current relative source/locator, initial-map coverage banner, chapter tree,
-evidence citations, limitations, failed-source reasons, Stop, Resume, Rescan/Reapprove, and Retry actions.
-Polling remains bounded and offers manual Refresh after the cap.
+Implement the shared copy catalog and persisted language preference, then show file and part progress, current
+relative source/locator, initial-map coverage banner, chapter tree, evidence citations, limitations,
+failed-source reasons, Stop, Resume, Rescan/Reapprove, and Retry actions. Polling remains bounded and offers
+manual Refresh after the cap. UI-language changes never trigger provider calls or artifact regeneration.
 
 - [ ] **Step 4: Remove misleading Agent-alpha capability copy**
 

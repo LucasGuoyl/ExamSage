@@ -1,11 +1,11 @@
 # ExamSage LangGraph Agent Design
 
-- Status: Approved interactive design; pending written-spec review
+- Status: Approved; amended 2026-08-01 for bilingual UI and response-language behavior
 - Date: 2026-07-17
 - Product name: ExamSage
 - Target repository: `ExamSage`
 - Target platforms: Windows and macOS
-- User interface language: English
+- User interface languages: English and Simplified Chinese, switchable at runtime
 
 ## 1. Executive summary
 
@@ -36,7 +36,7 @@ ExamSage turns these sources into an evidence-aware revision workspace and remai
 
 - Undergraduate students worldwide.
 - Mathematics, physics, chemistry, biology, engineering, computing, humanities, business, law, language and interdisciplinary courses.
-- Users with English UI expectations, including users whose source material is multilingual.
+- Users who prefer English or Simplified Chinese UI, including users whose source material is multilingual.
 - Users who want a downloadable open-source application and will supply and pay for their own provider API usage.
 
 ### 2.3 Product promise
@@ -164,6 +164,10 @@ The UI never calls the provider directly. The Worker retrieves the key at execut
 - Left: course workspaces, paused/running state and creation controls.
 - Centre: GPT-like conversation, directory attachment/selection, compact progress messages, approval cards and Stop/Resume controls.
 - Right: source coverage, Agent activity, chapter tree, exam priorities, practice bank, citations and exports.
+- The user can switch the complete interface between English and Simplified Chinese; the preference is
+  persisted locally and is independent of the provider or course language.
+- Generated academic content follows the language of the current user message by default. The user may
+  explicitly request another language without changing the interface language.
 
 Details are expandable. The chat shows concise stages rather than verbose internal reasoning.
 
@@ -643,7 +647,10 @@ Acceptance: request-specific tools run without rebuilding unrelated artifacts, a
 
 ### Subproject 5: Three-pane product experience
 
-Deliver English onboarding, course sidebar, chat, source and activity inspector, chapter/practice/export panels, queued messages, Stop/Resume, progressive results and actionable errors.
+Deliver switchable English/Simplified-Chinese onboarding, course sidebar, chat, source and activity
+inspector, chapter/practice/export panels, queued messages, Stop/Resume, progressive results and actionable
+errors. Persist the interface preference locally while keeping generated-content language driven by the
+current user message unless explicitly overridden.
 
 Acceptance: a new user completes a revision task from one key and one folder without terminal use or manual debugging.
 
@@ -700,7 +707,9 @@ No unresolved product choices remain in this master specification. File-level im
 - Multi-course folders create separate workspaces plus an unclassified group.
 - New messages queue during an active run; Stop is explicit.
 - Results are progressive.
-- The UI uses the selected three-pane layout and English text.
+- The UI uses the selected three-pane layout with runtime-switchable English and Simplified Chinese text.
+- Generated academic content follows the current user-message language unless the user explicitly chooses
+  another output language; interface language never silently overrides that choice.
 - Audio and video remain out of scope.
 - The current fixed pipeline is a temporary hidden migration fallback and is deleted after parity.
 - The full build is divided into six gated subprojects in the documented order.
