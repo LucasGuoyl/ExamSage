@@ -304,6 +304,101 @@ def test_unapproved_workspace_requires_approval_before_any_provider_call(
         evidence_store.close()
 
 
+def test_approved_workspace_with_no_selected_sources_fails_without_loop_or_provider(
+    tmp_path: Path,
+    workspace_store: WorkspaceStore,
+):
+    _root, revision = _workspace(
+        workspace_store,
+        tmp_path,
+        {"notes.txt": b"not selected"},
+        approve=False,
+    )
+    entry = next(item for item in revision.entries if item.included)
+    empty_revision = workspace_store.set_inclusion(
+        WORKSPACE_ID,
+        revision.revision_id,
+        (entry.entry_id,),
+        False,
+    )
+    workspace_store.approve(
+        WORKSPACE_ID,
+        empty_revision.revision_id,
+        empty_revision.policy_version,
+    )
+    provider = RecordingProvider()
+    service, _gate, evidence_store, artifacts = _service(
+        tmp_path,
+        workspace_store,
+        provider,
+    )
+    try:
+        with pytest.raises(EvidenceServiceError) as empty:
+            service.build_study_map(WORKSPACE_ID, "run_empty_sources_01")
+        assert empty.value.code == "evidence_sources_empty"
+        assert provider.requests == []
+        assert evidence_store.list_parts(
+            WORKSPACE_ID,
+            empty_revision.revision_id,
+        ) == ()
+    finally:
+        artifacts.close()
+        evidence_store.close()
+
+
+def test_prepare_analysis_never_returns_a_new_revision_it_did_not_prepare(
+    tmp_path: Path,
+    workspace_store: WorkspaceStore,
+):
+    _root, revision = _workspace(
+        workspace_store,
+        tmp_path,
+        {"a.txt": b"first", "b.txt": b"second"},
+    )
+    excluded = revision.entries[0]
+    provider = RecordingProvider()
+    service, _gate, evidence_store, artifacts = _service(
+        tmp_path,
+        workspace_store,
+        provider,
+    )
+    original_inspection = service._inspection_from_authority
+    replacement_revision_id = None
+
+    def approve_replacement(authority):
+        nonlocal replacement_revision_id
+        inspection = original_inspection(authority)
+        replacement = workspace_store.set_inclusion(
+            WORKSPACE_ID,
+            revision.revision_id,
+            (excluded.entry_id,),
+            False,
+        )
+        workspace_store.approve(
+            WORKSPACE_ID,
+            replacement.revision_id,
+            replacement.policy_version,
+        )
+        replacement_revision_id = replacement.revision_id
+        return inspection
+
+    service._inspection_from_authority = approve_replacement
+    try:
+        with pytest.raises(SourceAuthorizationError) as changed:
+            service.prepare_analysis(WORKSPACE_ID)
+        assert changed.value.code == "source_approval_revoked"
+        assert len(evidence_store.list_parts(WORKSPACE_ID, revision.revision_id)) == 2
+        assert replacement_revision_id is not None
+        assert evidence_store.list_parts(
+            WORKSPACE_ID,
+            replacement_revision_id,
+        ) == ()
+        assert provider.requests == []
+    finally:
+        artifacts.close()
+        evidence_store.close()
+
+
 def test_service_consumes_one_gate_spool_and_provider_receives_only_prepared_bytes(
     tmp_path: Path,
     workspace_store: WorkspaceStore,

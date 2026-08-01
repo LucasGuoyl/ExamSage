@@ -14,6 +14,7 @@ from exam_predictor.evidence.policy import EvidencePolicy, representative_ordina
 from exam_predictor.evidence.service import (
     EvidenceAnswerRequest,
     EvidenceAnswerResult,
+    EvidenceFrontierResult,
     EvidenceInspection,
     EvidenceRunResult,
     EvidenceService,
@@ -39,6 +40,7 @@ __all__ = [
     "EvidenceAnswerContext",
     "EvidenceAnswerRequest",
     "EvidenceAnswerResult",
+    "EvidenceFrontierResult",
     "EvidenceInspection",
     "EvidencePolicy",
     "EvidenceRepairRequest",

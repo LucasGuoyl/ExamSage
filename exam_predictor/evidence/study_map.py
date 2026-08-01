@@ -251,6 +251,7 @@ class StudyMapSynthesisRequest(_ProviderPayloadModel):
     status: SnapshotStatus
     evidence: tuple[EvidenceSynthesisItem, ...] = Field(max_length=32)
     drafts: tuple[str, ...] = Field(default=(), max_length=64, repr=False)
+    response_language: str | None = Field(default=None, max_length=64)
     deadline_seconds: float = Field(ge=10.0, le=300.0)
 
 
@@ -313,6 +314,7 @@ class StudyMapBuilder:
         *,
         publication_guard: PublicationGuard | None = None,
         synthesis_guard: PublicationGuard | None = None,
+        response_language: str | None = None,
     ) -> StudyMapSnapshot | None:
         if not self._store.is_current_revision(workspace_id, revision_id):
             return None
@@ -342,6 +344,7 @@ class StudyMapBuilder:
             superseded_snapshot_id=None,
             publication_guard=publication_guard,
             synthesis_guard=synthesis_guard,
+            response_language=response_language,
         )
 
     def publish_complete(
@@ -351,6 +354,7 @@ class StudyMapBuilder:
         *,
         publication_guard: PublicationGuard | None = None,
         synthesis_guard: PublicationGuard | None = None,
+        response_language: str | None = None,
     ) -> StudyMapSnapshot | None:
         if not self._store.is_current_revision(workspace_id, revision_id):
             return None
@@ -388,6 +392,7 @@ class StudyMapBuilder:
             superseded_snapshot_id=(None if current is None else current.snapshot_id),
             publication_guard=publication_guard,
             synthesis_guard=synthesis_guard,
+            response_language=response_language,
         )
 
     def answer_context(
@@ -495,9 +500,16 @@ class StudyMapBuilder:
         superseded_snapshot_id: str | None,
         publication_guard: PublicationGuard | None,
         synthesis_guard: PublicationGuard | None,
+        response_language: str | None,
     ) -> StudyMapSnapshot:
         with self._publication_context(synthesis_guard):
-            payload = self._synthesize(workspace_id, revision_id, status, units)
+            payload = self._synthesize(
+                workspace_id,
+                revision_id,
+                status,
+                units,
+                response_language=response_language,
+            )
         coverage = _mark_snapshot_influence(coverage, parts, units, payload)
         created_at = self._now()
         dependency_ids = tuple(sorted(payload.evidence_unit_ids))
@@ -609,6 +621,8 @@ class StudyMapBuilder:
         revision_id: str,
         status: SnapshotStatus,
         units: tuple[EvidenceUnit, ...],
+        *,
+        response_language: str | None,
     ) -> _SynthesisPayload:
         if not units:
             return _SynthesisPayload(
@@ -631,6 +645,7 @@ class StudyMapBuilder:
                     revision_id=revision_id,
                     status=status,
                     evidence=batches[0],
+                    response_language=response_language,
                     deadline_seconds=self._policy.provider_timeout_seconds,
                 )
             )
@@ -644,6 +659,7 @@ class StudyMapBuilder:
                     revision_id=revision_id,
                     status=status,
                     evidence=batch,
+                    response_language=response_language,
                     deadline_seconds=self._policy.provider_timeout_seconds,
                 )
             )
@@ -666,6 +682,7 @@ class StudyMapBuilder:
                 status=status,
                 evidence=(),
                 drafts=drafts,
+                response_language=response_language,
                 deadline_seconds=self._policy.provider_timeout_seconds,
             )
         )

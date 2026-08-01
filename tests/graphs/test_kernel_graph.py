@@ -11,7 +11,14 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
+from exam_predictor.evidence.scheduler import SchedulerOutcome, SchedulerStatus
+from exam_predictor.evidence.service import (
+    EvidenceFrontierResult,
+    EvidenceInspection,
+    EvidenceRunResult,
+)
 from exam_predictor.runtime.control import RunControlRegistry
+from exam_predictor.tools.evidence import EvidenceToolRegistry
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
 
 
@@ -54,6 +61,7 @@ def dependencies(
     *,
     provider: FakeProvider | None = None,
     on_emit=None,
+    tools: KernelToolRegistry | None = None,
 ):
     def emit(run_id, event_type, stage, message, payload=None):
         event = {
@@ -70,7 +78,7 @@ def dependencies(
     return KernelDependencies(
         provider_sessions=Sessions(provider),
         planner=KernelPlanner(),
-        tools=KernelToolRegistry(),
+        tools=tools or KernelToolRegistry(),
         controls=controls,
         emit=emit,
     )
@@ -327,6 +335,181 @@ def test_workspace_id_survives_real_checkpoint_and_durable_resume(tmp_path: Path
     serialized = json.dumps(values, ensure_ascii=False, sort_keys=True)
     assert workspace_id in serialized
     assert str(tmp_path) not in serialized
+
+
+def test_kernel_composes_real_evidence_subgraph_without_legacy_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from exam_predictor.agent import ExamSageAgent
+
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    revision_id = "revision_kernel_evidence_000001"
+    calls: list[str] = []
+
+    class EvidenceProvider(FakeProvider):
+        def create_chat_completion(self, **kwargs):
+            self.calls += 1
+            self.requests.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "tool": "build_study_map",
+                                    "arguments": {"entry_id": "invented"},
+                                    "reason": "Build cited course evidence.",
+                                }
+                            )
+                        )
+                    )
+                ]
+            )
+
+    class EvidenceService:
+        def inspect(self, candidate):
+            calls.append("inspect")
+            return EvidenceInspection(
+                workspace_id=candidate,
+                revision_id=revision_id,
+                approval_id="approval-kernel-evidence",
+                approval_required=False,
+                approved_source_count=1,
+                approved_bytes=20,
+            )
+
+        def prepare_analysis(self, candidate):
+            calls.append("prepare")
+            return self.inspect(candidate)
+
+        def analyze_frontier(self, candidate, revision, run_id):
+            calls.append("analyze")
+            return EvidenceFrontierResult(
+                workspace_id=candidate,
+                revision_id=revision,
+                outcome=SchedulerOutcome(
+                    status=SchedulerStatus.COMPLETE,
+                    processed_part_ids=("part-kernel-evidence",),
+                    pending_count=0,
+                ),
+            )
+
+        def publish_frontier(
+            self,
+            candidate,
+            revision,
+            outcome,
+            *,
+            response_language=None,
+        ):
+            calls.append("publish")
+            assert response_language == "en"
+            return EvidenceRunResult(
+                workspace_id=candidate,
+                revision_id=revision,
+                status="complete",
+                outcome=outcome,
+            )
+
+    def forbidden_build(*_args, **_kwargs):
+        raise AssertionError("legacy build_course must not run in Agent mode")
+
+    monkeypatch.setattr(ExamSageAgent, "build_course", forbidden_build)
+    controls = RunControlRegistry()
+    events: list[dict] = []
+    provider = EvidenceProvider()
+    tools = KernelToolRegistry(evidence=EvidenceToolRegistry(EvidenceService()))
+    config = {"configurable": {"thread_id": f"workspace:{workspace_id}"}}
+    with SqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite3")) as saver:
+        graph = build_kernel_graph(
+            dependencies(
+                events,
+                controls,
+                provider=provider,
+                tools=tools,
+            ),
+            saver,
+        )
+        result = graph.invoke(
+            {
+                "run_id": "run-kernel-evidence",
+                "provider_profile_id": "primary",
+                "workspace_id": workspace_id,
+                "user_message": "Build my study map.",
+                "messages": [
+                    {"role": "user", "content": "Build my study map."}
+                ],
+            },
+            config,
+        )
+
+    assert result["selected_tool"] == "build_study_map"
+    assert result["tool_result"]["metadata"]["status"] == "complete"
+    assert calls == ["inspect", "prepare", "inspect", "analyze", "publish"]
+    assert provider.calls == 1
+    assert [event["event_type"] for event in events] == [
+        "progress",
+        "tool_started",
+        "progress",
+        "tool_completed",
+        "message",
+    ]
+
+
+def test_evidence_inspection_failure_does_not_block_generic_workspace_chat(
+    tmp_path: Path,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    private_error = "C:/private/course/evidence.sqlite3"
+
+    class UnavailableEvidenceService:
+        def inspect(self, _workspace_id):
+            raise RuntimeError(private_error)
+
+    provider = FakeProvider()
+    events: list[dict] = []
+    tools = KernelToolRegistry(
+        evidence=EvidenceToolRegistry(UnavailableEvidenceService())
+    )
+    config = {"configurable": {"thread_id": f"workspace:{workspace_id}"}}
+    with SqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite3")) as saver:
+        graph = build_kernel_graph(
+            dependencies(
+                events,
+                RunControlRegistry(),
+                provider=provider,
+                tools=tools,
+            ),
+            saver,
+        )
+        result = graph.invoke(
+            {
+                "run_id": "run-generic-with-evidence-outage",
+                "provider_profile_id": "primary",
+                "workspace_id": workspace_id,
+                "user_message": "Explain limits.",
+                "messages": [{"role": "user", "content": "Explain limits."}],
+            },
+            config,
+        )
+
+    planner_payload = json.loads(provider.requests[0]["messages"][1]["content"])
+    assert result["selected_tool"] == "tutor_reply"
+    assert result["assistant_message"]
+    assert planner_payload["evidence"] == {
+        "available": False,
+        "safe_error_code": "evidence_unavailable",
+        "approval_required": True,
+        "approved_source_count": 0,
+        "approved_bytes": 0,
+        "processed_part_count": 0,
+        "pending_part_count": 0,
+        "failed_part_count": 0,
+        "course_group_count": 0,
+        "snapshot_status": None,
+    }
+    assert private_error not in json.dumps(planner_payload)
 
 
 def _walk(value):

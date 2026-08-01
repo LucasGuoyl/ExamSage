@@ -8,9 +8,14 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from exam_predictor.graphs.evidence import (
+    EvidenceGraphDependencies,
+    build_evidence_graph,
+)
 from exam_predictor.runtime.control import RunControlRegistry
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
+from exam_predictor.tools.evidence import EvidencePlannerContext, is_evidence_tool
 
 
 class KernelState(TypedDict, total=False):
@@ -25,6 +30,10 @@ class KernelState(TypedDict, total=False):
     tool_result: dict[str, Any]
     assistant_message: str
     pause_pending: bool
+    revision_id: str
+    evidence_inspection: dict[str, Any]
+    frontier: dict[str, Any]
+    evidence_result: dict[str, Any]
 
 
 EventEmitter = Callable[[str, str, str, str, dict[str, Any] | None], None]
@@ -64,7 +73,30 @@ def build_kernel_graph(deps: KernelDependencies, checkpointer):
         run_id = state["run_id"]
         deps.emit(run_id, "progress", "planning", "Choosing the next Agent tool.")
         provider = deps.provider_sessions.get_provider(state["provider_profile_id"])
-        plan_result = deps.planner.plan(state["user_message"], state.get("messages", []), provider)
+        workspace_id = state.get("workspace_id")
+        evidence_context = None
+        if workspace_id is not None and deps.tools.evidence is not None:
+            try:
+                evidence_context = deps.tools.evidence.planner_context(workspace_id)
+            except Exception:
+                evidence_context = EvidencePlannerContext(
+                    available=False,
+                    safe_error_code="evidence_unavailable",
+                    approval_required=True,
+                    approved_source_count=0,
+                    approved_bytes=0,
+                    processed_part_count=0,
+                    pending_part_count=0,
+                    failed_part_count=0,
+                    course_group_count=0,
+                )
+        plan_result = deps.planner.plan(
+            state["user_message"],
+            state.get("messages", []),
+            provider,
+            workspace_id=workspace_id,
+            evidence_context=evidence_context,
+        )
         return {
             "selected_tool": plan_result.tool,
             "tool_arguments": plan_result.arguments,
@@ -93,6 +125,11 @@ def build_kernel_graph(deps: KernelDependencies, checkpointer):
             "messages": [{"role": "assistant", "content": answer}],
         }
 
+    def route_tool(state: KernelState) -> str:
+        if is_evidence_tool(state["selected_tool"]) and deps.tools.evidence is not None:
+            return "evidence"
+        return "kernel"
+
     builder = StateGraph(KernelState)
     builder.add_node("stop_before_plan", detect_stop)
     builder.add_node("pause_before_plan", pause)
@@ -100,6 +137,17 @@ def build_kernel_graph(deps: KernelDependencies, checkpointer):
     builder.add_node("stop_before_tool", detect_stop)
     builder.add_node("pause_before_tool", pause)
     builder.add_node("run_tool", run_tool)
+    evidence_routes = {"kernel": "run_tool"}
+    if deps.tools.evidence is not None:
+        evidence_graph = build_evidence_graph(
+            EvidenceGraphDependencies(
+                tools=deps.tools.evidence,
+                controls=deps.controls,
+                emit=deps.emit,
+            )
+        )
+        builder.add_node("run_evidence_tool", evidence_graph)
+        evidence_routes["evidence"] = "run_evidence_tool"
     builder.add_node("stop_before_compose", detect_stop)
     builder.add_node("pause_before_compose", pause)
     builder.add_node("compose", compose)
@@ -114,10 +162,14 @@ def build_kernel_graph(deps: KernelDependencies, checkpointer):
     builder.add_conditional_edges(
         "stop_before_tool",
         route_after_stop,
-        {"pause": "pause_before_tool", "continue": "run_tool"},
+        {"pause": "pause_before_tool", "continue": "route_selected_tool"},
     )
-    builder.add_edge("pause_before_tool", "run_tool")
+    builder.add_node("route_selected_tool", lambda _state: {})
+    builder.add_conditional_edges("route_selected_tool", route_tool, evidence_routes)
+    builder.add_edge("pause_before_tool", "route_selected_tool")
     builder.add_edge("run_tool", "stop_before_compose")
+    if deps.tools.evidence is not None:
+        builder.add_edge("run_evidence_tool", "stop_before_compose")
     builder.add_conditional_edges(
         "stop_before_compose",
         route_after_stop,

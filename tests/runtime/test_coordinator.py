@@ -9,6 +9,12 @@ import pytest
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
+from exam_predictor.evidence.scheduler import SchedulerOutcome, SchedulerStatus
+from exam_predictor.evidence.service import (
+    EvidenceFrontierResult,
+    EvidenceInspection,
+    EvidenceRunResult,
+)
 from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
 from exam_predictor.runtime.control import RunControlRegistry
 from exam_predictor.runtime.coordinator import (
@@ -1446,6 +1452,202 @@ def test_source_authorization_failure_pauses_safely_without_starting_queued_work
     finally:
         harness.release_first.set()
         runtime.shutdown()
+
+
+def test_source_change_interrupt_uses_actionable_pause_and_can_resume(
+    tmp_path: Path,
+):
+    class SourceChangedHarness:
+        @staticmethod
+        def factory(_dependencies, _saver):
+            class FakeGraph:
+                @staticmethod
+                def invoke(value, _config):
+                    if isinstance(value, Command):
+                        assert value.resume == {"action": "resume"}
+                        return {"assistant_message": "resumed"}
+                    return {
+                        "__interrupt__": (
+                            SimpleNamespace(
+                                value={
+                                    "kind": "source_changed",
+                                    "run_id": value["run_id"],
+                                    "code": "source_approval_revoked",
+                                    "entry_id": "entry-replaced",
+                                }
+                            ),
+                        )
+                    }
+
+            return FakeGraph()
+
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=registry(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        graph_factory=SourceChangedHarness.factory,
+    )
+    runtime.start()
+    try:
+        run = runtime.submit_message("course-1", "primary", "Review")
+        wait_for_status(store, run.run_id, RunStatus.PAUSED)
+        paused = store.list_events(run.run_id)[-1]
+        assert paused.stage == "source_changed"
+        assert paused.payload == {
+            "code": "source_approval_revoked",
+            "entry_id": "entry-replaced",
+        }
+
+        runtime.resume(run.run_id)
+        wait_for_status(store, run.run_id, RunStatus.COMPLETED)
+    finally:
+        runtime.shutdown()
+
+
+def test_coordinator_injects_evidence_service_into_the_real_kernel_graph(
+    tmp_path: Path,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    revision_id = "revision_coordinator_evidence_01"
+    service_calls: list[str] = []
+
+    class EvidenceProvider:
+        name = "fake"
+        capabilities = SimpleNamespace(chat=True)
+        models = SimpleNamespace(fast="fast", balanced="balanced")
+
+        def create_chat_completion(self, **_kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "tool": "build_study_map",
+                                    "arguments": {},
+                                    "reason": "Build course evidence.",
+                                }
+                            )
+                        )
+                    )
+                ]
+            )
+
+    class EvidenceService:
+        def __init__(self):
+            self.controls = None
+            self.stop_once = True
+
+        def start(self):
+            service_calls.append("start")
+            return ()
+
+        def inspect(self, candidate):
+            service_calls.append("inspect")
+            return EvidenceInspection(
+                workspace_id=candidate,
+                revision_id=revision_id,
+                approval_id="approval-coordinator",
+                approval_required=False,
+                approved_source_count=1,
+                approved_bytes=10,
+            )
+
+        def prepare_analysis(self, candidate):
+            service_calls.append("prepare")
+            return self.inspect(candidate)
+
+        def analyze_frontier(self, candidate, revision, run_id):
+            service_calls.append("analyze")
+            if self.stop_once:
+                self.stop_once = False
+                self.controls.request_stop(run_id)
+            return EvidenceFrontierResult(
+                workspace_id=candidate,
+                revision_id=revision,
+                outcome=SchedulerOutcome(
+                    status=SchedulerStatus.COMPLETE,
+                    processed_part_ids=("part-coordinator",),
+                    pending_count=0,
+                ),
+            )
+
+        def publish_frontier(
+            self,
+            candidate,
+            revision,
+            outcome,
+            *,
+            response_language=None,
+        ):
+            service_calls.append("publish")
+            assert response_language == "en"
+            return EvidenceRunResult(
+                workspace_id=candidate,
+                revision_id=revision,
+                status="complete",
+                outcome=outcome,
+            )
+
+    sessions = ProviderSessionRegistry(factory=lambda _config: EvidenceProvider())
+    sessions.connect(provider_request("test-only-key"))
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    evidence_service = EvidenceService()
+    runtime = RuntimeCoordinator(
+        store=store,
+        provider_sessions=sessions,
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        workspace_repository=SimpleNamespace(
+            get_workspace=lambda _candidate: SimpleNamespace(
+                state=WorkspaceState.APPROVED
+            )
+        ),
+        evidence_service=evidence_service,
+    )
+    evidence_service.controls = runtime.controls
+    runtime.start()
+    try:
+        run = runtime.submit_message(
+            "ignored-client-thread",
+            "primary",
+            "Build my study map.",
+            workspace_id=workspace_id,
+        )
+        wait_for_status(store, run.run_id, RunStatus.PAUSED)
+        assert service_calls == [
+            "start",
+            "inspect",
+            "prepare",
+            "inspect",
+            "analyze",
+        ]
+        runtime.resume(run.run_id)
+        wait_for_status(store, run.run_id, RunStatus.COMPLETED)
+        events = store.list_events(run.run_id)
+    finally:
+        runtime.shutdown()
+
+    assert service_calls == [
+        "start",
+        "inspect",
+        "prepare",
+        "inspect",
+        "analyze",
+        "publish",
+    ]
+    assert [event.event_type for event in events] == [
+        EventType.STARTED,
+        EventType.PROGRESS,
+        EventType.TOOL_STARTED,
+        EventType.PROGRESS,
+        EventType.PAUSED,
+        EventType.RESUMED,
+        EventType.TOOL_COMPLETED,
+        EventType.MESSAGE,
+        EventType.COMPLETED,
+    ]
+    assert run.thread_id == f"workspace:{workspace_id}"
 
 
 def test_completed_status_and_terminal_event_become_visible_atomically(tmp_path: Path):

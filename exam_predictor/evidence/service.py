@@ -94,6 +94,12 @@ class EvidenceRunResult(EvidenceFrozenModel):
     safe_error_code: str | None = None
 
 
+class EvidenceFrontierResult(EvidenceFrozenModel):
+    workspace_id: str
+    revision_id: str
+    outcome: SchedulerOutcome
+
+
 class EvidenceAnswerRequest(EvidenceFrozenModel):
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
@@ -171,6 +177,13 @@ class EvidenceService:
         authority = self._workspace_store.transmission_authority_snapshot(workspace_id)
         if authority is None:
             raise EvidenceServiceError("workspace_not_found")
+        return self._inspection_from_authority(authority)
+
+    def _inspection_from_authority(
+        self,
+        authority: TransmissionAuthoritySnapshot,
+    ) -> EvidenceInspection:
+        workspace_id = authority.workspace.workspace_id
         if not self._authority_is_approved(authority):
             workspace = authority.workspace
             return EvidenceInspection(
@@ -208,6 +221,47 @@ class EvidenceService:
         authority = self._require_authority(workspace_id)
         self._prepare_current(authority)
         return self._analyze_current(authority, run_id)
+
+    def prepare_analysis(self, workspace_id: str) -> EvidenceInspection:
+        authority = self._require_authority(workspace_id)
+        self._prepare_current(authority)
+        inspection = self._inspection_from_authority(authority)
+        if not self._authority_matches(authority):
+            raise SourceAuthorizationError(
+                "source_approval_revoked",
+                workspace_id,
+                "",
+            )
+        return inspection
+
+    def analyze_frontier(
+        self,
+        workspace_id: str,
+        revision_id: str,
+        run_id: str,
+    ) -> EvidenceFrontierResult:
+        authority = self._require_revision(workspace_id, revision_id)
+        outcome = self._run_one_frontier(authority, run_id)
+        return EvidenceFrontierResult(
+            workspace_id=workspace_id,
+            revision_id=revision_id,
+            outcome=outcome,
+        )
+
+    def publish_frontier(
+        self,
+        workspace_id: str,
+        revision_id: str,
+        outcome: SchedulerOutcome,
+        *,
+        response_language: str | None = None,
+    ) -> EvidenceRunResult:
+        authority = self._require_revision(workspace_id, revision_id)
+        return self._publish_one_frontier(
+            authority,
+            outcome,
+            response_language=response_language,
+        )
 
     def continue_analysis(
         self,
@@ -317,20 +371,23 @@ class EvidenceService:
         assert approval is not None and revision is not None
         workspace_id = authority.workspace.workspace_id
         self._ensure_workspace_active(workspace_id)
+        approved_entries = self._approved_entries(approval, revision)
         previous_revision_id = self._evidence_store.current_revision_id(workspace_id)
         if previous_revision_id not in {None, revision.revision_id}:
             self._invalidate_changed_entries(
                 workspace_id,
                 previous_revision_id,
-                self._approved_entries(approval, revision),
+                approved_entries,
             )
+        if not approved_entries:
+            raise EvidenceServiceError("evidence_sources_empty")
         existing = self._evidence_store.list_parts(workspace_id, revision.revision_id)
         prepared_entries = {
             part.entry_id
             for part in existing
             if part.state is not PartState.INVALIDATED
         }
-        for entry in self._approved_entries(approval, revision):
+        for entry in approved_entries:
             if entry.entry_id in prepared_entries:
                 continue
             with self._workspace_store.hold_workspace_authority(workspace_id):
@@ -408,46 +465,45 @@ class EvidenceService:
             ),
         )
         while True:
-            self._ensure_workspace_active(workspace_id)
-            if not self._authority_matches(authority):
+            try:
+                last_outcome = self._run_one_frontier(authority, run_id)
+                result = self._publish_one_frontier(
+                    authority,
+                    last_outcome,
+                    response_language=None,
+                )
+            except SourceAuthorizationError:
                 return self._paused_result(
                     workspace_id,
                     revision.revision_id,
                     last_outcome,
                     "source_approval_revoked",
                 )
-            approval = authority.approval
-            assert approval is not None
+            if result.status == "complete":
+                return result
+            if last_outcome.status is SchedulerStatus.PAUSED:
+                return result
 
-            @contextmanager
-            def part_authority_guard(_part: SourcePartPlan):
-                try:
-                    with self._workspace_store.hold_transmission_authority(
-                        workspace_id,
-                        approval_id=approval.approval_id,
-                        revision_id=revision.revision_id,
-                    ) as held:
-                        self._ensure_workspace_active(workspace_id)
-                        yield held
-                except TransmissionAuthorityRevokedError:
-                    raise EvidenceAuthorizationError from None
-
-            last_outcome = self._scheduler.run_frontier(
-                run_id,
+    def _run_one_frontier(
+        self,
+        authority: TransmissionAuthoritySnapshot,
+        run_id: str,
+    ) -> SchedulerOutcome:
+        revision = authority.revision
+        approval = authority.approval
+        assert revision is not None and approval is not None
+        workspace_id = authority.workspace.workspace_id
+        self._ensure_workspace_active(workspace_id)
+        if not self._authority_matches(authority):
+            raise SourceAuthorizationError(
+                "source_approval_revoked",
                 workspace_id,
-                revision.revision_id,
-                authorize_part=part_authority_guard,
+                "",
             )
-            self._ensure_workspace_active(workspace_id)
-            if not self._authority_matches(authority):
-                return self._paused_result(
-                    workspace_id,
-                    revision.revision_id,
-                    last_outcome,
-                    "source_approval_revoked",
-                )
-            @contextmanager
-            def publication_guard():
+
+        @contextmanager
+        def part_authority_guard(_part: SourcePartPlan):
+            try:
                 with self._workspace_store.hold_transmission_authority(
                     workspace_id,
                     approval_id=approval.approval_id,
@@ -455,48 +511,82 @@ class EvidenceService:
                 ) as held:
                     self._ensure_workspace_active(workspace_id)
                     yield held
+            except TransmissionAuthorityRevokedError:
+                raise EvidenceAuthorizationError from None
 
-            try:
-                snapshot = self._builder.publish_initial(
+        outcome = self._scheduler.run_frontier(
+            run_id,
+            workspace_id,
+            revision.revision_id,
+            authorize_part=part_authority_guard,
+        )
+        self._ensure_workspace_active(workspace_id)
+        if not self._authority_matches(authority):
+            raise SourceAuthorizationError(
+                "source_approval_revoked",
+                workspace_id,
+                "",
+            )
+        return outcome
+
+    def _publish_one_frontier(
+        self,
+        authority: TransmissionAuthoritySnapshot,
+        outcome: SchedulerOutcome,
+        *,
+        response_language: str | None,
+    ) -> EvidenceRunResult:
+        revision = authority.revision
+        approval = authority.approval
+        assert revision is not None and approval is not None
+        workspace_id = authority.workspace.workspace_id
+
+        @contextmanager
+        def publication_guard():
+            with self._workspace_store.hold_transmission_authority(
+                workspace_id,
+                approval_id=approval.approval_id,
+                revision_id=revision.revision_id,
+            ) as held:
+                self._ensure_workspace_active(workspace_id)
+                yield held
+
+        try:
+            snapshot = self._builder.publish_initial(
+                workspace_id,
+                revision.revision_id,
+                publication_guard=publication_guard,
+                synthesis_guard=publication_guard,
+                response_language=response_language,
+            )
+            complete = (
+                self._builder.publish_complete(
                     workspace_id,
                     revision.revision_id,
                     publication_guard=publication_guard,
                     synthesis_guard=publication_guard,
+                    response_language=response_language,
                 )
-                complete = (
-                    self._builder.publish_complete(
-                        workspace_id,
-                        revision.revision_id,
-                        publication_guard=publication_guard,
-                        synthesis_guard=publication_guard,
-                    )
-                    if last_outcome.pending_count == 0
-                    else None
-                )
-            except TransmissionAuthorityRevokedError:
-                return self._paused_result(
-                    workspace_id,
-                    revision.revision_id,
-                    last_outcome,
-                    "source_approval_revoked",
-                )
-            if last_outcome.pending_count == 0:
-                if complete is not None:
-                    return EvidenceRunResult(
-                        workspace_id=workspace_id,
-                        revision_id=revision.revision_id,
-                        status="complete",
-                        snapshot=complete,
-                        outcome=last_outcome,
-                    )
-            if last_outcome.status is SchedulerStatus.PAUSED:
-                return EvidenceRunResult(
-                    workspace_id=workspace_id,
-                    revision_id=revision.revision_id,
-                    status="paused",
-                    snapshot=snapshot,
-                    outcome=last_outcome,
-                )
+                if outcome.pending_count == 0
+                else None
+            )
+        except TransmissionAuthorityRevokedError:
+            raise SourceAuthorizationError(
+                "source_approval_revoked",
+                workspace_id,
+                "",
+            ) from None
+        return EvidenceRunResult(
+            workspace_id=workspace_id,
+            revision_id=revision.revision_id,
+            status=(
+                "complete"
+                if outcome.pending_count == 0 and complete is not None
+                else "paused"
+            ),
+            snapshot=complete or snapshot,
+            outcome=outcome,
+        )
 
     def _invalidate_changed_entries(
         self,
@@ -533,6 +623,21 @@ class EvidenceService:
         if not self._authority_is_approved(authority):
             raise SourceAuthorizationError(
                 "source_approval_required",
+                workspace_id,
+                "",
+            )
+        return authority
+
+    def _require_revision(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> TransmissionAuthoritySnapshot:
+        authority = self._require_authority(workspace_id)
+        revision = authority.revision
+        if revision is None or revision.revision_id != revision_id:
+            raise SourceAuthorizationError(
+                "source_approval_revoked",
                 workspace_id,
                 "",
             )

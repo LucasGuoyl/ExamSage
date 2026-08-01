@@ -11,6 +11,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from exam_predictor.graphs.kernel import KernelDependencies, build_kernel_graph
+from exam_predictor.tools.evidence import EvidenceToolRegistry
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
 from exam_predictor.workspace.models import WorkspaceState
 from exam_predictor.workspace.transmission import SourceAuthorizationError
@@ -48,6 +49,7 @@ class RuntimeCoordinator:
         graph_factory: Callable[..., Any] = build_kernel_graph,
         vault: CredentialVault | None = None,
         workspace_repository: Any | None = None,
+        evidence_service: Any | None = None,
     ):
         self.store = store
         self.provider_sessions = provider_sessions
@@ -55,6 +57,7 @@ class RuntimeCoordinator:
         self.graph_factory = graph_factory
         self.vault = vault
         self.workspace_repository = workspace_repository
+        self.evidence_service = evidence_service
         self.controls = RunControlRegistry()
         self._commands: queue.Queue[tuple[str, str] | None] = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -78,6 +81,8 @@ class RuntimeCoordinator:
             if self._shutdown_requested:
                 raise RuntimeError("A shut down RuntimeCoordinator cannot be restarted.")
             self.store.recover_unfinished()
+            if self.evidence_service is not None:
+                self.evidence_service.start()
             self._restore_saved_profiles()
             self.checkpoints_path.parent.mkdir(parents=True, exist_ok=True)
             self._thread = threading.Thread(
@@ -363,7 +368,13 @@ class RuntimeCoordinator:
             dependencies = KernelDependencies(
                 provider_sessions=self.provider_sessions,
                 planner=KernelPlanner(),
-                tools=KernelToolRegistry(),
+                tools=KernelToolRegistry(
+                    evidence=(
+                        None
+                        if self.evidence_service is None
+                        else EvidenceToolRegistry(self.evidence_service)
+                    )
+                ),
                 controls=self.controls,
                 emit=self._emit,
             )
@@ -420,13 +431,29 @@ class RuntimeCoordinator:
                 ):
                     self.store.set_status(run_id, RunStatus.PAUSED)
                 else:
-                    self.store.set_status_and_append_event(
-                        run_id,
-                        RunStatus.PAUSED,
-                        EventType.PAUSED,
-                        "paused",
-                        "The run is paused at a safe boundary.",
+                    source_change = _source_change_interrupt(
+                        result.get("__interrupt__")
                     )
+                    if source_change is None:
+                        self.store.set_status_and_append_event(
+                            run_id,
+                            RunStatus.PAUSED,
+                            EventType.PAUSED,
+                            "paused",
+                            "The run is paused at a safe boundary.",
+                        )
+                    else:
+                        self.store.set_status_and_append_event(
+                            run_id,
+                            RunStatus.PAUSED,
+                            EventType.PAUSED,
+                            "source_changed",
+                            (
+                                "A course source changed. Rescan and approve it "
+                                "before resuming."
+                            ),
+                            payload=source_change,
+                        )
                 return
             self.store.set_status_and_append_event(
                 run_id,
@@ -507,3 +534,15 @@ class RuntimeCoordinator:
             "Queued run started.",
         )
         self._commands.put(("start", queued.run_id))
+
+
+def _source_change_interrupt(value: Any) -> dict[str, str] | None:
+    for item in value or ():
+        payload = getattr(item, "value", item)
+        if not isinstance(payload, dict) or payload.get("kind") != "source_changed":
+            continue
+        return {
+            "code": str(payload.get("code", "source_approval_revoked")),
+            "entry_id": str(payload.get("entry_id", "")),
+        }
+    return None
