@@ -6,7 +6,8 @@ import base64
 from hashlib import sha256
 from io import BytesIO
 from pathlib import PurePosixPath
-from typing import Any, Literal, Protocol
+import time
+from typing import Any, Callable, Literal, Protocol
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
@@ -22,8 +23,18 @@ from exam_predictor.workspace.models import normalize_relative_path
 
 
 ANALYSIS_MAX_OUTPUT_TOKENS = 4096
+UPLOAD_CLEANUP_TIMEOUT_SECONDS = 5.0
 _DEFAULT_INLINE_FILE_LIMIT_BYTES = 10 * 1024 * 1024
 _MAX_RETRY_AFTER_DIGITS = 10
+_CAPABILITY_NAMES = (
+    "chat",
+    "vision",
+    "file_understanding",
+    "embeddings",
+    "web_search",
+    "citations",
+    "ephemeral_requests",
+)
 _SAFE_ERROR_MESSAGES = {
     "provider_timeout": "The provider request timed out.",
     "provider_rate_limited": "The provider is rate limiting requests.",
@@ -56,6 +67,7 @@ class AnalyzeSourcePartRequest(_PrivateEvidenceModel):
     content_size_bytes: int = Field(ge=0)
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     model_route: Literal["fast", "balanced"] = "balanced"
+    deadline_seconds: float = Field(default=90.0, gt=0.0, le=300.0)
 
     @field_validator("relative_path")
     @classmethod
@@ -101,6 +113,10 @@ class EvidenceRouteIdentity(_PrivateEvidenceModel):
     provider: Literal["openai", "gemini"]
     model_route: Literal["fast", "balanced"]
     model_id: str = Field(min_length=1, max_length=256)
+    capability_fingerprint: str = Field(
+        default="0" * 64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
     @field_validator("model_id")
     @classmethod
@@ -157,21 +173,26 @@ class ProviderEvidenceAdapter:
         provider: BaseProvider,
         *,
         policy: EvidencePolicy = EvidencePolicy(),
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         self._provider = provider
         self._policy = policy
+        self._monotonic_clock = monotonic_clock or time.monotonic
 
     def analyze_source_part(self, request: AnalyzeSourcePartRequest) -> EvidencePartResult:
         self._verify_request(request)
         route = self.route_identity(request.model_route)
         provider_name = route.provider
         model_id = route.model_id
+        deadline = self._monotonic_clock() + request.deadline_seconds
 
         try:
             if provider_name == "openai":
-                raw_output = self._analyze_openai(request, model_id)
+                raw_output = self._analyze_openai(request, model_id, deadline)
             else:
-                raw_output = self._analyze_gemini(request, model_id)
+                raw_output = self._analyze_gemini(request, model_id, deadline)
+        except EvidenceProviderError:
+            raise
         except Exception as provider_exception:
             normalized = _normalize_provider_exception(provider_exception, self._policy)
         else:
@@ -212,6 +233,10 @@ class ProviderEvidenceAdapter:
             provider=provider_name,
             model_route=model_route,
             model_id=model_id,
+            capability_fingerprint=_capability_fingerprint(
+                provider_name,
+                capabilities,
+            ),
         )
 
     def _verify_request(self, request: AnalyzeSourcePartRequest) -> None:
@@ -225,7 +250,33 @@ class ProviderEvidenceAdapter:
         if len(content) > self._policy.max_part_bytes:
             raise EvidenceProviderError("provider_media_unsupported", retryable=False)
 
-    def _analyze_openai(self, request: AnalyzeSourcePartRequest, model_id: str) -> str:
+    def _remaining_seconds(self, deadline: float) -> float:
+        remaining = deadline - self._monotonic_clock()
+        if remaining <= 0:
+            raise EvidenceProviderError("provider_timeout", retryable=True)
+        return remaining
+
+    def _remaining_milliseconds(self, deadline: float) -> int:
+        remaining = int(self._remaining_seconds(deadline) * 1000)
+        if remaining < 1:
+            raise EvidenceProviderError("provider_timeout", retryable=True)
+        return remaining
+
+    def _cleanup_seconds(self, deadline: float) -> float:
+        remaining = deadline - self._monotonic_clock()
+        if remaining <= 0:
+            return UPLOAD_CLEANUP_TIMEOUT_SECONDS
+        return min(remaining, UPLOAD_CLEANUP_TIMEOUT_SECONDS)
+
+    def _cleanup_milliseconds(self, deadline: float) -> int:
+        return max(1, int(self._cleanup_seconds(deadline) * 1000))
+
+    def _analyze_openai(
+        self,
+        request: AnalyzeSourcePartRequest,
+        model_id: str,
+        deadline: float,
+    ) -> str:
         client = self._provider.client
         prefix = source_analysis_prefix(
             locator=request.locator,
@@ -252,6 +303,7 @@ class ProviderEvidenceAdapter:
                 uploaded = client.files.create(
                     file=(_provider_filename(request), request.content_bytes, request.media_type),
                     purpose="user_data",
+                    timeout=self._remaining_seconds(deadline),
                 )
                 candidate_id = getattr(uploaded, "id", None)
                 if not isinstance(candidate_id, str) or not candidate_id:
@@ -272,6 +324,7 @@ class ProviderEvidenceAdapter:
                 },
                 max_output_tokens=ANALYSIS_MAX_OUTPUT_TOKENS,
                 store=False,
+                timeout=self._remaining_seconds(deadline),
             )
             raw_output = getattr(response, "output_text", None)
             if not isinstance(raw_output, str):
@@ -280,11 +333,17 @@ class ProviderEvidenceAdapter:
         finally:
             if uploaded_id is not None:
                 try:
-                    client.files.delete(uploaded_id)
+                    cleanup_timeout = self._cleanup_seconds(deadline)
+                    client.files.delete(uploaded_id, timeout=cleanup_timeout)
                 except Exception:
                     pass
 
-    def _analyze_gemini(self, request: AnalyzeSourcePartRequest, model_id: str) -> str:
+    def _analyze_gemini(
+        self,
+        request: AnalyzeSourcePartRequest,
+        model_id: str,
+        deadline: float,
+    ) -> str:
         client = self._provider.client
         types = self._provider._genai.types
         uploaded: object | None = None
@@ -301,7 +360,12 @@ class ProviderEvidenceAdapter:
                 try:
                     uploaded = client.files.upload(
                         file=stream,
-                        config={"mime_type": request.media_type},
+                        config=types.UploadFileConfig(
+                            http_options=types.HttpOptions(
+                                timeout=self._remaining_milliseconds(deadline),
+                            ),
+                            mime_type=request.media_type,
+                        ),
                     )
                 finally:
                     stream.close()
@@ -311,6 +375,9 @@ class ProviderEvidenceAdapter:
                 uploaded_name = candidate_name
                 source_part = uploaded
             config = types.GenerateContentConfig(
+                http_options=types.HttpOptions(
+                    timeout=self._remaining_milliseconds(deadline),
+                ),
                 response_mime_type="application/json",
                 response_json_schema=SOURCE_ANALYSIS_JSON_SCHEMA,
                 max_output_tokens=ANALYSIS_MAX_OUTPUT_TOKENS,
@@ -334,7 +401,13 @@ class ProviderEvidenceAdapter:
         finally:
             if uploaded_name is not None:
                 try:
-                    client.files.delete(name=uploaded_name)
+                    cleanup_timeout = self._cleanup_milliseconds(deadline)
+                    client.files.delete(
+                        name=uploaded_name,
+                        config=types.DeleteFileConfig(
+                            http_options=types.HttpOptions(timeout=cleanup_timeout),
+                        ),
+                    )
                 except Exception:
                     pass
 
@@ -355,6 +428,15 @@ def _provider_filename(request: AnalyzeSourcePartRequest) -> str:
     if not suffix or len(suffix) > 16 or not suffix[1:].isalnum():
         suffix = ".bin"
     return f"{request.source_part_id}{suffix}"
+
+
+def _capability_fingerprint(provider_name: str, capabilities: object) -> str:
+    values = (
+        f"{name}={int(bool(getattr(capabilities, name, False)))}"
+        for name in _CAPABILITY_NAMES
+    )
+    identity = "\0".join((provider_name, *values))
+    return sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _normalize_provider_exception(

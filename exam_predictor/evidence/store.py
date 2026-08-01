@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -131,6 +132,12 @@ _REQUIRED_INDEXES = {
            ON study_map_snapshots(workspace_id, revision_id, created_at)""",
     ),
 }
+
+
+@dataclass(frozen=True)
+class EvidencePartClaim:
+    plan: SourcePartPlan
+    claim_token: str
 
 
 class EvidenceStore:
@@ -450,6 +457,19 @@ class EvidenceStore:
             raise KeyError(f"Evidence part '{part_id}' was not found.")
         return int(row["attempt_count"])
 
+    def part_state_counts(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> dict[PartState, int]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT state, COUNT(*) AS count FROM evidence_parts
+                   WHERE workspace_id = ? AND revision_id = ? GROUP BY state""",
+                (workspace_id, revision_id),
+            ).fetchall()
+        return {PartState(row["state"]): int(row["count"]) for row in rows}
+
     def claim_parts(
         self,
         workspace_id: str,
@@ -458,6 +478,24 @@ class EvidenceStore:
         limit: int,
         now: datetime,
     ) -> tuple[SourcePartPlan, ...]:
+        return tuple(
+            claim.plan
+            for claim in self.claim_parts_with_tokens(
+                workspace_id,
+                revision_id,
+                limit=limit,
+                now=now,
+            )
+        )
+
+    def claim_parts_with_tokens(
+        self,
+        workspace_id: str,
+        revision_id: str,
+        *,
+        limit: int,
+        now: datetime,
+    ) -> tuple[EvidencePartClaim, ...]:
         if limit < 0:
             raise ValueError("limit must not be negative")
         claimed_at = self._timestamp(now)
@@ -498,10 +536,22 @@ class EvidenceStore:
                        WHERE part_id = ?""",
                     (PartState.RUNNING.value, claimed_at, part_id),
                 )
-            claimed_rows = [
-                dict(row) | {"state": PartState.RUNNING.value} for row in rows
-            ]
-        return tuple(self._part(self._row_from_mapping(row)) for row in claimed_rows)
+            claims = tuple(
+                EvidencePartClaim(
+                    plan=self._part(
+                        self._row_from_mapping(
+                            dict(row) | {"state": PartState.RUNNING.value}
+                        )
+                    ),
+                    claim_token=self._claim_token(
+                        str(row["part_id"]),
+                        int(row["plan_generation"]),
+                        int(row["claim_generation"]) + 1,
+                    ),
+                )
+                for row in rows
+            )
+        return claims
 
     @staticmethod
     def _row_from_mapping(value: dict[str, object]) -> sqlite3.Row:
@@ -537,6 +587,7 @@ class EvidenceStore:
         finished_at: datetime | None = None,
         safe_error_code: str | None = None,
         next_attempt_at: datetime | None = None,
+        claim_token: str,
     ) -> SourcePartPlan:
         if attempt < 1:
             raise ValueError("attempt must be at least one")
@@ -558,10 +609,29 @@ class EvidenceStore:
         next_attempt = self._timestamp(next_attempt_at)
         updated = finished or started
         with self._transaction() as connection:
-            if connection.execute(
-                "SELECT 1 FROM evidence_parts WHERE part_id = ?", (part_id,)
-            ).fetchone() is None:
+            part = connection.execute(
+                """SELECT workspace_id, revision_id, state,
+                          plan_generation, claim_generation
+                   FROM evidence_parts WHERE part_id = ?""",
+                (part_id,),
+            ).fetchone()
+            if part is None:
                 raise KeyError(f"Evidence part '{part_id}' was not found.")
+            current = connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(part['workspace_id'])}",),
+            ).fetchone()
+            if current is None or current["value"] != part["revision_id"]:
+                raise ValueError("evidence part revision is no longer current")
+            expected = self._claim_token(
+                part_id,
+                int(part["plan_generation"]),
+                int(part["claim_generation"]),
+            )
+            if part["state"] != PartState.RUNNING.value or not hmac.compare_digest(
+                claim_token, expected
+            ):
+                raise ValueError("claim token does not match the current running claim")
             connection.execute(
                 """INSERT INTO evidence_attempts(
                        part_id, attempt_number, route, outcome, safe_error_code,
@@ -590,11 +660,31 @@ class EvidenceStore:
         assert row is not None
         return self._part(row)
 
-    def mark_running(self, part_id: str, *, attempt: int) -> SourcePartPlan:
+    def mark_running(
+        self,
+        part_id: str,
+        *,
+        attempt: int,
+        expected_state: PartState,
+    ) -> SourcePartPlan:
         if attempt < 1:
             raise ValueError("attempt must be at least one")
         now = self._timestamp(self._now())
         with self._transaction() as connection:
+            part = connection.execute(
+                "SELECT workspace_id, revision_id, state FROM evidence_parts WHERE part_id = ?",
+                (part_id,),
+            ).fetchone()
+            if part is None:
+                raise KeyError(f"Evidence part '{part_id}' was not found.")
+            current = connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(part['workspace_id'])}",),
+            ).fetchone()
+            if current is None or current["value"] != part["revision_id"]:
+                raise ValueError("evidence part revision is no longer current")
+            if part["state"] != expected_state.value:
+                raise ValueError("evidence part state does not match the expected state")
             cursor = connection.execute(
                 """UPDATE evidence_parts
                    SET state = ?, attempt_count = MAX(attempt_count, ?),
@@ -611,6 +701,65 @@ class EvidenceStore:
             ).fetchone()
         assert row is not None
         return self._part(row)
+
+    def resume_claim(
+        self,
+        part_id: str,
+        *,
+        previous_claim_token: str,
+        attempt: int,
+        now: datetime,
+    ) -> EvidencePartClaim:
+        if attempt < 1:
+            raise ValueError("attempt must be at least one")
+        resumed_at = self._timestamp(now)
+        with self._transaction() as connection:
+            part = connection.execute(
+                """SELECT workspace_id, revision_id, state,
+                          plan_generation, claim_generation
+                   FROM evidence_parts WHERE part_id = ?""",
+                (part_id,),
+            ).fetchone()
+            if part is None:
+                raise KeyError(f"Evidence part '{part_id}' was not found.")
+            current = connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(part['workspace_id'])}",),
+            ).fetchone()
+            expected = self._claim_token(
+                part_id,
+                int(part["plan_generation"]),
+                int(part["claim_generation"]),
+            )
+            if (
+                current is None
+                or current["value"] != part["revision_id"]
+                or part["state"] != PartState.RETRY_WAIT.value
+                or not hmac.compare_digest(previous_claim_token, expected)
+            ):
+                raise ValueError("claim token does not match the retryable claim")
+            connection.execute(
+                """UPDATE evidence_parts
+                   SET state = ?, attempt_count = MAX(attempt_count, ?),
+                       next_attempt_at = NULL,
+                       claim_generation = claim_generation + 1,
+                       updated_at = ?
+                   WHERE part_id = ?""",
+                (PartState.RUNNING.value, attempt, resumed_at, part_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM evidence_parts WHERE part_id = ?", (part_id,)
+            ).fetchone()
+        assert row is not None
+        plan = self._part(row)
+        return EvidencePartClaim(
+            plan=plan,
+            claim_token=self._claim_token(
+                part_id,
+                int(row["plan_generation"]),
+                int(row["claim_generation"]),
+            ),
+        )
 
     def publication_token(self, part_id: str) -> str:
         with self._lock:
@@ -635,6 +784,37 @@ class EvidenceStore:
             int(part["plan_generation"]),
             int(part["claim_generation"]),
         )
+
+    def pause_claim(
+        self,
+        part_id: str,
+        *,
+        claim_token: str,
+        paused_at: datetime,
+    ) -> None:
+        paused = self._timestamp(paused_at)
+        with self._transaction() as connection:
+            part = connection.execute(
+                """SELECT state, plan_generation, claim_generation
+                   FROM evidence_parts WHERE part_id = ?""",
+                (part_id,),
+            ).fetchone()
+            if part is None:
+                raise KeyError(f"Evidence part '{part_id}' was not found.")
+            expected = self._claim_token(
+                part_id,
+                int(part["plan_generation"]),
+                int(part["claim_generation"]),
+            )
+            if part["state"] != PartState.RUNNING.value or not hmac.compare_digest(
+                claim_token, expected
+            ):
+                raise ValueError("claim token does not match the current running claim")
+            connection.execute(
+                """UPDATE evidence_parts SET state = ?, next_attempt_at = ?, updated_at = ?
+                   WHERE part_id = ?""",
+                (PartState.RETRY_WAIT.value, paused, paused, part_id),
+            )
 
     @staticmethod
     def _unit(row: sqlite3.Row) -> EvidenceUnit:
@@ -662,6 +842,96 @@ class EvidenceStore:
 
     def get_cached_evidence(self, cache_key: str) -> EvidenceUnit | None:
         return self.cached_evidence(cache_key)
+
+    def reuse_cached_evidence(
+        self,
+        part_id: str,
+        *,
+        cache_key: str,
+        claim_token: str,
+        completed_at: datetime,
+    ) -> EvidenceUnit | None:
+        published_at = self._timestamp(completed_at)
+        cache_digest = self._digest(cache_key)
+        with self._transaction() as connection:
+            part = connection.execute(
+                """SELECT workspace_id, revision_id, source_sha256, state, plan_json,
+                          plan_generation, claim_generation
+                   FROM evidence_parts WHERE part_id = ?""",
+                (part_id,),
+            ).fetchone()
+            if part is None:
+                raise KeyError(f"Evidence part '{part_id}' was not found.")
+            current = connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(part['workspace_id'])}",),
+            ).fetchone()
+            expected = self._claim_token(
+                part_id,
+                int(part["plan_generation"]),
+                int(part["claim_generation"]),
+            )
+            if (
+                current is None
+                or current["value"] != part["revision_id"]
+                or part["state"] != PartState.RUNNING.value
+                or not hmac.compare_digest(claim_token, expected)
+            ):
+                raise ValueError("cache reuse requires the current running claim")
+            cached = connection.execute(
+                """SELECT cache.source_sha256, units.unit_json
+                   FROM evidence_cache AS cache
+                   JOIN evidence_units AS units
+                     ON units.evidence_unit_id = cache.evidence_unit_id
+                   WHERE cache.cache_digest = ?""",
+                (cache_digest,),
+            ).fetchone()
+            if cached is None or cached["source_sha256"] != part["source_sha256"]:
+                return None
+            persisted_plan = SourcePartPlan.model_validate_json(part["plan_json"])
+            original = EvidenceUnit.model_validate_json(cached["unit_json"])
+            if any(
+                citation.relative_path != persisted_plan.relative_path
+                or not self._locator_contains(persisted_plan.locator, citation.locator)
+                for citation in original.citations
+            ):
+                return None
+            unit_identity = "\0".join((part_id, cache_digest))
+            unit_id = f"unit_{self._digest(unit_identity)}"
+            unit = original.model_copy(
+                update={
+                    "evidence_unit_id": unit_id,
+                    "source_part_id": part_id,
+                    "citations": tuple(
+                        citation.model_copy(
+                            update={
+                                "citation_id": "citation_"
+                                + self._digest(chr(0).join((unit_id, str(index)))),
+                                "evidence_unit_id": unit_id,
+                                "source_part_id": part_id,
+                            }
+                        )
+                        for index, citation in enumerate(original.citations)
+                    ),
+                }
+            )
+            unit_payload = unit.model_dump(mode="json")
+            self._validate_serialized_strings(unit_payload)
+            unit_json = self._canonical_json(unit_payload)
+            unit_sha256 = self._digest(unit_json)
+            connection.execute(
+                """INSERT INTO evidence_units(
+                       evidence_unit_id, source_part_id, unit_json,
+                       unit_sha256, published_at
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (unit_id, part_id, unit_json, unit_sha256, published_at),
+            )
+            connection.execute(
+                """UPDATE evidence_parts SET state = ?, next_attempt_at = NULL, updated_at = ?
+                   WHERE part_id = ?""",
+                (PartState.PROCESSED.value, published_at, part_id),
+            )
+        return unit
 
     def publish_evidence(
         self,

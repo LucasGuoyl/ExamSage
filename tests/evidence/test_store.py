@@ -557,7 +557,7 @@ def test_recovery_pauses_running_parts_without_consuming_attempt(tmp_path: Path)
     path = tmp_path / "evidence.sqlite3"
     store = EvidenceStore(path)
     store.upsert_part_plans((part_plan(),))
-    store.mark_running("part-1", attempt=1)
+    store.mark_running("part-1", attempt=1, expected_state=PartState.PLANNED)
     store.close()
 
     restarted = EvidenceStore(path)
@@ -599,6 +599,7 @@ def test_record_attempt_cannot_reenter_running_with_a_recovered_claim_token(
             route="document",
             outcome=PartState.RUNNING,
             started_at=NOW,
+            claim_token=recovered_token,
         )
 
     assert store.get_part(plan.part_id).state is PartState.RETRY_WAIT
@@ -681,9 +682,88 @@ def test_claims_are_atomic_ordered_and_reject_a_stale_revision(tmp_path: Path):
     second.close()
 
 
+def test_stale_claim_token_cannot_record_over_a_recovered_new_owner(tmp_path: Path):
+    store = EvidenceStore(tmp_path / "evidence.sqlite3")
+    plan = part_plan()
+    store.upsert_part_plans((plan,))
+    [first] = store.claim_parts_with_tokens(
+        plan.workspace_id,
+        plan.revision_id,
+        limit=1,
+        now=NOW,
+    )
+    store.pause_claim(
+        plan.part_id,
+        claim_token=first.claim_token,
+        paused_at=NOW,
+    )
+    [second] = store.claim_parts_with_tokens(
+        plan.workspace_id,
+        plan.revision_id,
+        limit=1,
+        now=NOW,
+    )
+
+    with pytest.raises(ValueError, match="claim token"):
+        store.record_attempt(
+            plan.part_id,
+            attempt=1,
+            route="document",
+            outcome=PartState.FAILED,
+            started_at=NOW,
+            finished_at=NOW,
+            safe_error_code="provider_failed",
+            claim_token=first.claim_token,
+        )
+
+    assert store.publication_token(plan.part_id) == second.claim_token
+    assert store.get_part(plan.part_id).state is PartState.RUNNING
+    store.close()
+
+
+def test_completed_part_cannot_be_rewritten_by_its_old_claim(tmp_path: Path):
+    store = EvidenceStore(tmp_path / "evidence.sqlite3")
+    plan = part_plan()
+    unit = evidence_unit()
+    store.upsert_part_plans((plan,))
+    [claim] = store.claim_parts_with_tokens(
+        plan.workspace_id,
+        plan.revision_id,
+        limit=1,
+        now=NOW,
+    )
+    assert publish_claim(
+        store,
+        plan.part_id,
+        unit,
+        cache_key="completed-cache-key",
+        completed_at=NOW,
+        claim_token=claim.claim_token,
+    )
+
+    with pytest.raises(ValueError, match="current running claim"):
+        store.record_attempt(
+            plan.part_id,
+            attempt=2,
+            route="document",
+            outcome=PartState.FAILED,
+            started_at=NOW,
+            finished_at=NOW,
+            safe_error_code="provider_failed",
+            claim_token=claim.claim_token,
+        )
+
+    assert store.get_part(plan.part_id).state is PartState.PROCESSED
+    assert store.cached_evidence("completed-cache-key") == unit
+    store.close()
+
+
 def test_retry_wait_is_claimed_only_when_due(tmp_path: Path):
     store = EvidenceStore(tmp_path / "evidence.sqlite3")
     store.upsert_part_plans((part_plan(),))
+    [running] = store.claim_parts_with_tokens(
+        "workspace-1", "revision-1", limit=1, now=NOW
+    )
     store.record_attempt(
         "part-1",
         attempt=1,
@@ -693,6 +773,7 @@ def test_retry_wait_is_claimed_only_when_due(tmp_path: Path):
         finished_at=NOW + timedelta(seconds=1),
         next_attempt_at=NOW + timedelta(minutes=1),
         safe_error_code="provider_timeout",
+        claim_token=running.claim_token,
     )
 
     assert store.claim_parts(
@@ -715,6 +796,12 @@ def test_record_attempt_rolls_back_part_state_when_attempt_insert_fails(
     store = EvidenceStore(tmp_path / "evidence.sqlite3")
     original = part_plan()
     store.upsert_part_plans((original,))
+    [running] = store.claim_parts_with_tokens(
+        original.workspace_id,
+        original.revision_id,
+        limit=1,
+        now=NOW,
+    )
     with store._transaction() as connection:
         connection.execute(
             """CREATE TRIGGER reject_evidence_attempt
@@ -731,13 +818,14 @@ def test_record_attempt_rolls_back_part_state_when_attempt_insert_fails(
             started_at=NOW,
             finished_at=NOW + timedelta(seconds=1),
             safe_error_code="provider_failed",
+            claim_token=running.claim_token,
         )
     except sqlite3.IntegrityError as error:
         assert "forced attempt failure" in str(error)
     else:
         raise AssertionError("the trigger must reject the attempt")
 
-    assert store.get_part("part-1") == original
+    assert store.get_part("part-1") == running.plan
     assert store.attempt_count("part-1") == 0
     store.close()
 
@@ -912,7 +1000,11 @@ def test_processed_replay_requires_cache_tuple_from_the_same_claim_generation(
         completed_at=NOW,
     ) is True
 
-    store.mark_running(plan.part_id, attempt=2)
+    store.mark_running(
+        plan.part_id,
+        attempt=2,
+        expected_state=PartState.PROCESSED,
+    )
     second_token = store.publication_token(plan.part_id)
     assert second_token != first_token
     assert publish_claim(
@@ -1252,6 +1344,7 @@ def test_changed_plan_identity_atomically_resets_all_prior_work(
     store.claim_parts(
         original.workspace_id, original.revision_id, limit=1, now=NOW
     )
+    claim_token = store.publication_token(original.part_id)
     store.record_attempt(
         original.part_id,
         attempt=1,
@@ -1261,6 +1354,7 @@ def test_changed_plan_identity_atomically_resets_all_prior_work(
         finished_at=NOW + timedelta(seconds=1),
         next_attempt_at=NOW + timedelta(minutes=1),
         safe_error_code="provider_timeout",
+        claim_token=claim_token,
     )
     [resumed] = store.claim_parts(
         original.workspace_id,

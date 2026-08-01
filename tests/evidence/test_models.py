@@ -85,7 +85,7 @@ def test_source_part_rejects_absolute_paths_and_secret_fields():
                 ),
             },
             "content",
-            "Provider returned sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+            "Provider returned sk-" + "proj-abcdefghijklmnopqrstuvwxyz1234567890",
         ),
         (
             EvidenceUnit,

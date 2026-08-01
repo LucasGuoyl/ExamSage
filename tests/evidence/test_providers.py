@@ -4,6 +4,7 @@ from hashlib import sha256
 from io import IOBase
 import json
 from types import SimpleNamespace
+from typing import Callable
 
 from google import genai
 import pytest
@@ -14,7 +15,6 @@ from exam_predictor.evidence.providers import (
     AnalyzeSourcePartRequest,
     EvidencePartResult,
     EvidenceProviderError,
-    EvidenceRouteIdentity,
     ProviderEvidenceAdapter,
 )
 from exam_predictor.providers import ModelRouting, ProviderCapabilities
@@ -61,20 +61,44 @@ class _OpenAIResponses:
 
 
 class _Files:
-    def __init__(self) -> None:
+    def __init__(self, *, after_upload: Callable[[], None] | None = None) -> None:
         self.uploads: list[dict[str, object]] = []
         self.deletes: list[str] = []
+        self.delete_options: list[dict[str, object]] = []
+        self._after_upload = after_upload
 
     def create(self, **kwargs: object) -> object:
         self.uploads.append(kwargs)
+        if self._after_upload is not None:
+            self._after_upload()
         return SimpleNamespace(id="file_123")
 
     def upload(self, **kwargs: object) -> object:
         self.uploads.append(kwargs)
+        if self._after_upload is not None:
+            self._after_upload()
         return SimpleNamespace(name="files/provider-upload-123")
 
-    def delete(self, file_id: str | None = None, *, name: str | None = None) -> None:
+    def delete(
+        self,
+        file_id: str | None = None,
+        *,
+        name: str | None = None,
+        **kwargs: object,
+    ) -> None:
         self.deletes.append(file_id or name or "")
+        self.delete_options.append(kwargs)
+
+
+class _DeadlineClock:
+    def __init__(self) -> None:
+        self.value = 100.0
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
 
 
 def _openai_provider(responses: _OpenAIResponses) -> SimpleNamespace:
@@ -131,6 +155,7 @@ def test_openai_adapter_sends_one_versioned_structured_request_and_exact_model()
     assert call["model"] == "balanced-model"
     assert call["store"] is False
     assert call["max_output_tokens"] == ANALYSIS_MAX_OUTPUT_TOKENS
+    assert 0 < call["timeout"] <= request.deadline_seconds
     assert call["text"]["format"]["type"] == "json_schema"
     assert call["text"]["format"]["strict"] is True
     assert call["text"]["format"]["schema"]["additionalProperties"] is False
@@ -151,16 +176,11 @@ def test_route_identity_is_exact_safe_and_available_before_provider_call():
 
     identity = adapter.route_identity("balanced")
 
-    assert identity == EvidenceRouteIdentity(
-        provider="openai",
-        model_route="balanced",
-        model_id="balanced-model",
-    )
-    assert identity.model_dump() == {
-        "provider": "openai",
-        "model_route": "balanced",
-        "model_id": "balanced-model",
-    }
+    assert identity.provider == "openai"
+    assert identity.model_route == "balanced"
+    assert identity.model_id == "balanced-model"
+    assert len(identity.capability_fingerprint) == 64
+    assert set(identity.capability_fingerprint) <= set("0123456789abcdef")
     assert responses.calls == []
     assert "client" not in repr(identity).casefold()
     assert "credential" not in repr(identity).casefold()
@@ -180,6 +200,7 @@ def test_gemini_adapter_uses_inline_bytes_json_schema_and_fast_route_once():
     assert config.response_mime_type == "application/json"
     assert config.response_json_schema["additionalProperties"] is False
     assert config.max_output_tokens == ANALYSIS_MAX_OUTPUT_TOKENS
+    assert 0 < config.http_options.timeout <= int(request.deadline_seconds * 1000)
     assert len(call["contents"]) == 3
     assert call["contents"][1].inline_data.data == request.content_bytes
 
@@ -375,3 +396,81 @@ def test_gemini_uploaded_bytes_are_deleted_after_terminal_failure():
     assert isinstance(files.uploads[0]["file"], IOBase)
     assert files.deletes == ["files/provider-upload-123"]
     assert len(models.calls) == 1
+
+
+def test_openai_upload_analysis_and_cleanup_share_one_deadline_budget():
+    clock = _DeadlineClock()
+    responses = _OpenAIResponses()
+    provider = _openai_provider(responses)
+    files = _Files(after_upload=lambda: clock.advance(3))
+    provider.client.files = files
+    provider.inline_file_limit_bytes = 4
+    request = _request(b"12345").model_copy(update={"deadline_seconds": 10.0})
+
+    ProviderEvidenceAdapter(
+        provider,
+        monotonic_clock=clock.monotonic,
+    ).analyze_source_part(request)
+
+    assert files.uploads[0]["timeout"] == pytest.approx(10.0)
+    assert responses.calls[0]["timeout"] == pytest.approx(7.0)
+    assert files.delete_options[0]["timeout"] == pytest.approx(5.0)
+
+
+def test_gemini_upload_analysis_and_cleanup_share_one_deadline_budget():
+    clock = _DeadlineClock()
+    files = _Files(after_upload=lambda: clock.advance(3))
+    models = _GeminiModels()
+    provider = _gemini_provider(models, files=files, inline_limit=4)
+    request = _request(b"12345").model_copy(update={"deadline_seconds": 10.0})
+
+    ProviderEvidenceAdapter(
+        provider,
+        monotonic_clock=clock.monotonic,
+    ).analyze_source_part(request)
+
+    upload_config = files.uploads[0]["config"]
+    assert upload_config.http_options.timeout == 10_000
+    assert models.calls[0]["config"].http_options.timeout == 7_000
+    assert files.delete_options[0]["config"].http_options.timeout == 5_000
+
+
+def test_openai_deadline_exhaustion_still_attempts_bounded_upload_cleanup():
+    clock = _DeadlineClock()
+    responses = _OpenAIResponses()
+    provider = _openai_provider(responses)
+    files = _Files(after_upload=lambda: clock.advance(10))
+    provider.client.files = files
+    provider.inline_file_limit_bytes = 4
+    request = _request(b"12345").model_copy(update={"deadline_seconds": 10.0})
+
+    with pytest.raises(EvidenceProviderError, match="timed out") as caught:
+        ProviderEvidenceAdapter(
+            provider,
+            monotonic_clock=clock.monotonic,
+        ).analyze_source_part(request)
+
+    assert caught.value.code == "provider_timeout"
+    assert responses.calls == []
+    assert files.deletes == ["file_123"]
+    assert files.delete_options[0]["timeout"] == 5.0
+
+
+def test_gemini_deadline_exhaustion_still_attempts_bounded_upload_cleanup():
+    clock = _DeadlineClock()
+    files = _Files(after_upload=lambda: clock.advance(10))
+    models = _GeminiModels()
+    provider = _gemini_provider(models, files=files, inline_limit=4)
+    request = _request(b"12345").model_copy(update={"deadline_seconds": 10.0})
+
+    with pytest.raises(EvidenceProviderError, match="timed out") as caught:
+        ProviderEvidenceAdapter(
+            provider,
+            monotonic_clock=clock.monotonic,
+        ).analyze_source_part(request)
+
+    assert caught.value.code == "provider_timeout"
+    assert models.calls == []
+    assert files.deletes == ["files/provider-upload-123"]
+    cleanup_config = files.delete_options[0]["config"]
+    assert cleanup_config.http_options.timeout == 5_000
