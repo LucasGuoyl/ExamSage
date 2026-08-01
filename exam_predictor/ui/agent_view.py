@@ -3,9 +3,15 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import streamlit as st
 
+from exam_predictor.legacy_intake import (
+    LegacyIntakeError,
+    cleanup_legacy_intake,
+    diagnose_legacy_intake,
+)
 from exam_predictor.runtime.client import WorkerClient, WorkerClientError
 from exam_predictor.runtime.models import (
     AgentEvent,
@@ -126,6 +132,60 @@ def _render_language_selector() -> None:
     if selected != current:
         set_ui_language(st.session_state, selected)
         st.rerun()
+
+
+def _legacy_data_root() -> Path:
+    configured = os.environ.get("EXAMSAGE_DATA_DIR", "").strip()
+    return Path(configured) if configured else Path.home() / ".examsage"
+
+
+def _render_legacy_intake() -> None:
+    language = _language()
+    try:
+        summary = diagnose_legacy_intake(_legacy_data_root())
+    except LegacyIntakeError:
+        return
+    if not (
+        summary.session_count
+        or summary.unknown_entry_count
+        or summary.unsafe_session_count
+    ):
+        return
+    with st.expander(text("legacy_upload_title", language)):
+        st.caption(
+            text(
+                "legacy_upload_summary",
+                language,
+                sessions=summary.session_count,
+                files=summary.file_count,
+                bytes=summary.total_bytes,
+            )
+        )
+        if summary.unknown_entry_count or summary.unsafe_session_count:
+            st.warning(text("legacy_upload_warning", language))
+        if summary.session_count and st.button(
+            text("legacy_upload_cleanup", language),
+            key="cleanup-legacy-intake",
+        ):
+            active = st.session_state.get("intake_id")
+            active_ids = (active,) if isinstance(active, str) and active else ()
+            try:
+                result = cleanup_legacy_intake(
+                    _legacy_data_root(),
+                    session_ids=summary.session_ids,
+                    active_session_ids=active_ids,
+                )
+            except LegacyIntakeError:
+                st.error(text("legacy_upload_cleanup_failed", language))
+            else:
+                st.success(
+                    text(
+                        "legacy_upload_cleanup_success",
+                        language,
+                        sessions=len(result.deleted_session_ids),
+                        bytes=result.deleted_bytes,
+                    )
+                )
 
 
 def _render_polling_limit(run_id: str, state: AgentViewState) -> bool:
@@ -270,6 +330,9 @@ def render_agent_kernel() -> None:
         st.session_state.pop("agent_provider", None)
         st.error(text("worker_unavailable", language, detail=unavailable))
         return
+
+    with st.sidebar:
+        _render_legacy_intake()
 
     connect_error = st.session_state.pop("agent_connect_error", None)
     st.session_state.setdefault("agent_messages", [])

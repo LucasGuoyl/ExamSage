@@ -547,6 +547,43 @@ def test_stop_after_artifact_read_prevents_provider_call(tmp_path: Path):
     assert persisted.state is PartState.RETRY_WAIT
 
 
+def test_stop_after_validated_provider_result_publishes_once_before_pausing(
+    tmp_path: Path,
+):
+    controls = RunControlRegistry()
+
+    class StopAfterResultProvider(_ImmediateProvider):
+        def analyze_source_part(self, request):
+            result = super().analyze_source_part(request)
+            controls.request_stop("run-1")
+            return result
+
+    provider = StopAfterResultProvider()
+    plan = _plan("stop-after-result", priority=0)
+    scheduler, store, artifacts = _scheduler(
+        tmp_path,
+        provider,
+        (plan,),
+        policy=EvidencePolicy(multimodal_concurrency=1),
+        controls=controls,
+    )
+    try:
+        stopped = scheduler.run_frontier("run-1", WORKSPACE_ID, REVISION_ID)
+        persisted = store.get_part(plan.part_id)
+        controls.clear_stop("run-1")
+        resumed = scheduler.run_to_completion(
+            "run-1", WORKSPACE_ID, REVISION_ID
+        )
+    finally:
+        artifacts.close()
+        store.close()
+
+    assert stopped.status is SchedulerStatus.PAUSED
+    assert persisted.state is PartState.PROCESSED
+    assert resumed.status is SchedulerStatus.COMPLETE
+    assert provider.calls == [plan.part_id]
+
+
 def test_publish_failure_after_retry_pauses_the_rotated_claim(tmp_path: Path):
     class RetryOnceProvider(_ImmediateProvider):
         def analyze_source_part(self, request):

@@ -17,6 +17,11 @@ from exam_predictor.runtime.models import (
     SubmitMessageResponse,
 )
 from exam_predictor.evidence.models import EvidenceStatus
+from exam_predictor.legacy_intake import (
+    LegacyIntakeCleanupResult,
+    LegacyIntakeError,
+    LegacyIntakeSummary,
+)
 from exam_predictor.workspace.models import (
     ManifestPage,
     SourceMode,
@@ -269,6 +274,83 @@ def test_worker_unavailable_renders_safely_without_secret_or_legacy_controls(mon
     assert "Estimate cost" not in labels
     assert "Build my ExamSage agent" not in labels
     assert not app.file_uploader
+
+
+def test_legacy_upload_copies_are_visible_and_cleaned_only_by_explicit_action(
+    monkeypatch,
+):
+    fake = FakeWorkerClient()
+    session_id = "a" * 32
+    cleanup_calls = []
+    monkeypatch.setattr(agent_view, "_new_client", lambda: fake)
+    monkeypatch.setattr(
+        agent_view,
+        "diagnose_legacy_intake",
+        lambda _root: LegacyIntakeSummary(
+            session_count=1,
+            file_count=2,
+            total_bytes=7,
+            unknown_entry_count=1,
+            unsafe_session_count=1,
+            session_ids=(session_id,),
+        ),
+    )
+
+    def cleanup(root, *, session_ids, active_session_ids):
+        cleanup_calls.append((root, session_ids, active_session_ids))
+        return LegacyIntakeCleanupResult((session_id,), 7)
+
+    monkeypatch.setattr(agent_view, "cleanup_legacy_intake", cleanup)
+
+    app = AppTest.from_string(VIEW_SCRIPT).run()
+
+    assert cleanup_calls == []
+    assert button(app, "Clean up old upload copies")
+    visible = " ".join(
+        item.value for collection in (app.caption, app.warning) for item in collection
+    )
+    assert "1 old upload session" in visible
+    assert "Unknown or unsafe entries will not be touched" in visible
+    assert session_id not in visible
+
+    button(app, "Clean up old upload copies").click()
+    app.run()
+
+    assert len(cleanup_calls) == 1
+    assert cleanup_calls[0][1] == (session_id,)
+    assert cleanup_calls[0][2] == ()
+    assert any("Cleaned up 1 old upload session" in item.value for item in app.success)
+
+
+def test_legacy_cleanup_passes_current_legacy_session_to_active_refusal(monkeypatch):
+    fake = FakeWorkerClient()
+    session_id = "b" * 32
+    monkeypatch.setattr(agent_view, "_new_client", lambda: fake)
+    monkeypatch.setattr(
+        agent_view,
+        "diagnose_legacy_intake",
+        lambda _root: LegacyIntakeSummary(
+            session_count=1,
+            file_count=1,
+            total_bytes=4,
+            session_ids=(session_id,),
+        ),
+    )
+
+    def refuse_active(_root, *, session_ids, active_session_ids):
+        assert session_ids == (session_id,)
+        assert active_session_ids == (session_id,)
+        raise LegacyIntakeError("legacy_intake_active")
+
+    monkeypatch.setattr(agent_view, "cleanup_legacy_intake", refuse_active)
+    app = AppTest.from_string(VIEW_SCRIPT)
+    app.session_state["intake_id"] = session_id
+    app.run()
+
+    button(app, "Clean up old upload copies").click()
+    app.run()
+
+    assert any("could not be cleaned safely" in item.value for item in app.error)
 
 
 def test_provider_key_clears_even_when_worker_disappears_after_attempt(monkeypatch):

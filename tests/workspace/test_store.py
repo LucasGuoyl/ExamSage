@@ -493,6 +493,44 @@ def test_set_inclusion_clones_current_revision_and_expands_archive_subtree(
     assert restored.entries[0].inclusion_reason is None
 
 
+def test_explicit_include_acknowledges_a_changed_source_for_reapproval(
+    store: WorkspaceStore,
+    tmp_path: Path,
+):
+    store.create_workspace(workspace_record(tmp_path))
+    store.create_job(job(), "request-1")
+    store.start_job("job-1")
+    changed = entry(state=SourceState.CHANGED, sha256=HASH_B)
+    original = store.commit_scan(
+        "workspace-1",
+        ScanResult(
+            workspace_id="workspace-1",
+            entries=(changed,),
+            discovered_count=1,
+            bytes_hashed=changed.size_bytes,
+            failure_count=0,
+            completed_at=NOW,
+        ),
+        "job-1",
+    )
+
+    acknowledged = store.set_inclusion(
+        "workspace-1",
+        original.revision_id,
+        (changed.entry_id,),
+        True,
+    )
+
+    assert acknowledged.entries[0].included is True
+    assert acknowledged.entries[0].state is SourceState.PENDING_APPROVAL
+    approval = store.approve(
+        "workspace-1",
+        acknowledged.revision_id,
+        acknowledged.policy_version,
+    )
+    assert approval.entries[0].sha256 == HASH_B
+
+
 def test_approval_is_atomic_and_rejects_a_stale_revision(
     store: WorkspaceStore, scanned_workspace: WorkspaceRecord
 ):

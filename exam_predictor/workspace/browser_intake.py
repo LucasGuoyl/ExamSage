@@ -1024,6 +1024,37 @@ class OwnedTreeRemover:
         except OSError:
             raise OwnedTreeRemovalError("cleanup_failed") from None
 
+    def capture_identity(self, relative_path: str) -> tuple[str, str]:
+        """Capture the same platform identity later checked by this remover."""
+        parts = self._validated_parts(relative_path)
+        try:
+            if os.name == "nt":
+                identity = _WindowsOwnedTreeRemover(self._data_root).capture_identity(
+                    parts
+                )
+            else:
+                opener = SecureFileOpener(platform="posix")
+                with contextlib.ExitStack() as stack:
+                    root_anchor = stack.enter_context(
+                        opener.anchor_root(self._data_root)
+                    )
+                    if root_anchor.directory_fd is None:
+                        raise OwnedTreeRemovalError(
+                            "cleanup_identity_unavailable"
+                        )
+                    current_fd = root_anchor.directory_fd
+                    for part in parts:
+                        current_fd = stack.enter_context(
+                            opener.anchor_child_directory(current_fd, part)
+                        )
+                    opened = os.fstat(current_fd)
+                    identity = (opened.st_dev, opened.st_ino)
+        except OwnedTreeRemovalError:
+            raise
+        except OSError:
+            raise OwnedTreeRemovalError("cleanup_identity_unavailable") from None
+        return str(identity[0]), str(identity[1])
+
     @staticmethod
     def _validated_parts(relative_path: str) -> tuple[str, ...]:
         if (
@@ -1035,9 +1066,30 @@ class OwnedTreeRemover:
         ):
             raise OwnedTreeRemovalError("cleanup_path_invalid")
         parts = tuple(relative_path.split("/"))
+        verified_workspace = len(parts) >= 2 and parts[0] == "workspaces"
+        verified_legacy_intake = (
+            len(parts) == 2
+            and parts[0] == "intake"
+            and len(parts[1]) == 32
+            and all(character in "0123456789abcdef" for character in parts[1])
+        )
+        legacy_tombstone_prefix = ".owned-directory-"
+        verified_legacy_tombstone = (
+            len(parts) == 2
+            and parts[0] == "intake"
+            and parts[1].startswith(legacy_tombstone_prefix)
+            and len(parts[1]) == len(legacy_tombstone_prefix) + 32
+            and all(
+                character in "0123456789abcdef"
+                for character in parts[1][len(legacy_tombstone_prefix):]
+            )
+        )
         if (
-            len(parts) < 2
-            or parts[0] != "workspaces"
+            not (
+                verified_workspace
+                or verified_legacy_intake
+                or verified_legacy_tombstone
+            )
             or any(part in {"", ".", ".."} or ":" in part for part in parts)
         ):
             raise OwnedTreeRemovalError("cleanup_path_invalid")
@@ -1187,6 +1239,37 @@ class _WindowsOwnedTreeRemover(_WindowsSnapshotSession):
             self._claimed_root = current
             self._remove_open_directory(current, target_handle)
             self._mark_delete_checked(target_handle)
+        except BrowserIntakeError:
+            raise OwnedTreeRemovalError("cleanup_link_or_reparse") from None
+        finally:
+            for handle in reversed(handles):
+                self._close_handle(handle)
+
+    def capture_identity(self, parts: tuple[str, ...]) -> tuple[int, int]:
+        handles: list[int] = []
+        try:
+            data_handle = self._open_directory(
+                self._data_root,
+                delete_access=False,
+                containment_root=self._data_root,
+            )
+            handles.append(data_handle)
+            canonical_data_root = Path(self._final_path(data_handle))
+            current = canonical_data_root
+            for part in parts:
+                current /= part
+                handles.append(
+                    self._open_directory(
+                        current,
+                        delete_access=False,
+                        containment_root=canonical_data_root,
+                    )
+                )
+            if self._final_path(handles[-1]) != ntpath.normcase(
+                ntpath.abspath(str(current))
+            ):
+                raise OwnedTreeRemovalError("cleanup_path_invalid")
+            return self._handle_identity(handles[-1])
         except BrowserIntakeError:
             raise OwnedTreeRemovalError("cleanup_link_or_reparse") from None
         finally:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 
 SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -20,6 +22,20 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+_SENSITIVE_REPORT_KEYS = frozenset(
+    {
+        "api_key",
+        "authorization",
+        "content_bytes",
+        "credential",
+        "request_body",
+        "response_body",
+        "secret",
+        "source_content",
+        "token",
+    }
+)
+
 
 @dataclass(frozen=True, order=True)
 class SecretFinding:
@@ -27,6 +43,32 @@ class SecretFinding:
     path: str
     line_number: int
     source: str
+
+
+def sensitive_report_fields(value: Any) -> tuple[str, ...]:
+    """Return forbidden fields or secret-like values in benchmark reports."""
+    findings: list[str] = []
+
+    def visit(item: Any, path: tuple[str, ...]) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                name = str(key)
+                child_path = (*path, name)
+                if name.casefold() in _SENSITIVE_REPORT_KEYS:
+                    findings.append(".".join(child_path))
+                visit(child, child_path)
+        elif isinstance(item, (list, tuple)):
+            for index, child in enumerate(item):
+                visit(child, (*path, str(index)))
+        elif isinstance(item, str):
+            for pattern_name, pattern in SECRET_PATTERNS:
+                if pattern.search(item):
+                    findings.append(
+                        f"{'.'.join(path) or '<root>'}:secret-pattern:{pattern_name}"
+                    )
+
+    visit(value, ())
+    return tuple(sorted(set(findings)))
 
 
 def scan_text(
@@ -124,6 +166,28 @@ def audit_repository(root: Path) -> tuple[SecretFinding, ...]:
                 source="repository",
             )
         )
+        if candidate.name.startswith("examsage-benchmark-") and candidate.suffix == ".json":
+            try:
+                report = json.loads(content)
+            except (TypeError, ValueError):
+                findings.append(
+                    SecretFinding(
+                        "benchmark_report_invalid",
+                        candidate.relative_to(root).as_posix(),
+                        1,
+                        "repository",
+                    )
+                )
+            else:
+                findings.extend(
+                    SecretFinding(
+                        "benchmark_sensitive_field",
+                        candidate.relative_to(root).as_posix(),
+                        1,
+                        "repository",
+                    )
+                    for _field in sensitive_report_fields(report)
+                )
 
     for arguments, source in (
         (("diff", "--no-ext-diff", "--no-color", "--unified=0"), "worktree_diff"),

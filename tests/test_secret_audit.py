@@ -4,7 +4,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from scripts.check_secret_patterns import format_findings, scan_added_diff_text
+from scripts.check_secret_patterns import (
+    format_findings,
+    scan_added_diff_text,
+    sensitive_report_fields,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -40,3 +44,18 @@ def test_added_diff_diagnostics_never_echo_a_matched_value():
     assert findings[0].rule_id == "openai_api_key"
     assert "config.py:1" in report
     assert simulated_secret not in report
+
+
+def test_benchmark_report_field_audit_rejects_secret_or_source_payload_keys():
+    report = {
+        "provider": {"name": "gemini"},
+        "nested": {
+            "api_key": "must-not-be-echoed",
+            "content_bytes": "must-not-be-recorded",
+        },
+    }
+
+    assert sensitive_report_fields(report) == (
+        "nested.api_key",
+        "nested.content_bytes",
+    )

@@ -212,6 +212,59 @@ def test_stop_after_validated_frontier_interrupts_before_snapshot_publication(
     assert [event["event_type"] for event in events].count("resumed") == 1
 
 
+def test_one_resume_continues_when_stop_makes_the_frontier_retryable(
+    tmp_path: Path,
+):
+    controls = RunControlRegistry()
+
+    class StopPausedFrontierService(StagedEvidenceService):
+        def analyze_frontier(self, workspace_id, revision_id, run_id):
+            self.frontier_count += 1
+            first = self.frontier_count == 1
+            outcome = SchedulerOutcome(
+                status=(
+                    SchedulerStatus.PAUSED if first else SchedulerStatus.COMPLETE
+                ),
+                processed_part_ids=(f"part-{self.frontier_count}",),
+                pending_count=1 if first else 0,
+            )
+            self.calls.append(
+                (
+                    "analyze",
+                    workspace_id,
+                    revision_id,
+                    run_id,
+                    outcome.pending_count,
+                )
+            )
+            if first:
+                self.controls.request_stop(run_id)
+            return EvidenceFrontierResult(
+                workspace_id=workspace_id,
+                revision_id=revision_id,
+                outcome=outcome,
+            )
+
+    service = StopPausedFrontierService(controls)
+    config = {"configurable": {"thread_id": f"workspace:{WORKSPACE_ID}"}}
+    with SqliteSaver.from_conn_string(str(tmp_path / "checkpoints.sqlite3")) as saver:
+        graph = build_evidence_graph(_dependencies(service, []), saver)
+        paused = graph.invoke(_initial_state("run-stop-retryable"), config)
+        assert paused["__interrupt__"]
+
+        resumed = graph.invoke(Command(resume={"action": "resume"}), config)
+
+    assert "__interrupt__" not in resumed
+    assert resumed["tool_result"]["metadata"]["status"] == "complete"
+    assert [call[0] for call in service.calls] == [
+        "prepare",
+        "analyze",
+        "publish",
+        "analyze",
+        "publish",
+    ]
+
+
 def test_stop_before_authorization_checkpoints_without_preparing_sources(
     tmp_path: Path,
 ):

@@ -71,7 +71,17 @@ def build_kernel_graph(deps: KernelDependencies, checkpointer):
 
     def plan(state: KernelState) -> dict[str, Any]:
         run_id = state["run_id"]
-        deps.emit(run_id, "progress", "planning", "Choosing the next Agent tool.")
+        deps.emit(
+            run_id,
+            "progress",
+            "planning",
+            "Choosing the next Agent tool.",
+            {
+                "evidence_event": "provider_operation_started",
+                "operation": "kernel_planner",
+                "model_route": "fast",
+            },
+        )
         provider = deps.provider_sessions.get_provider(state["provider_profile_id"])
         workspace_id = state.get("workspace_id")
         evidence_context = None

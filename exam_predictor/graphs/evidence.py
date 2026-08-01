@@ -31,6 +31,7 @@ class EvidenceGraphState(TypedDict, total=False):
     evidence_result: dict[str, Any]
     tool_result: dict[str, Any]
     pause_pending: bool
+    resumed_from_stop: bool
     authority_error: dict[str, str] | None
 
 
@@ -64,7 +65,7 @@ def build_evidence_graph(
             f"Running {tool}.",
             {"tool": tool},
         )
-        return {"pause_pending": False}
+        return {"pause_pending": False, "resumed_from_stop": False}
 
     def route_kind(state: EvidenceGraphState) -> str:
         if state["selected_tool"] == "inspect_course_sources":
@@ -103,7 +104,7 @@ def build_evidence_graph(
                 "Course evidence analysis resumed from its checkpoint.",
                 {"stage": stage},
             )
-            return {"pause_pending": False}
+            return {"pause_pending": False, "resumed_from_stop": True}
 
         return pause
 
@@ -157,6 +158,7 @@ def build_evidence_graph(
         return {
             "authority_error": None,
             "frontier": frontier.model_dump(mode="json"),
+            "resumed_from_stop": False,
         }
 
     def publish(state: EvidenceGraphState) -> dict[str, Any]:
@@ -185,6 +187,8 @@ def build_evidence_graph(
         result = EvidencePublicationState.model_validate(state["evidence_result"])
         if result.status == "complete":
             return "complete"
+        if state.get("resumed_from_stop") and not frontier.outcome.failed_part_ids:
+            return "continue"
         if frontier.outcome.status is SchedulerStatus.PAUSED:
             return "paused"
         return "continue"
@@ -225,6 +229,7 @@ def build_evidence_graph(
         return {
             "authority_error": None,
             "pause_pending": False,
+            "resumed_from_stop": False,
         }
 
     def pause_evidence(state: EvidenceGraphState) -> dict[str, Any]:
@@ -248,7 +253,7 @@ def build_evidence_graph(
             "Course evidence analysis resumed from its checkpoint.",
             {"stage": "frontier"},
         )
-        return {"pause_pending": False}
+        return {"pause_pending": False, "resumed_from_stop": False}
 
     def finish(state: EvidenceGraphState) -> dict[str, Any]:
         result = EvidencePublicationState.model_validate(state["evidence_result"])

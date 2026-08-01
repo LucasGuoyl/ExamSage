@@ -1396,7 +1396,10 @@ class WorkspaceStore:
                         "safe_message": None,
                     }
                 )
-            if included and item.inclusion_reason == "user_excluded":
+            if included and (
+                item.inclusion_reason == "user_excluded"
+                or item.state is SourceState.CHANGED
+            ):
                 return item.model_copy(
                     update={
                         "state": SourceState.PENDING_APPROVAL,

@@ -832,6 +832,26 @@ class OwnedArtifactFilesystem:
             if descriptor is not None:
                 os.close(descriptor)
 
+    def verify_directory_anchor(self, anchor: OwnedDirectoryAnchor) -> None:
+        """Revalidate an owned directory handle against its current name."""
+        self._assert_anchor(anchor, anchor.identity)
+
+    def verify_mutation_file(self, source: OwnedMutationFile) -> None:
+        """Revalidate an open regular file, link count, parent, name, and identity."""
+        self._validate_regular(os.fstat(source.descriptor), source.identity)
+        self._assert_named_file(source.parent, source.name, source.identity)
+        self._assert_anchor(source.parent, source.parent.identity)
+
+    @classmethod
+    def directory_quarantine_name(
+        cls,
+        name: str,
+        identity: tuple[int, int],
+    ) -> str:
+        """Return the deterministic owned-directory tombstone for recovery."""
+        cls._validate_name(name)
+        return cls._directory_quarantine_name(name, identity)
+
     @contextmanager
     def open_claimed_file(
         self,

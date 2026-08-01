@@ -16,6 +16,11 @@ import streamlit as st
 from exam_predictor.agent import ExamSageAgent
 from exam_predictor.budget import estimate_run_cost
 from exam_predictor.exporter import report_to_pdf_bytes
+from exam_predictor.legacy_intake import (
+    LegacyIntakeError,
+    acquire_legacy_intake_lease,
+    cleanup_legacy_intake,
+)
 from exam_predictor.pipeline import ExamPredictor
 from exam_predictor.providers import BudgetExceeded, ProviderError, create_provider
 from exam_predictor.schema import KnowledgeTreeNode, PredictionReport
@@ -114,6 +119,11 @@ def save_uploads(uploaded_files) -> list[Path]:
     session_id = st.session_state.setdefault("intake_id", uuid.uuid4().hex)
     destination = INTAKE_DIR / session_id
     destination.mkdir(parents=True, exist_ok=True)
+    if "intake_lease" not in st.session_state:
+        st.session_state["intake_lease"] = acquire_legacy_intake_lease(
+            DATA_DIR,
+            session_id,
+        )
     paths: list[Path] = []
     for index, upload in enumerate(uploaded_files):
         name = safe_filename(upload.name)
@@ -494,9 +504,17 @@ if estimate:
                     status.update(label="Your ExamSage agent is ready", state="complete")
                 st.session_state["course_id"] = course_id
                 st.session_state["report"] = report
-                intake = INTAKE_DIR / st.session_state.get("intake_id", "")
-                if intake.exists() and INTAKE_DIR.resolve() in intake.resolve().parents:
-                    shutil.rmtree(intake, ignore_errors=True)
+                intake_session_id = st.session_state.get("intake_id", "")
+                intake_lease = st.session_state.pop("intake_lease", None)
+                if intake_lease is not None:
+                    intake_lease.close()
+                try:
+                    cleanup_legacy_intake(
+                        DATA_DIR,
+                        session_ids=(intake_session_id,),
+                    )
+                except LegacyIntakeError:
+                    pass
             except (BudgetExceeded, UploadSecurityError, ProviderError, ValueError) as exc:
                 st.error(str(exc))
             except Exception as exc:

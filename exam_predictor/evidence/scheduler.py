@@ -280,19 +280,10 @@ class EvidenceScheduler:
                         return _PartOutcome(part.part_id, PartState.RETRY_WAIT)
                     provider_result = self._provider.analyze_source_part(request)
                     unit = self._validator(provider_result, part)
-                    if self._must_pause(run_id, deadline):
-                        self._store.record_attempt(
-                            part.part_id,
-                            attempt=attempt,
-                            route=self._route_key(route),
-                            outcome=PartState.RETRY_WAIT,
-                            started_at=started_at,
-                            finished_at=self._wall_clock(),
-                            safe_error_code="provider_result_unpublished",
-                            next_attempt_at=self._wall_clock(),
-                            claim_token=claim_token,
-                        )
-                        return _PartOutcome(part.part_id, PartState.RETRY_WAIT)
+                    # A stop is a boundary for new provider work, not for the
+                    # local publication of an already-paid, validated result.
+                    # Persist it under the still-held authority so Resume does
+                    # not repeat the completed external call.
                     try:
                         self._store.publish_evidence(
                             part.part_id,
