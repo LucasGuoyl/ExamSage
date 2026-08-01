@@ -1,6 +1,7 @@
 from exam_predictor.evidence.models import (
     CoverageItem,
     CoverageSummary,
+    CourseGroup,
     EvidenceCitation,
     EvidenceUnit,
     KnowledgeNode,
@@ -10,18 +11,37 @@ from exam_predictor.evidence.models import (
     StudyMapSnapshot,
 )
 from exam_predictor.evidence.policy import EvidencePolicy, representative_ordinals, source_priority
+from exam_predictor.evidence.study_map import (
+    ApprovedCoverageEntry,
+    EvidenceAnswerContext,
+    EvidenceRepairRequest,
+    EvidenceValidationError,
+    EvidenceValidator,
+    StudyMapBuilder,
+    StudyMapSynthesisRequest,
+    StudyMapSynthesizer,
+)
 
 __all__ = [
+    "ApprovedCoverageEntry",
     "CoverageItem",
     "CoverageSummary",
+    "CourseGroup",
     "EvidenceCitation",
+    "EvidenceAnswerContext",
     "EvidencePolicy",
+    "EvidenceRepairRequest",
     "EvidenceUnit",
+    "EvidenceValidationError",
+    "EvidenceValidator",
     "KnowledgeNode",
     "PartState",
     "SnapshotStatus",
     "SourcePartPlan",
     "StudyMapSnapshot",
+    "StudyMapBuilder",
+    "StudyMapSynthesisRequest",
+    "StudyMapSynthesizer",
     "representative_ordinals",
     "source_priority",
 ]

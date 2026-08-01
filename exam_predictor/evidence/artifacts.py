@@ -226,6 +226,36 @@ class EvidenceArtifactStore:
             raise ArtifactBoundaryError("artifact_identity_changed") from None
         return self._decode_json(workspace_id, artifact_type, artifact_id, content)
 
+    def revoke_json(
+        self,
+        workspace_id: str,
+        artifact_type: str,
+        artifact_id: str,
+    ) -> None:
+        """Atomically replace a derived JSON artifact with an invalid tombstone."""
+
+        self._validate_identifier(workspace_id)
+        self._validate_json_type(artifact_type)
+        self._validate_identifier(artifact_id)
+        tombstone = b"{}"
+        try:
+            self._publish_bytes(
+                workspace_id,
+                artifact_type,
+                artifact_id,
+                tombstone,
+                hashlib.sha256(tombstone).hexdigest(),
+                suffix=".json",
+            )
+        except ArtifactBoundaryError:
+            raise
+        except RegistryError as error:
+            self._raise_registry_boundary(error)
+        except OwnedFilesystemError as error:
+            self._raise_filesystem_boundary(error)
+        except Exception:
+            raise ArtifactBoundaryError("artifact_publish_failed") from None
+
     def delete_workspace(self, workspace_id: str) -> ArtifactCleanupState:
         self._validate_identifier(workspace_id)
         try:
@@ -1289,6 +1319,8 @@ class EvidenceArtifactStore:
 
     @staticmethod
     def _raise_registry_boundary(error: RegistryError) -> None:
+        if error.code == "registry_slot_revoked":
+            raise ArtifactBoundaryError("artifact_revoked") from None
         if error.code in {"registry_identity_changed", "registry_claim_invalid"}:
             raise ArtifactBoundaryError("artifact_identity_changed") from None
         if error.code in {"registry_pending", "registry_state_conflict"}:

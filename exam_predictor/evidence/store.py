@@ -22,7 +22,7 @@ from exam_predictor.evidence.models import (
 )
 
 
-_SCHEMA_VERSION = "3"
+_SCHEMA_VERSION = "5"
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS evidence_meta (
@@ -86,6 +86,12 @@ _SCHEMA = (
       snapshot_id TEXT NOT NULL REFERENCES study_map_snapshots(snapshot_id) ON DELETE CASCADE,
       evidence_unit_id TEXT NOT NULL REFERENCES evidence_units(evidence_unit_id) ON DELETE CASCADE,
       PRIMARY KEY(snapshot_id, evidence_unit_id)
+    )""",
+    """CREATE TABLE IF NOT EXISTS snapshot_artifact_revocations (
+      workspace_id TEXT NOT NULL,
+      snapshot_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      completed_at TEXT
     )""",
     """CREATE INDEX IF NOT EXISTS idx_evidence_parts_workspace_revision_state
       ON evidence_parts(workspace_id, revision_id, state, priority)""",
@@ -313,6 +319,17 @@ class EvidenceStore:
                     """ALTER TABLE evidence_cache ADD COLUMN claim_generation
                        INTEGER CHECK(claim_generation IS NULL OR claim_generation >= 0)"""
                 )
+            revocation_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(snapshot_artifact_revocations)"
+                )
+            }
+            if "completed_at" not in revocation_columns:
+                connection.execute(
+                    """ALTER TABLE snapshot_artifact_revocations
+                       ADD COLUMN completed_at TEXT"""
+                )
             for index_name, (expected_columns, statement) in _REQUIRED_INDEXES.items():
                 actual_columns = tuple(
                     str(item["name"])
@@ -446,6 +463,28 @@ class EvidenceStore:
         if row is None:
             raise KeyError(f"Evidence part '{part_id}' was not found.")
         return self._part(row)
+
+    def list_parts(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> tuple[SourcePartPlan, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT * FROM evidence_parts
+                   WHERE workspace_id = ? AND revision_id = ?
+                   ORDER BY priority ASC, ordinal ASC, part_id ASC""",
+                (workspace_id, revision_id),
+            ).fetchall()
+        return tuple(self._part(row) for row in rows)
+
+    def is_current_revision(self, workspace_id: str, revision_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(workspace_id)}",),
+            ).fetchone()
+        return row is not None and row["value"] == revision_id
 
     def attempt_count(self, part_id: str) -> int:
         with self._lock:
@@ -828,6 +867,54 @@ class EvidenceStore:
             ).fetchone()
         return None if row is None else self._unit(row)
 
+    def list_evidence_units(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> tuple[EvidenceUnit, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT units.unit_json
+                   FROM evidence_units AS units
+                   JOIN evidence_parts AS parts
+                     ON parts.part_id = units.source_part_id
+                   WHERE parts.workspace_id = ? AND parts.revision_id = ?
+                     AND parts.state = ?
+                     AND units.rowid = (
+                       SELECT MAX(newest.rowid)
+                       FROM evidence_units AS newest
+                       WHERE newest.source_part_id = units.source_part_id
+                     )
+                   ORDER BY parts.priority ASC, parts.ordinal ASC, parts.part_id ASC""",
+                (workspace_id, revision_id, PartState.PROCESSED.value),
+            ).fetchall()
+        return tuple(self._unit(row) for row in rows)
+
+    def latest_evidence_times(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> dict[str, datetime]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT parts.part_id, units.published_at
+                   FROM evidence_units AS units
+                   JOIN evidence_parts AS parts
+                     ON parts.part_id = units.source_part_id
+                   WHERE parts.workspace_id = ? AND parts.revision_id = ?
+                     AND parts.state = ?
+                     AND units.rowid = (
+                       SELECT MAX(newest.rowid)
+                       FROM evidence_units AS newest
+                       WHERE newest.source_part_id = units.source_part_id
+                     )""",
+                (workspace_id, revision_id, PartState.PROCESSED.value),
+            ).fetchall()
+        return {
+            str(row["part_id"]): datetime.fromisoformat(str(row["published_at"]))
+            for row in rows
+        }
+
     def cached_evidence(self, cache_key: str) -> EvidenceUnit | None:
         with self._lock:
             row = self._connection.execute(
@@ -1082,6 +1169,130 @@ class EvidenceStore:
             ).fetchone()
         return None if row is None else self._snapshot(row)
 
+    def current_snapshot(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> StudyMapSnapshot | None:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT snapshot_json FROM study_map_snapshots
+                   WHERE workspace_id = ? AND revision_id = ?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (workspace_id, revision_id),
+            ).fetchone()
+        return None if row is None else self._snapshot(row)
+
+    @staticmethod
+    def _snapshot_identity_payload(snapshot_json: str) -> dict[str, object]:
+        payload = json.loads(snapshot_json)
+        if not isinstance(payload, dict):
+            raise ValueError("snapshot JSON must be an object")
+        payload.pop("created_at", None)
+        return payload
+
+    def _validated_snapshot_dependencies(
+        self,
+        connection: sqlite3.Connection,
+        snapshot: StudyMapSnapshot,
+    ) -> tuple[sqlite3.Row, ...]:
+        dependency_ids = tuple(sorted(snapshot.evidence_unit_ids))
+        if not dependency_ids:
+            return ()
+        placeholders = ",".join("?" for _ in dependency_ids)
+        rows = connection.execute(
+            f"""SELECT units.evidence_unit_id, units.unit_json,
+                       units.rowid AS unit_rowid,
+                       parts.workspace_id, parts.revision_id, parts.state,
+                       (SELECT MAX(newest.rowid)
+                        FROM evidence_units AS newest
+                        WHERE newest.source_part_id = units.source_part_id)
+                         AS latest_unit_rowid
+                FROM evidence_units AS units
+                JOIN evidence_parts AS parts
+                  ON parts.part_id = units.source_part_id
+                WHERE units.evidence_unit_id IN ({placeholders})""",
+            dependency_ids,
+        ).fetchall()
+        if len(rows) != len(dependency_ids):
+            raise sqlite3.IntegrityError("snapshot evidence dependencies do not exist")
+        if any(
+            row["workspace_id"] != snapshot.workspace_id
+            or row["revision_id"] != snapshot.revision_id
+            or row["state"] != PartState.PROCESSED.value
+            or row["unit_rowid"] != row["latest_unit_rowid"]
+            for row in rows
+        ):
+            raise ValueError(
+                "snapshot evidence must be the latest processed unit in its workspace revision"
+            )
+        return tuple(rows)
+
+    def current_snapshot_context(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> tuple[StudyMapSnapshot, tuple[EvidenceUnit, ...]] | None:
+        try:
+            with self._transaction() as connection:
+                current = connection.execute(
+                    "SELECT value FROM evidence_meta WHERE name = ?",
+                    (f"current_revision:{self._digest(workspace_id)}",),
+                ).fetchone()
+                if current is None or current["value"] != revision_id:
+                    return None
+                row = connection.execute(
+                    """SELECT snapshot_json FROM study_map_snapshots
+                       WHERE workspace_id = ? AND revision_id = ?
+                       ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                    (workspace_id, revision_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                snapshot = self._snapshot(row)
+                dependency_rows = self._validated_snapshot_dependencies(
+                    connection,
+                    snapshot,
+                )
+                by_id = {
+                    str(item["evidence_unit_id"]): self._unit(item)
+                    for item in dependency_rows
+                }
+                units = tuple(by_id[item] for item in snapshot.evidence_unit_ids)
+                return snapshot, units
+        except (ValueError, sqlite3.IntegrityError):
+            return None
+
+    def dependent_snapshots_for_entry(
+        self,
+        workspace_id: str,
+        revision_id: str,
+        entry_id: str,
+    ) -> tuple[StudyMapSnapshot, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT DISTINCT snapshots.snapshot_json, snapshots.created_at
+                   FROM study_map_snapshots AS snapshots
+                   JOIN study_map_dependencies AS dependencies
+                     ON dependencies.snapshot_id = snapshots.snapshot_id
+                   JOIN evidence_units AS units
+                     ON units.evidence_unit_id = dependencies.evidence_unit_id
+                   JOIN evidence_parts AS parts
+                     ON parts.part_id = units.source_part_id
+                   WHERE snapshots.workspace_id = ? AND snapshots.revision_id = ?
+                     AND parts.entry_id = ?
+                   ORDER BY snapshots.created_at ASC""",
+                (workspace_id, revision_id, entry_id),
+            ).fetchall()
+        return tuple(self._snapshot(row) for row in rows)
+
+    def delete_snapshot(self, snapshot_id: str) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM study_map_snapshots WHERE snapshot_id = ?",
+                (snapshot_id,),
+            )
+
     def save_snapshot(self, snapshot: StudyMapSnapshot) -> bool:
         snapshot_payload = snapshot.model_dump(mode="json")
         self._validate_serialized_strings(snapshot_payload)
@@ -1091,45 +1302,36 @@ class EvidenceStore:
             for node in snapshot.nodes
             for evidence_unit_id in node.evidence_unit_ids
         }
-        if dependency_ids != node_dependency_ids:
+        group_dependency_ids = {
+            evidence_unit_id
+            for group in snapshot.course_groups
+            for evidence_unit_id in group.evidence_unit_ids
+        }
+        if dependency_ids != node_dependency_ids | group_dependency_ids:
             raise ValueError(
-                "snapshot top-level and node evidence IDs must have one dependency closure"
+                "snapshot top-level, node, and group evidence IDs must have one dependency closure"
             )
         snapshot_json = self._canonical_json(snapshot_payload)
         created_at = self._timestamp(snapshot.created_at)
         with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(snapshot.workspace_id)}",),
+            ).fetchone()
+            if current is None or current["value"] != snapshot.revision_id:
+                raise ValueError("study-map snapshot revision is no longer current")
+            self._validated_snapshot_dependencies(connection, snapshot)
             existing = connection.execute(
                 """SELECT snapshot_json FROM study_map_snapshots
                    WHERE snapshot_id = ?""",
                 (snapshot.snapshot_id,),
             ).fetchone()
             if existing is not None:
-                if existing["snapshot_json"] == snapshot_json:
+                if self._snapshot_identity_payload(
+                    existing["snapshot_json"]
+                ) == self._snapshot_identity_payload(snapshot_json):
                     return False
                 raise ValueError("snapshot identity is already in use")
-            if dependency_ids:
-                placeholders = ",".join("?" for _ in dependency_ids)
-                dependency_rows = connection.execute(
-                    f"""SELECT units.evidence_unit_id,
-                               parts.workspace_id, parts.revision_id
-                        FROM evidence_units AS units
-                        JOIN evidence_parts AS parts
-                          ON parts.part_id = units.source_part_id
-                        WHERE units.evidence_unit_id IN ({placeholders})""",
-                    tuple(sorted(dependency_ids)),
-                ).fetchall()
-                if len(dependency_rows) != len(dependency_ids):
-                    raise sqlite3.IntegrityError(
-                        "snapshot evidence dependencies do not exist"
-                    )
-                if any(
-                    row["workspace_id"] != snapshot.workspace_id
-                    or row["revision_id"] != snapshot.revision_id
-                    for row in dependency_rows
-                ):
-                    raise ValueError(
-                        "snapshot evidence must belong to its workspace and revision"
-                    )
             connection.execute(
                 """INSERT INTO study_map_snapshots(
                        snapshot_id, workspace_id, revision_id, status,
@@ -1173,7 +1375,21 @@ class EvidenceStore:
         revision_id: str,
         entry_id: str,
     ) -> tuple[str, ...]:
+        part_ids, _snapshot_ids = self.invalidate_entry_with_revocations(
+            workspace_id,
+            revision_id,
+            entry_id,
+        )
+        return part_ids
+
+    def invalidate_entry_with_revocations(
+        self,
+        workspace_id: str,
+        revision_id: str,
+        entry_id: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         now = self._timestamp(self._now())
+        assert now is not None
         with self._transaction() as connection:
             rows = connection.execute(
                 """SELECT part_id FROM evidence_parts
@@ -1183,7 +1399,7 @@ class EvidenceStore:
             ).fetchall()
             part_ids = tuple(str(row["part_id"]) for row in rows)
             if not part_ids:
-                return ()
+                return (), ()
             placeholders = ",".join("?" for _ in part_ids)
             unit_rows = connection.execute(
                 f"""SELECT evidence_unit_id FROM evidence_units
@@ -1191,8 +1407,28 @@ class EvidenceStore:
                 part_ids,
             ).fetchall()
             unit_ids = tuple(str(row["evidence_unit_id"]) for row in unit_rows)
+            snapshot_ids: tuple[str, ...] = ()
             if unit_ids:
                 unit_placeholders = ",".join("?" for _ in unit_ids)
+                snapshot_rows = connection.execute(
+                    f"""SELECT DISTINCT snapshots.snapshot_id
+                        FROM study_map_snapshots AS snapshots
+                        JOIN study_map_dependencies AS dependencies
+                          ON dependencies.snapshot_id = snapshots.snapshot_id
+                        WHERE dependencies.evidence_unit_id IN ({unit_placeholders})
+                          AND snapshots.workspace_id = ? AND snapshots.revision_id = ?
+                        ORDER BY snapshots.snapshot_id ASC""",
+                    (*unit_ids, workspace_id, revision_id),
+                ).fetchall()
+                snapshot_ids = tuple(str(row["snapshot_id"]) for row in snapshot_rows)
+                for snapshot_id in snapshot_ids:
+                    connection.execute(
+                        """INSERT INTO snapshot_artifact_revocations(
+                               workspace_id, snapshot_id, created_at
+                           ) VALUES (?, ?, ?)
+                           ON CONFLICT(snapshot_id) DO NOTHING""",
+                        (workspace_id, snapshot_id, now),
+                    )
                 connection.execute(
                     f"""DELETE FROM study_map_snapshots
                         WHERE snapshot_id IN (
@@ -1211,10 +1447,59 @@ class EvidenceStore:
                     WHERE part_id IN ({placeholders})""",
                 (PartState.INVALIDATED.value, now, *part_ids),
             )
-        return part_ids
+        return part_ids, snapshot_ids
+
+    def pending_snapshot_revocations(
+        self,
+        workspace_id: str,
+    ) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT snapshot_id FROM snapshot_artifact_revocations
+                   WHERE workspace_id = ? AND completed_at IS NULL
+                   ORDER BY created_at ASC, snapshot_id ASC""",
+                (workspace_id,),
+            ).fetchall()
+        return tuple(str(row["snapshot_id"]) for row in rows)
+
+    def snapshot_revocations(self, workspace_id: str) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT snapshot_id FROM snapshot_artifact_revocations
+                   WHERE workspace_id = ? ORDER BY created_at ASC, snapshot_id ASC""",
+                (workspace_id,),
+            ).fetchall()
+        return tuple(str(row["snapshot_id"]) for row in rows)
+
+    def snapshot_is_revoked(self, workspace_id: str, snapshot_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT 1 FROM snapshot_artifact_revocations
+                   WHERE workspace_id = ? AND snapshot_id = ?""",
+                (workspace_id, snapshot_id),
+            ).fetchone()
+        return row is not None
+
+    def complete_snapshot_revocation(
+        self,
+        workspace_id: str,
+        snapshot_id: str,
+    ) -> None:
+        completed_at = self._timestamp(self._now())
+        with self._transaction() as connection:
+            connection.execute(
+                """UPDATE snapshot_artifact_revocations
+                   SET completed_at = COALESCE(completed_at, ?)
+                   WHERE workspace_id = ? AND snapshot_id = ?""",
+                (completed_at, workspace_id, snapshot_id),
+            )
 
     def delete_workspace(self, workspace_id: str) -> None:
         with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM snapshot_artifact_revocations WHERE workspace_id = ?",
+                (workspace_id,),
+            )
             connection.execute(
                 "DELETE FROM study_map_snapshots WHERE workspace_id = ?",
                 (workspace_id,),

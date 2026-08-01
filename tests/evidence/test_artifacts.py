@@ -297,6 +297,40 @@ def test_publish_json_uses_only_the_fixed_owned_layout(tmp_path, artifact_type, 
     assert expected_path.read_bytes() == encoded
 
 
+def test_revoked_json_slot_cannot_be_republished_by_another_store(tmp_path):
+    data_root = tmp_path / "data"
+    first = EvidenceArtifactStore(data_root)
+    second = EvidenceArtifactStore(data_root)
+    snapshot = _snapshot()
+    encoded = _canonical_json(snapshot)
+    try:
+        first.publish_json(
+            WORKSPACE_ID,
+            "snapshots",
+            SNAPSHOT_ID,
+            snapshot,
+            expected_sha256=_sha256(encoded),
+        )
+        first.revoke_json(WORKSPACE_ID, "snapshots", SNAPSHOT_ID)
+
+        with pytest.raises(ArtifactBoundaryError) as caught:
+            second.publish_json(
+                WORKSPACE_ID,
+                "snapshots",
+                SNAPSHOT_ID,
+                snapshot,
+                expected_sha256=_sha256(encoded),
+            )
+
+        assert caught.value.code == "artifact_revoked"
+        with pytest.raises(ArtifactBoundaryError):
+            second.read_json(WORKSPACE_ID, "snapshots", SNAPSHOT_ID)
+        second.revoke_json(WORKSPACE_ID, "snapshots", SNAPSHOT_ID)
+    finally:
+        second.close()
+        first.close()
+
+
 @pytest.mark.parametrize("document", [[], "text", 1, None])
 def test_publish_json_rejects_nonobject_documents(tmp_path, document):
     store = EvidenceArtifactStore(tmp_path / "data")

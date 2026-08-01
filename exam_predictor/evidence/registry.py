@@ -30,6 +30,7 @@ _PUBLISH_PHASES = frozenset({"prepared", "backup", "installed", "committed"})
 _DELETE_PHASES = frozenset({"planned", "quarantined", "removed"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GENERATION = re.compile(r"^[0-9a-f]{32}$")
+_REVOKED_ARTIFACT_SHA256 = hashlib.sha256(b"{}").hexdigest()
 _MAX_RECORD_BYTES = 16 * 1024 * 1024
 _MAX_LOG_BYTES = 256 * 1024 * 1024
 
@@ -370,8 +371,16 @@ class EvidenceArtifactRegistry:
             workspace = state.workspaces.get(intent.workspace_id)
             if workspace is None or workspace.phase != "active" or intent.generation != workspace.generation:
                 raise RegistryError("registry_state_conflict")
+            current = state.artifacts.get((intent.workspace_id, intent.slot))
             if (
-                state.artifacts.get((intent.workspace_id, intent.slot)) != intent.old_claim
+                current is not None
+                and intent.collection == "snapshots"
+                and current.sha256 == _REVOKED_ARTIFACT_SHA256
+                and intent.expected_sha256 != _REVOKED_ARTIFACT_SHA256
+            ):
+                raise RegistryError("registry_slot_revoked")
+            if (
+                current != intent.old_claim
                 or intent.workspace_id in state.publish_intents
                 or intent.workspace_id in state.publish_journals
             ):
