@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 import hashlib
 import json
 import time
-from typing import Protocol
+from typing import ContextManager, Protocol
 
 from exam_predictor.evidence.artifacts import EvidenceArtifactStore
 from exam_predictor.evidence.models import EvidenceUnit, PartState, SourcePartPlan
@@ -46,6 +47,15 @@ class SchedulerProvider(Protocol):
 
 EvidenceValidator = Callable[[EvidencePartResult, SourcePartPlan], EvidenceUnit]
 EventEmitter = Callable[[str, dict[str, object]], None]
+PartAuthorizationGuard = Callable[[SourcePartPlan], ContextManager[object]]
+
+
+class EvidenceAuthorizationError(RuntimeError):
+    pass
+
+
+class _EvidencePublicationError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -89,6 +99,7 @@ class EvidenceScheduler:
         revision_id: str,
         *,
         deadline: float | None = None,
+        authorize_part: PartAuthorizationGuard | None = None,
     ) -> SchedulerOutcome:
         boundary = deadline
         if boundary is None:
@@ -120,6 +131,7 @@ class EvidenceScheduler:
                     run_id,
                     claim,
                     boundary,
+                    authorize_part,
                 )
             results = tuple(
                 futures[claim.plan.part_id].result() for claim in claimed
@@ -204,10 +216,17 @@ class EvidenceScheduler:
         run_id: str,
         claim: EvidencePartClaim,
         deadline: float,
+        authorize_part: PartAuthorizationGuard | None,
     ) -> _PartOutcome:
         token_holder = [claim.claim_token]
         try:
-            return self._run_part(run_id, claim, deadline, token_holder)
+            return self._run_part(
+                run_id,
+                claim,
+                deadline,
+                token_holder,
+                authorize_part,
+            )
         except Exception:
             self._pause_claim(claim.plan, token_holder[0])
             return _PartOutcome(claim.plan.part_id, PartState.RETRY_WAIT)
@@ -218,6 +237,7 @@ class EvidenceScheduler:
         claim: EvidencePartClaim,
         deadline: float,
         token_holder: list[str],
+        authorize_part: PartAuthorizationGuard | None,
     ) -> _PartOutcome:
         part = claim.plan
         claim_token = claim.claim_token
@@ -229,12 +249,13 @@ class EvidenceScheduler:
         except EvidenceProviderError as error:
             return self._record_recoverable_route_error(part, claim_token, error)
         cache_key = self._cache_key(part, route)
-        cached = self._store.reuse_cached_evidence(
-            part.part_id,
-            cache_key=cache_key,
-            claim_token=claim_token,
-            completed_at=self._wall_clock(),
-        )
+        with self._authorization_context(authorize_part, part):
+            cached = self._store.reuse_cached_evidence(
+                part.part_id,
+                cache_key=cache_key,
+                claim_token=claim_token,
+                completed_at=self._wall_clock(),
+            )
         if cached is not None:
             self._emit("part_processed", part, {"cache_hit": True})
             return _PartOutcome(part.part_id, PartState.PROCESSED)
@@ -252,12 +273,40 @@ class EvidenceScheduler:
                 {"attempt": attempt, "model_route": route.model_route},
             )
             try:
-                request = self._request(part, deadline)
-                if self._must_pause(run_id, deadline):
-                    self._pause_claim(part, claim_token)
-                    return _PartOutcome(part.part_id, PartState.RETRY_WAIT)
-                provider_result = self._provider.analyze_source_part(request)
-                unit = self._validator(provider_result, part)
+                with self._authorization_context(authorize_part, part):
+                    request = self._request(part, deadline)
+                    if self._must_pause(run_id, deadline):
+                        self._pause_claim(part, claim_token)
+                        return _PartOutcome(part.part_id, PartState.RETRY_WAIT)
+                    provider_result = self._provider.analyze_source_part(request)
+                    unit = self._validator(provider_result, part)
+                    if self._must_pause(run_id, deadline):
+                        self._store.record_attempt(
+                            part.part_id,
+                            attempt=attempt,
+                            route=self._route_key(route),
+                            outcome=PartState.RETRY_WAIT,
+                            started_at=started_at,
+                            finished_at=self._wall_clock(),
+                            safe_error_code="provider_result_unpublished",
+                            next_attempt_at=self._wall_clock(),
+                            claim_token=claim_token,
+                        )
+                        return _PartOutcome(part.part_id, PartState.RETRY_WAIT)
+                    try:
+                        self._store.publish_evidence(
+                            part.part_id,
+                            unit,
+                            cache_key=cache_key,
+                            claim_token=claim_token,
+                            completed_at=self._wall_clock(),
+                        )
+                    except Exception as error:
+                        raise _EvidencePublicationError from error
+            except EvidenceAuthorizationError:
+                raise
+            except _EvidencePublicationError:
+                raise
             except EvidenceProviderError as error:
                 finished_at = self._wall_clock()
                 if (
@@ -339,26 +388,6 @@ class EvidenceScheduler:
                 )
                 return _PartOutcome(part.part_id, PartState.FAILED)
 
-            if self._must_pause(run_id, deadline):
-                self._store.record_attempt(
-                    part.part_id,
-                    attempt=attempt,
-                    route=self._route_key(route),
-                    outcome=PartState.RETRY_WAIT,
-                    started_at=started_at,
-                    finished_at=self._wall_clock(),
-                    safe_error_code="provider_result_unpublished",
-                    next_attempt_at=self._wall_clock(),
-                    claim_token=claim_token,
-                )
-                return _PartOutcome(part.part_id, PartState.RETRY_WAIT)
-            self._store.publish_evidence(
-                part.part_id,
-                unit,
-                cache_key=cache_key,
-                claim_token=claim_token,
-                completed_at=self._wall_clock(),
-            )
             self._emit(
                 "part_processed",
                 part,
@@ -366,6 +395,13 @@ class EvidenceScheduler:
             )
             return _PartOutcome(part.part_id, PartState.PROCESSED)
         return _PartOutcome(part.part_id, PartState.FAILED)
+
+    @staticmethod
+    def _authorization_context(
+        authorize_part: PartAuthorizationGuard | None,
+        part: SourcePartPlan,
+    ) -> ContextManager[object]:
+        return nullcontext() if authorize_part is None else authorize_part(part)
 
     def _request(
         self,

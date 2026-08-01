@@ -11,6 +11,14 @@ from exam_predictor.evidence.models import (
     StudyMapSnapshot,
 )
 from exam_predictor.evidence.policy import EvidencePolicy, representative_ordinals, source_priority
+from exam_predictor.evidence.service import (
+    EvidenceAnswerRequest,
+    EvidenceAnswerResult,
+    EvidenceInspection,
+    EvidenceRunResult,
+    EvidenceService,
+    EvidenceServiceError,
+)
 from exam_predictor.evidence.study_map import (
     ApprovedCoverageEntry,
     EvidenceAnswerContext,
@@ -29,8 +37,14 @@ __all__ = [
     "CourseGroup",
     "EvidenceCitation",
     "EvidenceAnswerContext",
+    "EvidenceAnswerRequest",
+    "EvidenceAnswerResult",
+    "EvidenceInspection",
     "EvidencePolicy",
     "EvidenceRepairRequest",
+    "EvidenceRunResult",
+    "EvidenceService",
+    "EvidenceServiceError",
     "EvidenceUnit",
     "EvidenceValidationError",
     "EvidenceValidator",

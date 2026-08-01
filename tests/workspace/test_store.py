@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
@@ -26,6 +29,7 @@ from exam_predictor.workspace.store import (
     InvalidApprovalError,
     ManifestNotFoundError,
     StaleManifestError,
+    TransmissionAuthorityReentrancyError,
     WorkspaceJobNotFoundError,
     WorkspaceNotFoundError,
     WorkspaceStore,
@@ -1284,3 +1288,184 @@ def test_close_is_explicit_and_idempotent(tmp_path: Path):
 
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         connection.execute("SELECT 1")
+
+
+def test_transmission_authority_lock_is_shared_across_store_instances(
+    store: WorkspaceStore,
+    scanned_workspace: WorkspaceRecord,
+    tmp_path: Path,
+):
+    manifest = store.get_manifest(scanned_workspace.workspace_id)
+    approval = store.approve(
+        scanned_workspace.workspace_id,
+        manifest.revision_id,
+        manifest.policy_version,
+    )
+    second = WorkspaceStore(tmp_path / "workspace.sqlite3")
+    mutation_started = Event()
+
+    def revoke_from_second_store():
+        mutation_started.set()
+        return second.set_inclusion(
+            scanned_workspace.workspace_id,
+            manifest.revision_id,
+            (manifest.entries[0].entry_id,),
+            False,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with store.hold_transmission_authority(
+                scanned_workspace.workspace_id,
+                approval_id=approval.approval_id,
+                revision_id=manifest.revision_id,
+            ):
+                mutation = pool.submit(revoke_from_second_store)
+                assert mutation_started.wait(timeout=5)
+                assert not mutation.done()
+            changed = mutation.result(timeout=5)
+        assert changed.revision_id != manifest.revision_id
+    finally:
+        second.close()
+
+
+def test_cleanup_state_mutation_waits_for_transmission_authority(
+    store: WorkspaceStore,
+    scanned_workspace: WorkspaceRecord,
+    tmp_path: Path,
+):
+    manifest = store.get_manifest(scanned_workspace.workspace_id)
+    approval = store.approve(
+        scanned_workspace.workspace_id,
+        manifest.revision_id,
+        manifest.policy_version,
+    )
+    owned_root = tmp_path / "workspaces" / scanned_workspace.workspace_id
+    owned_root.mkdir(parents=True)
+    cleanup = store.queue_cleanup(
+        scanned_workspace.workspace_id,
+        owned_root,
+        "cleanup_failed",
+    )
+    second = WorkspaceStore(tmp_path / "workspace.sqlite3")
+    cleanup_started = Event()
+
+    def fail_from_second_store():
+        cleanup_started.set()
+        return second.fail_cleanup(cleanup.cleanup_id, "cleanup_retry_failed")
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with store.hold_transmission_authority(
+                scanned_workspace.workspace_id,
+                approval_id=approval.approval_id,
+                revision_id=manifest.revision_id,
+            ):
+                failed = pool.submit(fail_from_second_store)
+                assert cleanup_started.wait(timeout=5)
+                assert not failed.done()
+            record = failed.result(timeout=5)
+        assert record is not None
+        assert record.safe_error_code == "cleanup_retry_failed"
+    finally:
+        second.close()
+
+
+@pytest.mark.parametrize("use_hardlink_alias", [False, True])
+def test_transmission_authority_lock_is_shared_across_processes(
+    store: WorkspaceStore,
+    scanned_workspace: WorkspaceRecord,
+    tmp_path: Path,
+    use_hardlink_alias: bool,
+):
+    manifest = store.get_manifest(scanned_workspace.workspace_id)
+    approval = store.approve(
+        scanned_workspace.workspace_id,
+        manifest.revision_id,
+        manifest.policy_version,
+    )
+    database_path = tmp_path / "workspace.sqlite3"
+    if use_hardlink_alias:
+        with store._lock:
+            store._connection.execute("PRAGMA wal_checkpoint(FULL)")
+        alias = tmp_path / "workspace-alias.sqlite3"
+        os.link(database_path, alias)
+        database_path = alias
+    child_code = """
+import sys
+from pathlib import Path
+from exam_predictor.workspace.store import WorkspaceStore
+
+database_path, workspace_id, revision_id, entry_id = sys.argv[1:]
+child = WorkspaceStore(Path(database_path))
+try:
+    print("ready", flush=True)
+    child.set_inclusion(workspace_id, revision_id, (entry_id,), False)
+    print("changed", flush=True)
+finally:
+    child.close()
+"""
+    process = None
+    try:
+        with store.hold_transmission_authority(
+            scanned_workspace.workspace_id,
+            approval_id=approval.approval_id,
+            revision_id=manifest.revision_id,
+        ):
+            process = subprocess.Popen(
+                (
+                    sys.executable,
+                    "-c",
+                    child_code,
+                    str(database_path),
+                    scanned_workspace.workspace_id,
+                    manifest.revision_id,
+                    manifest.entries[0].entry_id,
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert process.stdout is not None
+            assert process.stdout.readline().strip() == "ready"
+            assert process.poll() is None
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == "changed"
+        if not use_hardlink_alias:
+            assert store.get_workspace(scanned_workspace.workspace_id).state is (
+                WorkspaceState.APPROVAL_REQUIRED
+            )
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_same_thread_authority_mutation_fails_fast_instead_of_deadlocking(
+    store: WorkspaceStore,
+    scanned_workspace: WorkspaceRecord,
+):
+    manifest = store.get_manifest(scanned_workspace.workspace_id)
+    approval = store.approve(
+        scanned_workspace.workspace_id,
+        manifest.revision_id,
+        manifest.policy_version,
+    )
+
+    with store.hold_transmission_authority(
+        scanned_workspace.workspace_id,
+        approval_id=approval.approval_id,
+        revision_id=manifest.revision_id,
+    ):
+        with pytest.raises(TransmissionAuthorityReentrancyError):
+            store.set_inclusion(
+                scanned_workspace.workspace_id,
+                manifest.revision_id,
+                (manifest.entries[0].entry_id,),
+                False,
+            )
+
+    assert store.get_workspace(scanned_workspace.workspace_id).state is (
+        WorkspaceState.APPROVED
+    )

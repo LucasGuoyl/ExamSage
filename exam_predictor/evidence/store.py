@@ -22,7 +22,7 @@ from exam_predictor.evidence.models import (
 )
 
 
-_SCHEMA_VERSION = "5"
+_SCHEMA_VERSION = "6"
 
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS evidence_meta (
@@ -92,6 +92,10 @@ _SCHEMA = (
       snapshot_id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL,
       completed_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS evidence_workspace_deletions (
+      workspace_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL
     )""",
     """CREATE INDEX IF NOT EXISTS idx_evidence_parts_workspace_revision_state
       ON evidence_parts(workspace_id, revision_id, state, priority)""",
@@ -485,6 +489,14 @@ class EvidenceStore:
                 (f"current_revision:{self._digest(workspace_id)}",),
             ).fetchone()
         return row is not None and row["value"] == revision_id
+
+    def current_revision_id(self, workspace_id: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM evidence_meta WHERE name = ?",
+                (f"current_revision:{self._digest(workspace_id)}",),
+            ).fetchone()
+        return None if row is None else str(row["value"])
 
     def attempt_count(self, part_id: str) -> int:
         with self._lock:
@@ -1494,23 +1506,68 @@ class EvidenceStore:
                 (completed_at, workspace_id, snapshot_id),
             )
 
-    def delete_workspace(self, workspace_id: str) -> None:
+    def begin_workspace_deletion(self, workspace_id: str) -> None:
+        created_at = self._timestamp(self._now())
         with self._transaction() as connection:
             connection.execute(
-                "DELETE FROM snapshot_artifact_revocations WHERE workspace_id = ?",
+                """INSERT INTO evidence_workspace_deletions(workspace_id, created_at)
+                   VALUES (?, ?) ON CONFLICT(workspace_id) DO NOTHING""",
+                (workspace_id, created_at),
+            )
+
+    def workspace_deletion_pending(self, workspace_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT 1 FROM evidence_workspace_deletions
+                   WHERE workspace_id = ?""",
+                (workspace_id,),
+            ).fetchone()
+        return row is not None
+
+    def pending_workspace_deletions(self) -> tuple[str, ...]:
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT workspace_id FROM evidence_workspace_deletions
+                   ORDER BY created_at ASC, workspace_id ASC"""
+            ).fetchall()
+        return tuple(str(row["workspace_id"]) for row in rows)
+
+    def complete_workspace_deletion(self, workspace_id: str) -> None:
+        with self._transaction() as connection:
+            self._delete_workspace_rows(connection, workspace_id)
+            connection.execute(
+                "DELETE FROM evidence_workspace_deletions WHERE workspace_id = ?",
                 (workspace_id,),
             )
+
+    def delete_workspace(self, workspace_id: str) -> None:
+        with self._transaction() as connection:
+            self._delete_workspace_rows(connection, workspace_id)
             connection.execute(
-                "DELETE FROM study_map_snapshots WHERE workspace_id = ?",
+                "DELETE FROM evidence_workspace_deletions WHERE workspace_id = ?",
                 (workspace_id,),
             )
-            connection.execute(
-                "DELETE FROM evidence_parts WHERE workspace_id = ?", (workspace_id,)
-            )
-            connection.execute(
-                "DELETE FROM evidence_meta WHERE name = ?",
-                (f"current_revision:{self._digest(workspace_id)}",),
-            )
+
+    def _delete_workspace_rows(
+        self,
+        connection: sqlite3.Connection,
+        workspace_id: str,
+    ) -> None:
+        connection.execute(
+            "DELETE FROM snapshot_artifact_revocations WHERE workspace_id = ?",
+            (workspace_id,),
+        )
+        connection.execute(
+            "DELETE FROM study_map_snapshots WHERE workspace_id = ?",
+            (workspace_id,),
+        )
+        connection.execute(
+            "DELETE FROM evidence_parts WHERE workspace_id = ?", (workspace_id,)
+        )
+        connection.execute(
+            "DELETE FROM evidence_meta WHERE name = ?",
+            (f"current_revision:{self._digest(workspace_id)}",),
+        )
 
     def recover_unfinished(self) -> tuple[str, ...]:
         now = self._timestamp(self._now())

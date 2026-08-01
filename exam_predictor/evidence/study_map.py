@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
 import re
 from threading import RLock
-from typing import Callable, Literal, Protocol
+from typing import Callable, ContextManager, Literal, Protocol
 
 from pydantic import ConfigDict, Field, ValidationError, field_validator
 
@@ -277,6 +278,7 @@ class ApprovedCoverageEntry(EvidenceFrozenModel):
 
 
 CoverageSource = Callable[[str, str], tuple[ApprovedCoverageEntry, ...]]
+PublicationGuard = Callable[[], ContextManager[object]]
 
 
 class StudyMapBuilder:
@@ -308,13 +310,17 @@ class StudyMapBuilder:
         self,
         workspace_id: str,
         revision_id: str,
+        *,
+        publication_guard: PublicationGuard | None = None,
+        synthesis_guard: PublicationGuard | None = None,
     ) -> StudyMapSnapshot | None:
         if not self._store.is_current_revision(workspace_id, revision_id):
             return None
         self.recover_snapshot_revocations(workspace_id)
         current = self._store.current_snapshot(workspace_id, revision_id)
         if current is not None:
-            self._ensure_snapshot_artifact(current)
+            with self._publication_context(publication_guard):
+                self._ensure_snapshot_artifact(current)
             return current
         parts = self._store.list_parts(workspace_id, revision_id)
         if not parts:
@@ -334,19 +340,25 @@ class StudyMapBuilder:
             units,
             parts,
             superseded_snapshot_id=None,
+            publication_guard=publication_guard,
+            synthesis_guard=synthesis_guard,
         )
 
     def publish_complete(
         self,
         workspace_id: str,
         revision_id: str,
+        *,
+        publication_guard: PublicationGuard | None = None,
+        synthesis_guard: PublicationGuard | None = None,
     ) -> StudyMapSnapshot | None:
         if not self._store.is_current_revision(workspace_id, revision_id):
             return None
         self.recover_snapshot_revocations(workspace_id)
         current = self._store.current_snapshot(workspace_id, revision_id)
         if current is not None and current.status is SnapshotStatus.COMPLETE:
-            self._ensure_snapshot_artifact(current)
+            with self._publication_context(publication_guard):
+                self._ensure_snapshot_artifact(current)
             return current
         parts = self._store.list_parts(workspace_id, revision_id)
         if not parts or any(
@@ -374,6 +386,8 @@ class StudyMapBuilder:
             units,
             parts,
             superseded_snapshot_id=(None if current is None else current.snapshot_id),
+            publication_guard=publication_guard,
+            synthesis_guard=synthesis_guard,
         )
 
     def answer_context(
@@ -404,6 +418,14 @@ class StudyMapBuilder:
             evidence_units=units,
             limitations=tuple(dict.fromkeys(limitations)),
         )
+
+    def coverage(
+        self,
+        workspace_id: str,
+        revision_id: str,
+    ) -> CoverageSummary:
+        parts = self._store.list_parts(workspace_id, revision_id)
+        return self._coverage(workspace_id, revision_id, parts)
 
     def invalidate_entry(
         self,
@@ -471,8 +493,11 @@ class StudyMapBuilder:
         parts: tuple[SourcePartPlan, ...],
         *,
         superseded_snapshot_id: str | None,
+        publication_guard: PublicationGuard | None,
+        synthesis_guard: PublicationGuard | None,
     ) -> StudyMapSnapshot:
-        payload = self._synthesize(workspace_id, revision_id, status, units)
+        with self._publication_context(synthesis_guard):
+            payload = self._synthesize(workspace_id, revision_id, status, units)
         coverage = _mark_snapshot_influence(coverage, parts, units, payload)
         created_at = self._now()
         dependency_ids = tuple(sorted(payload.evidence_unit_ids))
@@ -503,37 +528,46 @@ class StudyMapBuilder:
         )
         snapshot_document = snapshot.model_dump(mode="json")
         expected_sha256 = sha256(_canonical_json(snapshot_document).encode()).hexdigest()
-        inserted = self._store.save_snapshot(snapshot)
-        persisted = snapshot if inserted else self._store.get_snapshot(snapshot.snapshot_id)
-        if persisted is None:
-            raise EvidenceValidationError("study_map_invalid")
-        try:
-            self._ensure_snapshot_artifact(
-                persisted,
-                expected_sha256=(expected_sha256 if inserted else None),
+        with self._publication_context(publication_guard):
+            inserted = self._store.save_snapshot(snapshot)
+            persisted = (
+                snapshot if inserted else self._store.get_snapshot(snapshot.snapshot_id)
             )
-        except Exception:
-            if inserted:
-                try:
-                    self._revoke_snapshot_artifact(
-                        workspace_id,
-                        snapshot.snapshot_id,
-                    )
-                except Exception:
-                    pass
+            if persisted is None:
+                raise EvidenceValidationError("study_map_invalid")
+            try:
+                self._ensure_snapshot_artifact(
+                    persisted,
+                    expected_sha256=(expected_sha256 if inserted else None),
+                )
+            except Exception:
+                if inserted:
+                    try:
+                        self._revoke_snapshot_artifact(
+                            workspace_id,
+                            snapshot.snapshot_id,
+                        )
+                    except Exception:
+                        pass
+                    self._store.delete_snapshot(snapshot.snapshot_id)
+                raise
+            if (
+                not self._store.is_current_revision(workspace_id, revision_id)
+                or self._store.get_snapshot(snapshot.snapshot_id) is None
+            ):
+                self._revoke_snapshot_artifact(
+                    workspace_id,
+                    snapshot.snapshot_id,
+                )
                 self._store.delete_snapshot(snapshot.snapshot_id)
-            raise
-        if (
-            not self._store.is_current_revision(workspace_id, revision_id)
-            or self._store.get_snapshot(snapshot.snapshot_id) is None
-        ):
-            self._revoke_snapshot_artifact(
-                workspace_id,
-                snapshot.snapshot_id,
-            )
-            self._store.delete_snapshot(snapshot.snapshot_id)
-            raise ValueError("study-map snapshot revision is no longer current")
+                raise ValueError("study-map snapshot revision is no longer current")
         return persisted
+
+    @staticmethod
+    def _publication_context(
+        publication_guard: PublicationGuard | None,
+    ) -> ContextManager[object]:
+        return nullcontext() if publication_guard is None else publication_guard()
 
     def _ensure_snapshot_artifact(
         self,

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import sqlite3
+import stat
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
@@ -30,6 +34,41 @@ from exam_predictor.workspace.models import (
     normalize_relative_path,
 )
 from exam_predictor.workspace.policy import DEFAULT_SCAN_POLICY
+
+
+_AUTHORITY_LOCKS_GUARD = threading.Lock()
+_AUTHORITY_LOCKS: dict[tuple[tuple[int, int], str], _WorkspaceAuthorityLock] = {}
+
+
+def _serialize_workspace_authority(method):
+    @wraps(method)
+    def guarded(self, workspace_id: str, *args, **kwargs):
+        with self._workspace_authority_lock(workspace_id):
+            return method(self, workspace_id, *args, **kwargs)
+
+    return guarded
+
+
+def _serialize_job_authority(method):
+    @wraps(method)
+    def guarded(self, job_id: str, *args, **kwargs):
+        workspace_id = self._job_workspace_id(job_id)
+        with self._workspace_authority_lock(workspace_id):
+            return method(self, job_id, *args, **kwargs)
+
+    return guarded
+
+
+def _serialize_cleanup_authority(method):
+    @wraps(method)
+    def guarded(self, cleanup_id: str, *args, **kwargs):
+        workspace_id = self._cleanup_workspace_id(cleanup_id)
+        if workspace_id is None:
+            return method(self, cleanup_id, *args, **kwargs)
+        with self._workspace_authority_lock(workspace_id):
+            return method(self, cleanup_id, *args, **kwargs)
+
+    return guarded
 
 
 class WorkspaceNotFoundError(LookupError):
@@ -58,6 +97,171 @@ class InvalidApprovalError(ValueError):
 
 class TransmissionAuthorityRevokedError(RuntimeError):
     pass
+
+
+class TransmissionAuthorityReentrancyError(RuntimeError):
+    pass
+
+
+class _WorkspaceAuthorityLock:
+    """A same-thread fail-fast lock shared by threads and local processes."""
+
+    def __init__(
+        self,
+        process_key: str,
+    ) -> None:
+        self._process_key = process_key
+        self._thread_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._owner_thread_id: int | None = None
+        self._reentrant_depth = 0
+        self._handle = None
+
+    def __enter__(self):
+        thread_id = threading.get_ident()
+        with self._state_lock:
+            if self._owner_thread_id == thread_id:
+                raise TransmissionAuthorityReentrancyError(
+                    "Workspace transmission authority cannot be mutated reentrantly."
+                )
+        self._thread_lock.acquire()
+        with self._state_lock:
+            self._owner_thread_id = thread_id
+            self._reentrant_depth = 1
+        try:
+            self._handle = self._acquire_process_lock()
+            return self
+        except BaseException:
+            with self._state_lock:
+                self._owner_thread_id = None
+                self._reentrant_depth = 0
+            self._thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        handle = self._handle
+        self._handle = None
+        try:
+            if handle is not None:
+                self._release_process_lock(handle)
+        finally:
+            with self._state_lock:
+                self._owner_thread_id = None
+                self._reentrant_depth = 0
+            self._thread_lock.release()
+
+    @contextmanager
+    def reentrant(self) -> Iterator[_WorkspaceAuthorityLock]:
+        thread_id = threading.get_ident()
+        with self._state_lock:
+            nested = self._owner_thread_id == thread_id
+            if nested:
+                self._reentrant_depth += 1
+        if not nested:
+            with self:
+                yield self
+            return
+        try:
+            yield self
+        finally:
+            with self._state_lock:
+                self._reentrant_depth -= 1
+
+    def _acquire_process_lock(self):
+        if os.name == "nt":
+            return self._acquire_windows_mutex()
+        return self._acquire_posix_file_lock()
+
+    def _acquire_windows_mutex(self):
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        )
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateMutexW(
+            None,
+            False,
+            f"Local\\ExamSageAuthority-{self._process_key}",
+        )
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        if result not in {0x00000000, 0x00000080}:
+            kernel32.CloseHandle(handle)
+            raise RuntimeError("Workspace authority mutex acquisition failed.")
+        return handle
+
+    def _acquire_posix_file_lock(self) -> int:
+        import fcntl
+
+        user_id = os.getuid()
+        root = Path("/tmp") / f".examsage-authority-{user_id}"
+        try:
+            root.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        root_stat = root.lstat()
+        if (
+            not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != user_id
+            or stat.S_IMODE(root_stat.st_mode) & 0o077
+        ):
+            raise RuntimeError("Workspace authority lock directory is unsafe.")
+        flags = os.O_CREAT | os.O_RDWR
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        lock_path = root / f"{self._process_key}.lock"
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            lock_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(lock_stat.st_mode)
+                or lock_stat.st_uid != user_id
+                or lock_stat.st_nlink != 1
+                or stat.S_IMODE(lock_stat.st_mode) & 0o077
+            ):
+                raise RuntimeError("Workspace authority lock file is unsafe.")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _release_process_lock(handle) -> None:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+            kernel32.ReleaseMutex.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            try:
+                if not kernel32.ReleaseMutex(handle):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            finally:
+                os.close(handle)
+
+
+def _physical_file_identity(stat_result: os.stat_result) -> tuple[int, int]:
+    return int(stat_result.st_dev), int(stat_result.st_ino)
 
 
 @dataclass(frozen=True)
@@ -292,6 +496,9 @@ class WorkspaceStore:
             connection.execute("PRAGMA foreign_keys=ON")
             self._connection = connection
             self._migrate()
+            self._authority_scope = _physical_file_identity(
+                os.stat(self.database_path)
+            )
         except BaseException:
             connection.close()
             raise
@@ -314,6 +521,39 @@ class WorkspaceStore:
                 raise
             else:
                 self._connection.commit()
+
+    def _workspace_authority_lock(self, workspace_id: str) -> _WorkspaceAuthorityLock:
+        key = (self._authority_scope, workspace_id)
+        with _AUTHORITY_LOCKS_GUARD:
+            process_key = hashlib.sha256(
+                (
+                    f"{self._authority_scope[0]}:{self._authority_scope[1]}"
+                    f"\0{workspace_id}"
+                ).encode("utf-8")
+            ).hexdigest()
+            return _AUTHORITY_LOCKS.setdefault(
+                key,
+                _WorkspaceAuthorityLock(process_key),
+            )
+
+    @contextmanager
+    def hold_workspace_authority(self, workspace_id: str) -> Iterator[None]:
+        """Serialize a workspace authority mutation without reading source data."""
+        with self._workspace_authority_lock(workspace_id):
+            yield
+
+    def _job_workspace_id(self, job_id: str) -> str:
+        with self._lock:
+            row = self._job_row(self._connection, job_id)
+        return str(row["workspace_id"])
+
+    def _cleanup_workspace_id(self, cleanup_id: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT workspace_id FROM cleanup_queue WHERE cleanup_id = ?",
+                (cleanup_id,),
+            ).fetchone()
+        return None if row is None else str(row["workspace_id"])
 
     def _migrate(self) -> None:
         with self._transaction() as connection:
@@ -987,6 +1227,7 @@ class WorkspaceStore:
                 return ()
             return self._revision(self._connection, workspace_id, revision_id).entries
 
+    @_serialize_workspace_authority
     def commit_scan(
         self, workspace_id: str, result: ScanResult, job_id: str
     ) -> ManifestRevision:
@@ -1126,6 +1367,7 @@ class WorkspaceStore:
                 )
             return self._revision(self._connection, workspace_id, revision_id)
 
+    @_serialize_workspace_authority
     def set_inclusion(
         self,
         workspace_id: str,
@@ -1200,6 +1442,7 @@ class WorkspaceStore:
             revision = self._revision(connection, workspace_id, new_revision_id)
         return revision
 
+    @_serialize_workspace_authority
     def approve(
         self,
         workspace_id: str,
@@ -1314,36 +1557,37 @@ class WorkspaceStore:
         verified_at: datetime | None = None,
     ) -> Iterator[TransmissionAuthoritySnapshot]:
         """Hold current approval authority stable through a bounded source read."""
-        with self._transaction() as connection:
-            snapshot = self._transmission_authority_snapshot(
-                connection,
-                workspace_id,
-            )
-            if (
-                snapshot is None
-                or snapshot.approval is None
-                or snapshot.revision is None
-                or snapshot.workspace.state is not WorkspaceState.APPROVED
-                or snapshot.workspace.current_draft_revision_id != revision_id
-                or snapshot.workspace.current_approved_revision_id != revision_id
-                or snapshot.approval.approval_id != approval_id
-                or snapshot.approval.revision_id != revision_id
-                or snapshot.revision.revision_id != revision_id
-            ):
-                raise TransmissionAuthorityRevokedError(
-                    "Workspace source approval is no longer current."
+        with self._workspace_authority_lock(workspace_id).reentrant():
+            with self._transaction() as connection:
+                snapshot = self._transmission_authority_snapshot(
+                    connection,
+                    workspace_id,
                 )
-            if verified_at is not None:
-                connection.execute(
-                    """UPDATE workspaces
-                       SET last_access_verified_at = ?, updated_at = ?
-                       WHERE workspace_id = ?""",
-                    (
-                        self._timestamp(verified_at),
-                        self._timestamp(verified_at),
-                        workspace_id,
-                    ),
-                )
+                if (
+                    snapshot is None
+                    or snapshot.approval is None
+                    or snapshot.revision is None
+                    or snapshot.workspace.state is not WorkspaceState.APPROVED
+                    or snapshot.workspace.current_draft_revision_id != revision_id
+                    or snapshot.workspace.current_approved_revision_id != revision_id
+                    or snapshot.approval.approval_id != approval_id
+                    or snapshot.approval.revision_id != revision_id
+                    or snapshot.revision.revision_id != revision_id
+                ):
+                    raise TransmissionAuthorityRevokedError(
+                        "Workspace source approval is no longer current."
+                    )
+                if verified_at is not None:
+                    connection.execute(
+                        """UPDATE workspaces
+                           SET last_access_verified_at = ?, updated_at = ?
+                           WHERE workspace_id = ?""",
+                        (
+                            self._timestamp(verified_at),
+                            self._timestamp(verified_at),
+                            workspace_id,
+                        ),
+                    )
             yield snapshot
 
     def _transmission_authority_snapshot(
@@ -1480,6 +1724,7 @@ class WorkspaceStore:
             ).fetchall()
         return tuple(self._job(row) for row in rows)
 
+    @_serialize_job_authority
     def start_job(self, job_id: str) -> WorkspaceJob:
         now = self._now()
         with self._transaction() as connection:
@@ -1563,6 +1808,7 @@ class WorkspaceStore:
             )
         return event
 
+    @_serialize_job_authority
     def fail_job(self, job_id: str, safe_error_code: str) -> WorkspaceJob:
         self._safe_code(safe_error_code)
         now = self._now()
@@ -1661,6 +1907,7 @@ class WorkspaceStore:
             ).fetchall()
         return tuple(self._event(row) for row in rows)
 
+    @_serialize_workspace_authority
     def mark_entry_changed(self, workspace_id: str, entry_id: str, code: str) -> None:
         new_revision_id = uuid4().hex
         now = self._now()
@@ -1707,6 +1954,7 @@ class WorkspaceStore:
                 ),
             )
 
+    @_serialize_workspace_authority
     def mark_revision_attention_if_current(
         self,
         workspace_id: str,
@@ -1763,6 +2011,7 @@ class WorkspaceStore:
             )
             return self._revision(connection, workspace_id, new_revision_id)
 
+    @_serialize_workspace_authority
     def mark_entries_changed_latest(
         self,
         workspace_id: str,
@@ -1833,6 +2082,7 @@ class WorkspaceStore:
                 ),
             )
 
+    @_serialize_workspace_authority
     def mark_deleting(self, workspace_id: str) -> WorkspaceRecord:
         now = self._now()
         active = (WorkspaceJobStatus.QUEUED.value, WorkspaceJobStatus.RUNNING.value)
@@ -1862,6 +2112,7 @@ class WorkspaceStore:
             row = self._workspace_row(connection, workspace_id)
         return self._workspace(row)
 
+    @_serialize_workspace_authority
     def delete_workspace_rows(self, workspace_id: str) -> None:
         with self._transaction() as connection:
             workspace = self._workspace_row(connection, workspace_id)
@@ -1974,6 +2225,7 @@ class WorkspaceStore:
             ).fetchall()
         return tuple(self._cleanup(row) for row in rows)
 
+    @_serialize_cleanup_authority
     def fail_cleanup(
         self, cleanup_id: str, safe_error_code: str
     ) -> CleanupRecord | None:
@@ -2007,6 +2259,7 @@ class WorkspaceStore:
                 raise RuntimeError("The cleanup record could not be read back.")
             return self._cleanup(updated)
 
+    @_serialize_cleanup_authority
     def complete_cleanup(self, cleanup_id: str) -> str | None:
         with self._transaction() as connection:
             cleanup = connection.execute(
