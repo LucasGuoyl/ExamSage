@@ -27,6 +27,9 @@ from tenacity import (
 from .schema import SourceCitation
 
 
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 90.0
+
+
 class ProviderError(RuntimeError):
     """A provider could not complete a requested operation."""
 
@@ -219,6 +222,7 @@ class BaseProvider:
 class OpenAIProvider(BaseProvider):
     name = "openai"
     capabilities = ProviderCapabilities()
+    inline_file_limit_bytes = 10 * 1024 * 1024
 
     def __init__(
         self,
@@ -227,13 +231,19 @@ class OpenAIProvider(BaseProvider):
         *,
         approved_max_usd: float | None = None,
         base_url: str | None = None,
+        provider_timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     ):
         super().__init__(api_key, models, approved_max_usd=approved_max_usd)
         try:
             from openai import OpenAI
         except ImportError as exc:  # pragma: no cover - dependency error path
             raise ProviderError("Install the 'openai' package to use OpenAI.") from exc
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=provider_timeout_seconds,
+            max_retries=0,
+        )
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=12))
     def create_chat_completion(self, **kwargs):
@@ -394,6 +404,7 @@ class GeminiProvider(BaseProvider):
         models: ModelRouting,
         *,
         approved_max_usd: float | None = None,
+        provider_timeout_seconds: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     ):
         super().__init__(api_key, models, approved_max_usd=approved_max_usd)
         try:
@@ -401,7 +412,11 @@ class GeminiProvider(BaseProvider):
         except ImportError as exc:  # pragma: no cover - dependency error path
             raise ProviderError("Install the 'google-genai' package to use Gemini.") from exc
         self._genai = genai
-        self.client = genai.Client(api_key=api_key)
+        http_options = genai.types.HttpOptions(
+            timeout=int(provider_timeout_seconds * 1000),
+            retry_options=genai.types.HttpRetryOptions(attempts=1),
+        )
+        self.client = genai.Client(api_key=api_key, http_options=http_options)
 
     @staticmethod
     def _contents_from_messages(messages: list[dict]) -> tuple[str, str]:

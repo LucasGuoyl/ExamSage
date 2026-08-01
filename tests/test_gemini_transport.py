@@ -38,6 +38,36 @@ def _analysis_response(text: str = "ok") -> SimpleNamespace:
     )
 
 
+def test_provider_constructors_disable_sdk_retries_and_set_explicit_timeouts(monkeypatch):
+    import openai
+    from google import genai
+
+    captured: dict[str, dict[str, object]] = {}
+
+    def fake_openai(**kwargs):
+        captured["openai"] = kwargs
+        return SimpleNamespace()
+
+    def fake_gemini(**kwargs):
+        captured["gemini"] = kwargs
+        return SimpleNamespace()
+
+    monkeypatch.setattr(openai, "OpenAI", fake_openai)
+    monkeypatch.setattr(genai, "Client", fake_gemini)
+    models = ModelRouting("fast", "balanced", "reasoning", "embedding")
+
+    from exam_predictor.providers import OpenAIProvider
+
+    OpenAIProvider("test-key", models)
+    GeminiProvider("test-key", models)
+
+    assert captured["openai"]["timeout"] == 90.0
+    assert captured["openai"]["max_retries"] == 0
+    http_options = captured["gemini"]["http_options"]
+    assert http_options.timeout == 90_000
+    assert http_options.retry_options.attempts == 1
+
+
 def test_gemini_small_pdf_uses_inline_transport(tmp_path: Path):
     source = tmp_path / "lecture.pdf"
     source.write_bytes(b"small transient pdf")
