@@ -66,6 +66,9 @@ def entry(
     included: bool = True,
     archive_parent_entry_id: str | None = None,
     archive_member_path: str | None = None,
+    archive_member_index: int | None = None,
+    archive_member_crc32: int | None = None,
+    archive_member_compressed_bytes: int | None = None,
 ) -> ManifestEntry:
     return ManifestEntry(
         entry_id=entry_id,
@@ -83,6 +86,9 @@ def entry(
         proposed_course_group="Module",
         archive_parent_entry_id=archive_parent_entry_id,
         archive_member_path=archive_member_path,
+        archive_member_index=archive_member_index,
+        archive_member_crc32=archive_member_crc32,
+        archive_member_compressed_bytes=archive_member_compressed_bytes,
     )
 
 
@@ -139,7 +145,7 @@ def test_schema_pragmas_and_workspace_round_trip(store: WorkspaceStore, tmp_path
     assert store.source_root(persisted.workspace_id) == (tmp_path / "workspace-1")
     assert store.get_manifest_entries(persisted.workspace_id) == ()
     with store._lock:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert store._connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert store._connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         tables = {
@@ -361,6 +367,68 @@ def test_unique_scan_job_index_migration_repairs_legacy_replay_duplicates(
             ).fetchall()
         assert [row["revision_id"] for row in rows] == ["legacy-current"]
         assert reopened.get_manifest(ready.workspace_id).revision_id == "legacy-current"
+    finally:
+        reopened.close()
+
+
+def test_v2_migration_adds_and_round_trips_exact_archive_member_identity(tmp_path: Path):
+    path = tmp_path / "workspace.sqlite3"
+    original = WorkspaceStore(path)
+    original.close()
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("ALTER TABLE manifest_entries DROP COLUMN archive_member_index")
+        connection.execute("ALTER TABLE manifest_entries DROP COLUMN archive_member_crc32")
+        connection.execute(
+            "ALTER TABLE manifest_entries DROP COLUMN archive_member_compressed_bytes"
+        )
+        connection.execute("PRAGMA user_version=2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = WorkspaceStore(path)
+    try:
+        migrated.create_workspace(workspace_record(tmp_path))
+        migrated.create_job(job(), "request-1")
+        migrated.start_job("job-1")
+        parent = entry(entry_id="archive", relative_path="bundle.zip")
+        member = entry(
+            entry_id="member",
+            relative_path="bundle.zip",
+            archive_parent_entry_id="archive",
+            archive_member_path="inside.pdf",
+            archive_member_index=2,
+            archive_member_crc32=0x1234ABCD,
+            archive_member_compressed_bytes=7,
+        )
+        migrated.commit_scan(
+            "workspace-1",
+            ScanResult(
+                workspace_id="workspace-1",
+                entries=(parent, member),
+                discovered_count=2,
+                bytes_hashed=20,
+                failure_count=0,
+                completed_at=NOW,
+            ),
+            "job-1",
+        )
+    finally:
+        migrated.close()
+
+    reopened = WorkspaceStore(path)
+    try:
+        persisted = next(
+            item
+            for item in reopened.get_manifest_entries("workspace-1")
+            if item.archive_member_path == "inside.pdf"
+        )
+        assert (
+            persisted.archive_member_index,
+            persisted.archive_member_crc32,
+            persisted.archive_member_compressed_bytes,
+        ) == (2, 0x1234ABCD, 7)
     finally:
         reopened.close()
 

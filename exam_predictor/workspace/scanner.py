@@ -882,6 +882,9 @@ class WorkspaceScanner:
             ),
             archive_parent_entry_id=parent.entry_id,
             archive_member_path=member.display_path,
+            archive_member_index=member.member_index,
+            archive_member_crc32=member.crc32,
+            archive_member_compressed_bytes=member.compressed_bytes,
         )
 
     def _path_limit_failure(self, relative_path: str) -> str | None:

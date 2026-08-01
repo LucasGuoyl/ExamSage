@@ -32,6 +32,7 @@ dependencies = [
   "pypdf>=6.0,<7",
   "Pillow>=11,<13",
   "python-pptx>=1.0,<2",
+  "defusedxml>=0.7,<1",
   "streamlit>=1.49,<2",
   "pandas>=2.2,<3",
   "reportlab>=4.2,<5",

@@ -197,6 +197,24 @@ def test_fixed_mutation_file_is_created_then_reopened_with_one_identity(tmp_path
             assert filesystem.hash_open_file(reopened) == (_sha256(b"registry"), 8)
 
 
+def test_open_existing_mutation_file_never_creates_a_missing_authority_name(tmp_path):
+    filesystem = OwnedArtifactFilesystem()
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with filesystem.anchor_directory(root) as anchor:
+        with pytest.raises(OwnedFilesystemError) as caught:
+            with filesystem.open_mutation_file(
+                anchor,
+                ".registry.log",
+                expected_parent_identity=anchor.identity,
+            ):
+                pytest.fail("a missing authority file must not be created")
+
+    assert caught.value.code == "owned_not_found"
+    assert not (root / ".registry.log").exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound temp cleanup")
 def test_windows_temp_cleanup_marks_exact_handle_even_when_directory_flush_fails(
     tmp_path,
@@ -264,6 +282,9 @@ def test_existing_child_read_and_empty_directory_removal_stay_anchored(tmp_path)
         )
 
     assert not child.exists()
+    tombstones = [path for path in root.iterdir() if path.name.startswith(".owned-directory-")]
+    assert len(tombstones) == 1
+    assert tombstones[0].is_dir()
 
 
 def test_claimed_delete_quarantines_and_never_deletes_a_substitution(tmp_path):
@@ -299,6 +320,81 @@ def test_claimed_delete_quarantines_and_never_deletes_a_substitution(tmp_path):
 
     assert caught.value.code == "owned_identity_changed"
     assert claimed.read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX name-race hardening")
+def test_posix_replace_quarantines_a_last_moment_source_substitution(tmp_path):
+    class SubstitutingFilesystem(OwnedArtifactFilesystem):
+        def __init__(self):
+            super().__init__()
+            self.substituted = False
+
+        def _rename_noreplace_posix(self, parent, source_name, destination_name):
+            if not self.substituted and destination_name == "artifact":
+                self.substituted = True
+                (parent.path / source_name).rename(parent.path / ".claimed-displaced")
+                (parent.path / source_name).write_bytes(b"attacker")
+            return super()._rename_noreplace_posix(parent, source_name, destination_name)
+
+    filesystem = SubstitutingFilesystem()
+    root = tmp_path / "data"
+    root.mkdir()
+    with filesystem.anchor_directory(root) as anchor:
+        with filesystem.create_temporary_file(
+            anchor,
+            ".owned.tmp",
+            expected_parent_identity=anchor.identity,
+        ) as temporary:
+            os.write(temporary.descriptor, b"claimed")
+            os.fsync(temporary.descriptor)
+            with pytest.raises(OwnedFilesystemError) as caught:
+                filesystem.replace_open_file(
+                    anchor,
+                    temporary,
+                    ".owned.tmp",
+                    "artifact",
+                    expected_parent_identity=anchor.identity,
+                    expected_source_identity=temporary.identity,
+                    expected_sha256=_sha256(b"claimed"),
+                    expected_size=7,
+                    replace_existing=False,
+                )
+
+    assert caught.value.code == "owned_identity_changed"
+    assert not (root / "artifact").exists()
+    assert b"attacker" in [path.read_bytes() for path in root.iterdir() if path.is_file()]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX name-race hardening")
+def test_posix_empty_directory_removal_never_deletes_a_substitute(tmp_path):
+    class SubstitutingFilesystem(OwnedArtifactFilesystem):
+        def __init__(self):
+            super().__init__()
+            self.substituted = False
+
+        def before_mutation(self, operation, parent, source_name):
+            if operation == "remove_directory" and not self.substituted:
+                self.substituted = True
+                (parent.path / source_name).rename(parent.path / ".claimed-directory-displaced")
+                (parent.path / source_name).mkdir()
+
+    filesystem = SubstitutingFilesystem()
+    root = tmp_path / "data"
+    child = root / "parts"
+    child.mkdir(parents=True)
+    child_stat = child.stat(follow_symlinks=False)
+    with filesystem.anchor_directory(root) as anchor:
+        with pytest.raises(OwnedFilesystemError) as caught:
+            filesystem.remove_empty_directory(
+                anchor,
+                "parts",
+                expected_parent_identity=anchor.identity,
+                expected_child_identity=(child_stat.st_dev, child_stat.st_ino),
+            )
+
+    assert caught.value.code == "owned_identity_changed"
+    assert (root / ".claimed-directory-displaced").exists()
+    assert any(path.is_dir() for path in root.iterdir() if path.name.startswith(".owned-directory-"))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows durability primitives")

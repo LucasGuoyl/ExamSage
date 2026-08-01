@@ -122,6 +122,9 @@ _SCHEMA = (
       safe_message TEXT,
       archive_parent_entry_id TEXT,
       archive_member_path TEXT,
+      archive_member_index INTEGER CHECK(archive_member_index IS NULL OR archive_member_index >= 1),
+      archive_member_crc32 INTEGER CHECK(archive_member_crc32 IS NULL OR archive_member_crc32 >= 0),
+      archive_member_compressed_bytes INTEGER CHECK(archive_member_compressed_bytes IS NULL OR archive_member_compressed_bytes >= 0),
       PRIMARY KEY(revision_id, entry_id)
     )""",
     """CREATE TABLE approvals (
@@ -315,12 +318,12 @@ class WorkspaceStore:
     def _migrate(self) -> None:
         with self._transaction() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 2:
+            if version > 3:
                 raise RuntimeError("The workspace database schema is newer than this application.")
             if version == 0:
                 for statement in _SCHEMA:
                     connection.execute(statement)
-                connection.execute("PRAGMA user_version=2")
+                connection.execute("PRAGMA user_version=3")
             elif version == 1:
                 connection.execute(
                     "ALTER TABLE workspaces ADD COLUMN owned_root_device TEXT"
@@ -347,6 +350,18 @@ class WorkspaceStore:
                     )"""
                 )
                 connection.execute("PRAGMA user_version=2")
+                version = 2
+            if version == 2:
+                connection.execute(
+                    "ALTER TABLE manifest_entries ADD COLUMN archive_member_index INTEGER"
+                )
+                connection.execute(
+                    "ALTER TABLE manifest_entries ADD COLUMN archive_member_crc32 INTEGER"
+                )
+                connection.execute(
+                    "ALTER TABLE manifest_entries ADD COLUMN archive_member_compressed_bytes INTEGER"
+                )
+                connection.execute("PRAGMA user_version=3")
             now = self._timestamp(self._now())
             duplicate_active = connection.execute(
                 """WITH ranked AS (
@@ -536,8 +551,9 @@ class WorkspaceStore:
                    revision_id, entry_id, relative_path, item_kind, format_category,
                    size_bytes, modified_ns, device_id, file_id, sha256, state, included,
                    inclusion_reason, proposed_course_group, failure_code, safe_message,
-                   archive_parent_entry_id, archive_member_path
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   archive_parent_entry_id, archive_member_path, archive_member_index,
+                   archive_member_crc32, archive_member_compressed_bytes
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 revision_id,
                 item.entry_id,
@@ -557,6 +573,9 @@ class WorkspaceStore:
                 item.safe_message,
                 item.archive_parent_entry_id,
                 item.archive_member_path,
+                item.archive_member_index,
+                item.archive_member_crc32,
+                item.archive_member_compressed_bytes,
             ),
         )
 

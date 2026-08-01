@@ -6,6 +6,7 @@ import struct
 import zipfile
 from pathlib import PurePosixPath
 from typing import BinaryIO, Sequence
+from unicodedata import category
 
 from exam_predictor.workspace.models import ArchiveMember, ScanPolicy, SourceState
 from exam_predictor.workspace.policy import DEFAULT_SCAN_POLICY
@@ -19,6 +20,7 @@ ARCHIVE_MEMBER_LIMIT = "archive_member_limit"
 ARCHIVE_SIZE_LIMIT = "archive_size_limit"
 ARCHIVE_RATIO_LIMIT = "archive_ratio_limit"
 ARCHIVE_DEPTH_LIMIT = "archive_depth_limit"
+ARCHIVE_PATH_COLLISION = "archive_path_collision"
 _END_OF_CENTRAL_DIRECTORY = b"PK\x05\x06"
 _END_OF_CENTRAL_DIRECTORY_SIZE = 22
 _MAX_ZIP_COMMENT_BYTES = 65_535
@@ -37,6 +39,13 @@ def _member_failure(info: zipfile.ZipInfo, policy: ScanPolicy) -> str | None:
         return ARCHIVE_ABSOLUTE_PATH
     if ".." in member_path.parts:
         return ARCHIVE_TRAVERSAL
+    if raw.rstrip("/") != member_path.as_posix():
+        return ARCHIVE_PATH_COLLISION
+    display_path = "".join(
+        character for character in member_path.as_posix() if category(character) != "Cc"
+    )[: policy.max_path_chars]
+    if display_path != member_path.as_posix():
+        return ARCHIVE_PATH_COLLISION
     unix_kind = (info.external_attr >> 16) & 0o170000
     if unix_kind == stat.S_IFLNK:
         return ARCHIVE_LINK
@@ -180,6 +189,7 @@ class ArchiveInspector:
             raise zipfile.BadZipFile("central directory member count mismatch")
 
         members: list[ArchiveMember] = []
+        display_paths: set[str] = set()
         expanded_bytes = 0
         with zipfile.ZipFile(archive_stream, "r") as archive:
             for member_count, info in enumerate(archive.infolist(), start=1):
@@ -195,17 +205,26 @@ class ArchiveInspector:
                     failure_code = ARCHIVE_SIZE_LIMIT
 
                 _, member_path = _normalized_member_path(info)
-                members.append(
-                    ArchiveMember(
+                member = ArchiveMember(
                         parent_entry_id=parent_entry_id,
                         display_path=member_path.as_posix(),
                         item_kind="folder" if info.is_dir() else "file",
                         size_bytes=info.file_size,
                         compressed_bytes=info.compress_size,
+                        member_index=member_count,
+                        crc32=info.CRC,
                         state=(SourceState.FAILED if failure_code else SourceState.PENDING_APPROVAL),
                         failure_code=failure_code,
                     )
-                )
+                if member.display_path in display_paths and member.failure_code is None:
+                    member = member.model_copy(
+                        update={
+                            "state": SourceState.FAILED,
+                            "failure_code": ARCHIVE_PATH_COLLISION,
+                        }
+                    )
+                display_paths.add(member.display_path)
+                members.append(member)
                 if aggregate_limit_exceeded:
                     break
         return tuple(members)

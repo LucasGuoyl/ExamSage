@@ -95,6 +95,9 @@ class ManifestEntry(FrozenModel):
     safe_message: str | None = None
     archive_parent_entry_id: str | None = None
     archive_member_path: str | None = None
+    archive_member_index: int | None = Field(default=None, ge=1)
+    archive_member_crc32: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
+    archive_member_compressed_bytes: int | None = Field(default=None, ge=0)
 
     @field_validator("relative_path")
     @classmethod
@@ -202,6 +205,8 @@ class ArchiveMember(FrozenModel):
     item_kind: str
     size_bytes: int = Field(ge=0)
     compressed_bytes: int = Field(ge=0)
+    member_index: int | None = Field(default=None, ge=1)
+    crc32: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
     state: SourceState
     failure_code: str | None = None
 

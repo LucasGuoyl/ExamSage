@@ -18,6 +18,7 @@ from exam_predictor.evidence.registry import (
     ArtifactClaim,
     DeleteJournalItem,
     EvidenceArtifactRegistry,
+    PublishIntent,
     PublishJournal,
     RegistryError,
     WorkspaceClaim,
@@ -233,29 +234,61 @@ class EvidenceArtifactStore:
             if claim is None:
                 return ArtifactCleanupState.DELETED
             if claim.phase == "reserved":
+                if registry.retire_recovered_workspace(workspace_id):
+                    return ArtifactCleanupState.DELETED
                 return ArtifactCleanupState.CLEANUP_PENDING
+            if registry.get_publish_intent(workspace_id) is not None:
+                with self._open_tree(
+                    workspace_id,
+                    allowed_phases={"active"},
+                    expected_generation=claim.generation,
+                ) as tree:
+                    self._recover_publish_intent(tree)
+                if registry.get_publish_intent(workspace_id) is not None:
+                    return ArtifactCleanupState.CLEANUP_PENDING
             if registry.get_publish_journal(workspace_id) is not None:
-                with self._open_tree(workspace_id, allowed_phases={"active"}) as tree:
+                with self._open_tree(
+                    workspace_id,
+                    allowed_phases={"active"},
+                    expected_generation=claim.generation,
+                ) as tree:
                     self._recover_publish(tree)
                 if registry.get_publish_journal(workspace_id) is not None:
                     return ArtifactCleanupState.CLEANUP_PENDING
             claim = registry.get_workspace(workspace_id)
             if claim is None:
                 return ArtifactCleanupState.DELETED
+            deletion_generation = claim.generation
             if claim.phase == "active":
-                registry.begin_delete(workspace_id)
+                registry.begin_delete(
+                    workspace_id,
+                    expected_generation=claim.generation,
+                )
             elif claim.phase != "deleting":
                 return ArtifactCleanupState.CLEANUP_PENDING
-            items = registry.get_delete_items(workspace_id)
+            items = registry.get_delete_items(
+                workspace_id,
+                expected_generation=deletion_generation,
+            )
             if any(item.phase != "removed" for item in items):
-                with self._open_tree(workspace_id, allowed_phases={"deleting"}) as tree:
+                with self._open_tree(
+                    workspace_id,
+                    allowed_phases={"deleting"},
+                    expected_generation=deletion_generation,
+                ) as tree:
                     if not self._delete_layout_is_known(tree, items):
                         return ArtifactCleanupState.CLEANUP_PENDING
                     self._delete_claimed_items(tree, items)
-            items = registry.get_delete_items(workspace_id)
+            items = registry.get_delete_items(
+                workspace_id,
+                expected_generation=deletion_generation,
+            )
             if any(item.phase != "removed" for item in items):
                 return ArtifactCleanupState.CLEANUP_PENDING
-            self._remove_deleted_tree(workspace_id)
+            self._remove_deleted_tree(
+                workspace_id,
+                expected_generation=deletion_generation,
+            )
             return ArtifactCleanupState.DELETED
         except ArtifactBoundaryError:
             raise
@@ -300,12 +333,33 @@ class EvidenceArtifactStore:
                 self._verify_claimed_name(collection, filename, old_claim)
             temporary_name = f".artifact-{secrets.token_hex(16)}.tmp"
             backup_name = f".artifact-{secrets.token_hex(16)}.backup"
+            intent = PublishIntent(
+                workspace_id=workspace_id,
+                slot=slot,
+                target_name=filename,
+                temporary_name=temporary_name,
+                backup_name=backup_name,
+                collection=artifact_type,
+                kind=_KIND_BY_COLLECTION[artifact_type],
+                artifact_id=artifact_id,
+                expected_sha256=expected_sha256,
+                expected_size=len(content),
+                old_claim=old_claim,
+                generation=tree.claim.generation,
+            )
+            registry.reserve_publish(intent)
             try:
                 with self._filesystem.create_temporary_file(
                     collection,
                     temporary_name,
                     expected_parent_identity=collection.identity,
                 ) as temporary:
+                    registry.claim_publish_temporary(
+                        workspace_id,
+                        temporary.identity,
+                        expected_generation=tree.claim.generation,
+                        expected_temporary_name=temporary_name,
+                    )
                     self._write_descriptor(temporary.descriptor, content)
                     digest, size = self._filesystem.hash_open_file(temporary)
                     if digest != expected_sha256 or size != len(content):
@@ -319,6 +373,7 @@ class EvidenceArtifactStore:
                         identity=temporary.identity,
                         sha256=digest,
                         size=size,
+                        generation=tree.claim.generation,
                     )
                     journal = PublishJournal(
                         workspace_id=workspace_id,
@@ -329,11 +384,14 @@ class EvidenceArtifactStore:
                         backup_name=backup_name,
                         new_claim=new_claim,
                         old_claim=old_claim,
+                        generation=tree.claim.generation,
                     )
                     registry.prepare_publish(journal)
                     self._install_publish(tree, journal, temporary)
             except BaseException as error:
                 if isinstance(error, Exception):
+                    with contextlib.suppress(Exception):
+                        self._recover_publish_intent(tree)
                     with contextlib.suppress(Exception):
                         self._recover_publish(tree)
                 raise
@@ -361,6 +419,8 @@ class EvidenceArtifactStore:
             )
         registry.advance_publish(
             journal.workspace_id,
+            expected_generation=journal.generation,
+            expected_temporary_name=journal.temporary_name,
             expected_phase="prepared",
             new_phase="backup",
         )
@@ -373,18 +433,29 @@ class EvidenceArtifactStore:
             expected_source_identity=temporary.identity,
             expected_sha256=journal.new_claim.sha256,
             expected_size=journal.new_claim.size,
-            replace_existing=True,
+            replace_existing=False,
         )
         self._verify_claimed_name(collection, journal.target_name, journal.new_claim)
         registry.advance_publish(
             journal.workspace_id,
+            expected_generation=journal.generation,
+            expected_temporary_name=journal.temporary_name,
             expected_phase="backup",
             new_phase="installed",
         )
-        registry.commit_publish(journal.workspace_id, journal.new_claim)
+        registry.commit_publish(
+            journal.workspace_id,
+            journal.new_claim,
+            expected_generation=journal.generation,
+            expected_temporary_name=journal.temporary_name,
+        )
         if old_claim is not None:
             self._delete_if_claimed(collection, journal.backup_name, old_claim)
-        registry.clear_publish(journal.workspace_id)
+        registry.clear_publish(
+            journal.workspace_id,
+            expected_generation=journal.generation,
+            expected_temporary_name=journal.temporary_name,
+        )
 
     def _recover_publish(self, tree: _WorkspaceTree) -> None:
         registry = self._require_registry()
@@ -396,6 +467,8 @@ class EvidenceArtifactStore:
             self._rollback_publish(collection, journal)
             registry.abort_publish(
                 journal.workspace_id,
+                expected_generation=journal.generation,
+                expected_temporary_name=journal.temporary_name,
                 expected_phases={"prepared", "backup"},
             )
             return
@@ -407,7 +480,12 @@ class EvidenceArtifactStore:
                 journal.new_claim,
             )
             self._validate_optional_backup(collection, journal)
-            registry.commit_publish(journal.workspace_id, journal.new_claim)
+            registry.commit_publish(
+                journal.workspace_id,
+                journal.new_claim,
+                expected_generation=journal.generation,
+                expected_temporary_name=journal.temporary_name,
+            )
             journal = registry.get_publish_journal(journal.workspace_id)
             if journal is None:
                 raise RegistryError("registry_state_conflict")
@@ -434,7 +512,64 @@ class EvidenceArtifactStore:
             expected_parent_identity=collection.identity,
         ):
             raise ArtifactBoundaryError("artifact_identity_changed")
-        registry.clear_publish(journal.workspace_id)
+        registry.clear_publish(
+            journal.workspace_id,
+            expected_generation=journal.generation,
+            expected_temporary_name=journal.temporary_name,
+        )
+
+    def _recover_publish_intent(self, tree: _WorkspaceTree) -> None:
+        registry = self._require_registry()
+        intent = registry.get_publish_intent(tree.claim.workspace_id)
+        if intent is None:
+            return
+        collection = tree.collections[intent.collection]
+        temporary_state = self._filesystem.classify_named_identity(
+            collection,
+            intent.temporary_name,
+            expected_parent_identity=collection.identity,
+            expected_source_identity=intent.temporary_identity,
+        )
+        backup_state = self._filesystem.classify_named_identity(
+            collection,
+            intent.backup_name,
+            expected_parent_identity=collection.identity,
+            expected_source_identity=intent.temporary_identity,
+        )
+        if intent.temporary_identity is None:
+            if temporary_state != "absent" or backup_state != "absent":
+                raise ArtifactBoundaryError("artifact_identity_changed")
+            registry.clear_publish_intent(
+                intent.workspace_id,
+                expected_generation=intent.generation,
+                expected_temporary_name=intent.temporary_name,
+            )
+            return
+        if temporary_state == "foreign" or backup_state == "foreign":
+            raise ArtifactBoundaryError("artifact_identity_changed")
+        if temporary_state == "owned" and backup_state == "owned":
+            raise ArtifactBoundaryError("artifact_identity_changed")
+        if temporary_state == "owned":
+            self._filesystem.delete_reserved_file(
+                collection,
+                intent.temporary_name,
+                expected_parent_identity=collection.identity,
+                expected_source_identity=intent.temporary_identity,
+                quarantine_name=intent.backup_name,
+            )
+        elif backup_state == "owned":
+            self._filesystem.delete_reserved_file(
+                collection,
+                intent.backup_name,
+                expected_parent_identity=collection.identity,
+                expected_source_identity=intent.temporary_identity,
+                quarantine_name=intent.backup_name,
+            )
+        registry.clear_publish_intent(
+            intent.workspace_id,
+            expected_generation=intent.generation,
+            expected_temporary_name=intent.temporary_name,
+        )
 
     def _rollback_publish(
         self,
@@ -503,6 +638,11 @@ class EvidenceArtifactStore:
     def _ready_tree(self, workspace_id: str, *, create: bool) -> Iterator[_WorkspaceTree]:
         registry = self._require_registry()
         claim = registry.get_workspace(workspace_id)
+        if claim is not None and claim.phase == "reserved":
+            if registry.retire_recovered_workspace(workspace_id):
+                claim = None
+            else:
+                raise ArtifactBoundaryError("artifact_operation_pending")
         if claim is None and create:
             self._bootstrap_workspace(workspace_id)
             claim = registry.get_workspace(workspace_id)
@@ -510,60 +650,85 @@ class EvidenceArtifactStore:
             raise ArtifactBoundaryError("artifact_identity_changed")
         if claim.phase != "active":
             raise ArtifactBoundaryError("artifact_operation_pending")
-        if registry.get_publish_journal(workspace_id) is not None:
-            with self._open_tree(workspace_id, allowed_phases={"active"}) as recovery_tree:
+        if (
+            registry.get_publish_intent(workspace_id) is not None
+            or registry.get_publish_journal(workspace_id) is not None
+        ):
+            with self._open_tree(
+                workspace_id,
+                allowed_phases={"active"},
+                expected_generation=claim.generation,
+            ) as recovery_tree:
+                self._recover_publish_intent(recovery_tree)
                 self._recover_publish(recovery_tree)
-            if registry.get_publish_journal(workspace_id) is not None:
+            if (
+                registry.get_publish_intent(workspace_id) is not None
+                or registry.get_publish_journal(workspace_id) is not None
+            ):
                 raise ArtifactBoundaryError("artifact_operation_pending")
-        with self._open_tree(workspace_id, allowed_phases={"active"}) as tree:
+        with self._open_tree(
+            workspace_id,
+            allowed_phases={"active"},
+            expected_generation=claim.generation,
+        ) as tree:
             yield tree
 
     def _bootstrap_workspace(self, workspace_id: str) -> None:
         registry = self._require_registry()
-        if not registry.reserve_workspace(workspace_id):
+        generation = secrets.token_hex(16)
+        if not registry.reserve_workspace(workspace_id, generation=generation):
             claim = registry.get_workspace(workspace_id)
             if claim is None or claim.phase != "active":
                 raise ArtifactBoundaryError("artifact_operation_pending")
             return
-        root = self._require_root()
-        with self._filesystem.anchor_child_directory(
-            root,
-            "workspaces",
-            expected_parent_identity=root.identity,
-        ) as workspaces:
-            with self._filesystem.create_child_directory(
-                workspaces,
-                workspace_id,
-                expected_parent_identity=workspaces.identity,
-            ) as workspace:
-                if self._filesystem.name_exists(
-                    workspace,
-                    "evidence",
-                    expected_parent_identity=workspace.identity,
-                ):
-                    raise ArtifactBoundaryError("artifact_identity_changed")
-                with self._filesystem.create_new_child_directory(
-                    workspace,
-                    "evidence",
-                    expected_parent_identity=workspace.identity,
-                ) as evidence:
-                    identities: dict[str, Identity] = {}
-                    with ExitStack() as stack:
-                        for name in _COLLECTIONS:
-                            child = stack.enter_context(
-                                self._filesystem.create_new_child_directory(
-                                    evidence,
-                                    name,
-                                    expected_parent_identity=evidence.identity,
+        try:
+            root = self._require_root()
+            with self._filesystem.anchor_child_directory(
+                root,
+                "workspaces",
+                expected_parent_identity=root.identity,
+            ) as workspaces:
+                with self._filesystem.create_child_directory(
+                    workspaces,
+                    workspace_id,
+                    expected_parent_identity=workspaces.identity,
+                ) as workspace:
+                    if self._filesystem.name_exists(
+                        workspace,
+                        "evidence",
+                        expected_parent_identity=workspace.identity,
+                    ):
+                        raise ArtifactBoundaryError("artifact_identity_changed")
+                    with self._filesystem.create_new_child_directory(
+                        workspace,
+                        "evidence",
+                        expected_parent_identity=workspace.identity,
+                    ) as evidence:
+                        identities: dict[str, Identity] = {}
+                        with ExitStack() as stack:
+                            for name in _COLLECTIONS:
+                                child = stack.enter_context(
+                                    self._filesystem.create_new_child_directory(
+                                        evidence,
+                                        name,
+                                        expected_parent_identity=evidence.identity,
+                                    )
                                 )
+                                identities[name] = child.identity
+                            registry.finalize_workspace(
+                                workspace_id,
+                                expected_generation=generation,
+                                workspace_identity=workspace.identity,
+                                evidence_identity=evidence.identity,
+                                collection_identities=identities,
                             )
-                            identities[name] = child.identity
-                        registry.finalize_workspace(
-                            workspace_id,
-                            workspace_identity=workspace.identity,
-                            evidence_identity=evidence.identity,
-                            collection_identities=identities,
-                        )
+        except Exception:
+            with contextlib.suppress(RegistryError):
+                registry.retire_reserved_workspace(
+                    workspace_id,
+                    expected_generation=generation,
+                )
+            raise
 
     @contextmanager
     def _open_tree(
@@ -571,12 +736,14 @@ class EvidenceArtifactStore:
         workspace_id: str,
         *,
         allowed_phases: set[str],
+        expected_generation: str,
     ) -> Iterator[_WorkspaceTree]:
         registry = self._require_registry()
         claim = registry.get_workspace(workspace_id)
         if (
             claim is None
             or claim.phase not in allowed_phases
+            or claim.generation != expected_generation
             or claim.workspace_identity is None
             or claim.evidence_identity is None
         ):
@@ -679,10 +846,18 @@ class EvidenceArtifactStore:
                 quarantine = item.quarantine_name
                 if quarantine is None:
                     quarantine = f".artifact-delete-{secrets.token_hex(16)}.quarantine"
-                    registry.plan_delete_quarantine(item.workspace_id, item.slot, quarantine)
+                    registry.plan_delete_quarantine(
+                        item.workspace_id,
+                        item.slot,
+                        quarantine,
+                        expected_generation=item.generation,
+                    )
                     item = next(
                         candidate
-                        for candidate in registry.get_delete_items(item.workspace_id)
+                        for candidate in registry.get_delete_items(
+                            item.workspace_id,
+                            expected_generation=item.generation,
+                        )
                         if candidate.slot == item.slot
                     )
                 source = self._classify_name(collection, filename, (item.claim,))
@@ -702,19 +877,26 @@ class EvidenceArtifactStore:
                     raise ArtifactBoundaryError("artifact_identity_changed")
                 if not self._delete_layout_is_known(
                     tree,
-                    registry.get_delete_items(item.workspace_id),
+                    registry.get_delete_items(
+                        item.workspace_id,
+                        expected_generation=item.generation,
+                    ),
                 ):
                     raise RegistryError("registry_pending")
                 registry.advance_delete_item(
                     item.workspace_id,
                     item.slot,
+                    expected_generation=item.generation,
                     expected_phase="planned",
                     new_phase="quarantined",
                     quarantine_name=quarantine,
                 )
                 item = next(
                     candidate
-                    for candidate in registry.get_delete_items(item.workspace_id)
+                    for candidate in registry.get_delete_items(
+                        item.workspace_id,
+                        expected_generation=item.generation,
+                    )
                     if candidate.slot == item.slot
                 )
             if item.phase == "quarantined":
@@ -723,7 +905,10 @@ class EvidenceArtifactStore:
                     raise RegistryError("registry_claim_invalid")
                 if not self._delete_layout_is_known(
                     tree,
-                    registry.get_delete_items(item.workspace_id),
+                    registry.get_delete_items(
+                        item.workspace_id,
+                        expected_generation=item.generation,
+                    ),
                 ):
                     raise RegistryError("registry_pending")
                 if self._filesystem.name_exists(
@@ -741,17 +926,27 @@ class EvidenceArtifactStore:
                 registry.advance_delete_item(
                     item.workspace_id,
                     item.slot,
+                    expected_generation=item.generation,
                     expected_phase="quarantined",
                     new_phase="removed",
                     quarantine_name=quarantine,
                 )
 
-    def _remove_deleted_tree(self, workspace_id: str) -> None:
+    def _remove_deleted_tree(
+        self,
+        workspace_id: str,
+        *,
+        expected_generation: str,
+    ) -> None:
         registry = self._require_registry()
         claim = registry.get_workspace(workspace_id)
         if claim is None:
             return
-        if claim.workspace_identity is None or claim.evidence_identity is None:
+        if (
+            claim.generation != expected_generation
+            or claim.workspace_identity is None
+            or claim.evidence_identity is None
+        ):
             raise RegistryError("registry_claim_invalid")
         collection_identities = registry.get_collection_identities(workspace_id)
         root = self._require_root()
@@ -767,51 +962,80 @@ class EvidenceArtifactStore:
             ) as workspace:
                 if workspace.identity != claim.workspace_identity:
                     raise OwnedFilesystemError("owned_identity_changed")
-                if not self._filesystem.name_exists(
+                evidence_is_visible = self._filesystem.name_exists(
                     workspace,
                     "evidence",
                     expected_parent_identity=workspace.identity,
-                ):
-                    registry.clear_deleted_workspace(workspace_id)
-                    return
-                with self._filesystem.anchor_child_directory(
-                    workspace,
-                    "evidence",
-                    expected_parent_identity=workspace.identity,
-                ) as evidence:
-                    if evidence.identity != claim.evidence_identity:
-                        raise OwnedFilesystemError("owned_identity_changed")
-                    for name in _COLLECTIONS:
-                        if not self._filesystem.name_exists(
+                )
+                if evidence_is_visible:
+                    with self._filesystem.anchor_child_directory(
+                        workspace,
+                        "evidence",
+                        expected_parent_identity=workspace.identity,
+                    ) as evidence:
+                        self._verify_empty_evidence_tree(
                             evidence,
-                            name,
-                            expected_parent_identity=evidence.identity,
-                        ):
-                            continue
-                        with self._filesystem.anchor_child_directory(
-                            evidence,
-                            name,
-                            expected_parent_identity=evidence.identity,
-                        ) as collection:
-                            if collection.identity != collection_identities[
-                                name
-                            ] or self._filesystem.list_names(collection):
-                                raise OwnedFilesystemError("owned_identity_changed")
-                        self._filesystem.remove_empty_directory(
-                            evidence,
-                            name,
-                            expected_parent_identity=evidence.identity,
-                            expected_child_identity=collection_identities[name],
+                            claim.evidence_identity,
+                            collection_identities,
                         )
-                    if self._filesystem.list_names(evidence):
-                        raise OwnedFilesystemError("owned_identity_changed")
-                self._filesystem.remove_empty_directory(
+                quarantine = self._filesystem.quarantine_directory_tree(
                     workspace,
                     "evidence",
                     expected_parent_identity=workspace.identity,
                     expected_child_identity=claim.evidence_identity,
                 )
-        registry.clear_deleted_workspace(workspace_id)
+                if quarantine is None:
+                    if self._filesystem.directory_names_with_identity(
+                        workspace,
+                        expected_parent_identity=workspace.identity,
+                        expected_child_identity=claim.evidence_identity,
+                    ):
+                        raise OwnedFilesystemError("owned_identity_changed")
+                    raise RegistryError("registry_pending")
+                with self._filesystem.anchor_child_directory(
+                    workspace,
+                    quarantine,
+                    expected_parent_identity=workspace.identity,
+                ) as evidence:
+                    self._verify_empty_evidence_tree(
+                        evidence,
+                        claim.evidence_identity,
+                        collection_identities,
+                    )
+                owned_names = self._filesystem.directory_names_with_identity(
+                    workspace,
+                    expected_parent_identity=workspace.identity,
+                    expected_child_identity=claim.evidence_identity,
+                )
+                if owned_names != (quarantine,):
+                    raise OwnedFilesystemError("owned_identity_changed")
+        registry.clear_deleted_workspace(
+            workspace_id,
+            expected_generation=claim.generation,
+        )
+
+    def _verify_empty_evidence_tree(
+        self,
+        evidence: OwnedDirectoryAnchor,
+        expected_evidence_identity: tuple[int, int],
+        collection_identities: dict[str, tuple[int, int]],
+    ) -> None:
+        if (
+            evidence.identity != expected_evidence_identity
+            or set(self._filesystem.list_names(evidence)) != set(_COLLECTIONS)
+        ):
+            raise OwnedFilesystemError("owned_identity_changed")
+        for name in _COLLECTIONS:
+            with self._filesystem.anchor_child_directory(
+                evidence,
+                name,
+                expected_parent_identity=evidence.identity,
+            ) as collection:
+                if (
+                    collection.identity != collection_identities[name]
+                    or self._filesystem.list_names(collection)
+                ):
+                    raise OwnedFilesystemError("owned_identity_changed")
 
     def _claim(self, workspace_id: str, collection: str, filename: str) -> ArtifactClaim:
         claim = self._require_registry().get_artifact(
@@ -898,6 +1122,7 @@ class EvidenceArtifactStore:
             expected_source_identity=claim.identity,
             expected_sha256=claim.sha256,
             expected_size=claim.size,
+            quarantine_name=name,
         )
 
     def _encode_json(
@@ -910,7 +1135,7 @@ class EvidenceArtifactStore:
         try:
             model_type = EvidenceUnit if artifact_type == "units" else StudyMapSnapshot
             if type(document) is model_type:
-                model = document
+                model = model_type.model_validate(document.model_dump(mode="python"))
             elif type(document) is dict:
                 self._validate_json_object(document)
                 model = model_type.model_validate(document)

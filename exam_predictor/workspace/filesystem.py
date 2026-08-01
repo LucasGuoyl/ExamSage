@@ -9,7 +9,7 @@ import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Iterator, Protocol
+from typing import BinaryIO, Iterator, Literal, Protocol
 
 
 FILE_ATTRIBUTE_DIRECTORY = 0x10
@@ -63,6 +63,7 @@ class OwnedMutationFile:
     name: str
     descriptor: int
     identity: tuple[int, int]
+    created: bool = False
 
 
 @dataclass
@@ -740,6 +741,47 @@ class OwnedArtifactFilesystem:
                 os.close(descriptor)
 
     @contextmanager
+    def open_mutation_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+    ) -> Iterator[OwnedMutationFile]:
+        """Open an existing authority file without ever creating its name."""
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        descriptor: int | None = None
+        try:
+            if self._platform == "posix":
+                flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+            else:
+                descriptor = self._open_file_windows(parent.path / name, mutable=True, pin=True)
+            opened = os.fstat(descriptor)
+            self._validate_regular(opened)
+            source = OwnedMutationFile(
+                parent,
+                name,
+                descriptor,
+                (opened.st_dev, opened.st_ino),
+                False,
+            )
+            self._assert_named_file(parent, name, source.identity)
+            self._assert_anchor(parent, expected_parent_identity)
+            yield source
+        except FileNotFoundError:
+            raise OwnedFilesystemError("owned_not_found") from None
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @contextmanager
     def open_or_create_mutation_file(
         self,
         parent: OwnedDirectoryAnchor,
@@ -750,6 +792,7 @@ class OwnedArtifactFilesystem:
         self._validate_name(name)
         self._assert_anchor(parent, expected_parent_identity)
         descriptor: int | None = None
+        created = False
         try:
             if self._platform == "posix":
                 flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
@@ -763,16 +806,23 @@ class OwnedArtifactFilesystem:
                         0o600,
                         dir_fd=parent.descriptor,
                     )
+                    created = True
             else:
                 try:
                     descriptor = self._open_file_windows(parent.path / name, mutable=True, pin=True)
                 except FileNotFoundError:
                     descriptor = self._create_mutation_windows(parent.path / name, pin=True)
+                    created = True
             opened = os.fstat(descriptor)
             self._validate_regular(opened)
-            source = OwnedMutationFile(parent, name, descriptor, (opened.st_dev, opened.st_ino))
+            source = OwnedMutationFile(parent, name, descriptor, (opened.st_dev, opened.st_ino), created)
             self._assert_named_file(parent, name, source.identity)
             self._assert_anchor(parent, expected_parent_identity)
+            if created:
+                if self._platform == "posix":
+                    os.fsync(parent.descriptor)
+                else:
+                    self._flush_directory_windows(parent)
             yield source
         except OwnedFilesystemError:
             raise
@@ -939,8 +989,6 @@ class OwnedArtifactFilesystem:
         if final_digest != expected_sha256 or final_size != expected_size:
             raise OwnedFilesystemError("owned_content_changed")
         if self._platform == "posix":
-            if not replace_existing and self._name_exists(parent, destination_name):
-                raise OwnedFilesystemError("owned_destination_exists")
             if replace_existing:
                 os.replace(
                     source_name,
@@ -949,12 +997,7 @@ class OwnedArtifactFilesystem:
                     dst_dir_fd=parent.descriptor,
                 )
             else:
-                os.rename(
-                    source_name,
-                    destination_name,
-                    src_dir_fd=parent.descriptor,
-                    dst_dir_fd=parent.descriptor,
-                )
+                self._rename_noreplace_posix(parent, source_name, destination_name)
             os.fsync(source.descriptor)
             os.fsync(parent.descriptor)
             write_through = False
@@ -971,14 +1014,14 @@ class OwnedArtifactFilesystem:
             self._flush_file_windows(source.descriptor)
             parent_flushed = self._flush_directory_windows(parent)
             write_through = True
+        if isinstance(source, OwnedTemporaryFile):
+            source.release()
         try:
             self._assert_named_file(parent, destination_name, expected_source_identity)
         except OwnedFilesystemError:
-            self._quarantine_untrusted(parent, destination_name)
-            raise
+            self._quarantine_untrusted_name(parent, destination_name)
+            raise OwnedFilesystemError("owned_identity_changed") from None
         self._assert_anchor(parent, expected_parent_identity)
-        if isinstance(source, OwnedTemporaryFile):
-            source.release()
         return OwnedMutationResult(
             identity=expected_source_identity,
             sha256=digest,
@@ -1029,8 +1072,9 @@ class OwnedArtifactFilesystem:
         expected_source_identity: tuple[int, int],
         expected_sha256: str,
         expected_size: int,
+        quarantine_name: str | None = None,
     ) -> None:
-        quarantine_name = f".owned-quarantine-{secrets.token_hex(16)}"
+        quarantine_name = quarantine_name or f".owned-quarantine-{secrets.token_hex(16)}"
         with self.open_claimed_file_for_mutation(
             parent,
             source_name,
@@ -1047,6 +1091,58 @@ class OwnedArtifactFilesystem:
                 expected_parent_identity=expected_parent_identity,
                 expected_source_identity=expected_source_identity,
             )
+
+    def delete_reserved_file(
+        self,
+        parent: OwnedDirectoryAnchor,
+        source_name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_source_identity: tuple[int, int],
+        quarantine_name: str | None = None,
+    ) -> None:
+        """Delete the exact occupant of a durable exclusive-name reservation."""
+        self._validate_name(source_name)
+        self._assert_anchor(parent, expected_parent_identity)
+        descriptor: int | None = None
+        try:
+            if self._platform == "posix":
+                flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(source_name, flags, dir_fd=parent.descriptor)
+            else:
+                descriptor = self._open_file_windows(parent.path / source_name, mutable=True)
+            opened = os.fstat(descriptor)
+            self._validate_regular(opened, expected_source_identity)
+            identity = (opened.st_dev, opened.st_ino)
+            self._assert_named_file(parent, source_name, identity)
+            self.before_mutation("delete_reserved", parent, source_name)
+            self._assert_named_file(parent, source_name, identity)
+            quarantine = quarantine_name or f".owned-reserved-{secrets.token_hex(16)}"
+            self._validate_name(quarantine)
+            if self._platform == "posix":
+                if source_name != quarantine:
+                    self._rename_noreplace_posix(parent, source_name, quarantine)
+                self._assert_named_file(parent, quarantine, identity)
+                os.unlink(quarantine, dir_fd=parent.descriptor)
+                os.fsync(parent.descriptor)
+            else:
+                import msvcrt
+
+                handle = msvcrt.get_osfhandle(descriptor)
+                if source_name != quarantine:
+                    self._rename_handle_windows(handle, parent.path / quarantine)
+                self._assert_named_file(parent, quarantine, identity)
+                self._mark_delete_handle_windows(handle)
+            self._assert_anchor(parent, expected_parent_identity)
+        except FileNotFoundError:
+            raise OwnedFilesystemError("owned_not_found") from None
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     def delete_open_file(
         self,
@@ -1068,12 +1164,25 @@ class OwnedArtifactFilesystem:
             self.before_mutation("delete", parent, source_name)
             self._assert_named_file(parent, source_name, expected_source_identity)
             handle = msvcrt.get_osfhandle(source.descriptor)
-            destination = parent.path / quarantine_name
-            self._rename_handle_windows(handle, destination)
+            if source_name != quarantine_name:
+                destination = parent.path / quarantine_name
+                self._rename_handle_windows(handle, destination)
             self._flush_file_windows(source.descriptor)
             self._flush_directory_windows(parent)
             self._assert_named_file(parent, quarantine_name, expected_source_identity)
             self._mark_delete_windows(source.descriptor)
+            if isinstance(source, OwnedTemporaryFile):
+                source.release()
+            return
+        if source_name == quarantine_name:
+            self._assert_anchor(parent, expected_parent_identity)
+            opened = os.fstat(source.descriptor)
+            self._validate_regular(opened, expected_source_identity)
+            self._assert_named_file(parent, source_name, expected_source_identity)
+            self.before_mutation("delete", parent, source_name)
+            self._assert_named_file(parent, source_name, expected_source_identity)
+            os.unlink(source_name, dir_fd=parent.descriptor)
+            os.fsync(parent.descriptor)
             if isinstance(source, OwnedTemporaryFile):
                 source.release()
             return
@@ -1105,11 +1214,8 @@ class OwnedArtifactFilesystem:
         self._assert_anchor(temporary.parent, expected_parent_identity)
         self._assert_named_file(temporary.parent, temporary.name, temporary.identity)
         if self._platform == "windows":
-            import msvcrt
-
-            handle = msvcrt.get_osfhandle(temporary.descriptor)
-            quarantine = temporary.parent.path / f".owned-quarantine-{secrets.token_hex(16)}"
-            self._rename_handle_windows(handle, quarantine)
+            self.before_mutation("discard_temporary", temporary.parent, temporary.name)
+            self._assert_named_file(temporary.parent, temporary.name, temporary.identity)
             try:
                 self._flush_directory_windows(temporary.parent)
             finally:
@@ -1130,6 +1236,29 @@ class OwnedArtifactFilesystem:
                 )
         except OSError:
             raise OwnedFilesystemError("owned_operation_failed") from None
+
+    def directory_names_with_identity(
+        self,
+        parent: OwnedDirectoryAnchor,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_child_identity: tuple[int, int],
+    ) -> tuple[str, ...]:
+        """Return names in one pinned parent that still identify an owned directory."""
+        self._assert_anchor(parent, expected_parent_identity)
+        matches: list[str] = []
+        for name in self.list_names(parent):
+            child: OwnedDirectoryAnchor | None = None
+            try:
+                child = self._open_child_directory(parent, name)
+            except (FileNotFoundError, NotADirectoryError, OwnedFilesystemError, OSError):
+                continue
+            try:
+                if child.identity == expected_child_identity:
+                    matches.append(name)
+            finally:
+                self._close_directory(child)
+        return tuple(sorted(matches, key=lambda value: (value.casefold(), value)))
 
     def name_exists(
         self,
@@ -1160,6 +1289,36 @@ class OwnedArtifactFilesystem:
             return False
         return True
 
+    def classify_named_identity(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_source_identity: tuple[int, int] | None,
+    ) -> Literal["absent", "owned", "foreign"]:
+        """Classify one no-follow name from a single directory-entry observation."""
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        try:
+            if self._platform == "posix":
+                named = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+            else:
+                named = os.lstat(parent.path / name)
+        except FileNotFoundError:
+            return "absent"
+        except PermissionError:
+            raise OwnedFilesystemError("owned_operation_failed") from None
+        except OSError:
+            raise OwnedFilesystemError("owned_identity_changed") from None
+        if expected_source_identity is None:
+            return "foreign"
+        try:
+            self._validate_regular(named, expected_source_identity)
+        except OwnedFilesystemError:
+            return "foreign"
+        return "owned"
+
     def remove_empty_directory(
         self,
         parent: OwnedDirectoryAnchor,
@@ -1167,44 +1326,121 @@ class OwnedArtifactFilesystem:
         *,
         expected_parent_identity: tuple[int, int],
         expected_child_identity: tuple[int, int],
-    ) -> None:
+    ) -> bool:
         self._validate_name(name)
         self._assert_anchor(parent, expected_parent_identity)
-        quarantine = f".owned-directory-{secrets.token_hex(16)}"
-        if self._platform == "posix":
-            child = self._open_child_directory(parent, name)
-            try:
-                if child.identity != expected_child_identity or self.list_names(child):
-                    raise OwnedFilesystemError("owned_identity_changed")
-                os.rename(
-                    name,
-                    quarantine,
-                    src_dir_fd=parent.descriptor,
-                    dst_dir_fd=parent.descriptor,
-                )
-                moved = os.stat(
-                    quarantine,
-                    dir_fd=parent.descriptor,
-                    follow_symlinks=False,
-                )
-                if (moved.st_dev, moved.st_ino) != expected_child_identity:
-                    raise OwnedFilesystemError("owned_identity_changed")
-                os.rmdir(quarantine, dir_fd=parent.descriptor)
-                os.fsync(parent.descriptor)
-            finally:
-                self._close_directory(child)
-            return
-        child = self._open_directory_windows(parent.path / name, delete_access=True)
+        quarantine = self._directory_quarantine_name(name, expected_child_identity)
+        original_exists = self._name_exists(parent, name)
+        quarantine_exists = self._name_exists(parent, quarantine)
+        if original_exists and quarantine_exists:
+            raise OwnedFilesystemError("owned_identity_changed")
+        if not original_exists and not quarantine_exists:
+            return False
+        active_name = name if original_exists else quarantine
+        child = (
+            self._open_directory_windows(parent.path / active_name, delete_access=True)
+            if self._platform == "windows"
+            else self._open_child_directory(parent, active_name)
+        )
         try:
             if child.identity != expected_child_identity or self.list_names(child):
                 raise OwnedFilesystemError("owned_identity_changed")
-            destination = parent.path / quarantine
-            self._rename_handle_windows(child.descriptor, destination)
-            if self._identity_windows(child.descriptor, destination) != expected_child_identity:
+            self.before_mutation("remove_directory", parent, active_name)
+            if child.identity != expected_child_identity or self.list_names(child):
                 raise OwnedFilesystemError("owned_identity_changed")
-            self._mark_delete_handle_windows(child.descriptor)
+            self._quarantine_open_directory(parent, child, active_name, quarantine)
         finally:
             self._close_directory(child)
+        return True
+
+    def quarantine_directory_tree(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        *,
+        expected_parent_identity: tuple[int, int],
+        expected_child_identity: tuple[int, int],
+    ) -> str | None:
+        """Move an owned directory tree to a durable, identity-bound tombstone.
+
+        Directory removal by name cannot be made object-bound on POSIX.  Keeping
+        the quarantined empty tree makes retries deterministic and prevents a
+        last-moment path substitution from causing deletion of a foreign object.
+        """
+        self._validate_name(name)
+        self._assert_anchor(parent, expected_parent_identity)
+        quarantine = self._directory_quarantine_name(name, expected_child_identity)
+        original_exists = self._name_exists(parent, name)
+        quarantine_exists = self._name_exists(parent, quarantine)
+        if original_exists and quarantine_exists:
+            raise OwnedFilesystemError("owned_identity_changed")
+        if not original_exists and not quarantine_exists:
+            return None
+        active_name = name if original_exists else quarantine
+        child = (
+            self._open_directory_windows(parent.path / active_name, delete_access=True)
+            if self._platform == "windows"
+            else self._open_child_directory(parent, active_name)
+        )
+        try:
+            if child.identity != expected_child_identity:
+                raise OwnedFilesystemError("owned_identity_changed")
+            self.before_mutation("quarantine_directory", parent, active_name)
+            if child.identity != expected_child_identity:
+                raise OwnedFilesystemError("owned_identity_changed")
+            self._quarantine_open_directory(parent, child, active_name, quarantine)
+        finally:
+            self._close_directory(child)
+        return quarantine
+
+    def _quarantine_open_directory(
+        self,
+        parent: OwnedDirectoryAnchor,
+        child: OwnedDirectoryAnchor,
+        active_name: str,
+        quarantine_name: str,
+    ) -> None:
+        if active_name != quarantine_name:
+            if self._platform == "posix":
+                self._rename_noreplace_posix(parent, active_name, quarantine_name)
+                os.fsync(parent.descriptor)
+            else:
+                self._rename_handle_windows(child.descriptor, parent.path / quarantine_name)
+                self._flush_directory_windows(parent)
+        try:
+            self._assert_named_directory(parent, quarantine_name, child.identity)
+        except OwnedFilesystemError:
+            raise OwnedFilesystemError("owned_identity_changed") from None
+
+    def _quarantine_untrusted_name(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+    ) -> None:
+        quarantine = f".owned-rejected-{secrets.token_hex(16)}"
+        try:
+            if self._platform == "posix":
+                self._rename_noreplace_posix(parent, name, quarantine)
+                os.fsync(parent.descriptor)
+            else:
+                self._move_file_ex_windows(
+                    parent.path / name,
+                    parent.path / quarantine,
+                    self.MOVEFILE_WRITE_THROUGH,
+                )
+                self._flush_directory_windows(parent)
+        except (OSError, OwnedFilesystemError):
+            raise OwnedFilesystemError("owned_identity_changed") from None
+
+    @staticmethod
+    def _directory_quarantine_name(
+        name: str,
+        identity: tuple[int, int],
+    ) -> str:
+        digest = hashlib.sha256(
+            f"{name}\0{identity[0]}\0{identity[1]}".encode("utf-8")
+        ).hexdigest()[:32]
+        return f".owned-directory-{digest}"
 
     def anchor_identity(self, anchor: OwnedDirectoryAnchor) -> tuple[int, int]:
         self._assert_anchor(anchor, anchor.identity)
@@ -1324,6 +1560,29 @@ class OwnedArtifactFilesystem:
             else:
                 named = os.lstat(parent.path / name)
             self._validate_regular(named, expected)
+        except OwnedFilesystemError:
+            raise
+        except OSError:
+            raise OwnedFilesystemError("owned_identity_changed") from None
+
+    def _assert_named_directory(
+        self,
+        parent: OwnedDirectoryAnchor,
+        name: str,
+        expected: tuple[int, int],
+    ) -> None:
+        try:
+            if self._platform == "posix":
+                named = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+            else:
+                named = os.lstat(parent.path / name)
+            if (
+                not stat.S_ISDIR(named.st_mode)
+                or stat.S_ISLNK(named.st_mode)
+                or self._is_reparse_stat(named)
+                or (named.st_dev, named.st_ino) != expected
+            ):
+                raise OwnedFilesystemError("owned_identity_changed")
         except OwnedFilesystemError:
             raise
         except OSError:
@@ -1555,7 +1814,53 @@ class OwnedArtifactFilesystem:
         import ctypes
 
         if not self._kernel32.MoveFileExW(str(source), str(destination), flags):
-            raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.get_last_error()
+            if not flags & self.MOVEFILE_REPLACE_EXISTING and error in {80, 183}:
+                raise OwnedFilesystemError("owned_destination_exists")
+            raise ctypes.WinError(error)
+
+    @staticmethod
+    def _rename_noreplace_posix(
+        parent: OwnedDirectoryAnchor,
+        source_name: str,
+        destination_name: str,
+    ) -> None:
+        import ctypes
+        import sys
+
+        library = ctypes.CDLL(None, use_errno=True)
+        source = os.fsencode(source_name)
+        destination = os.fsencode(destination_name)
+        if sys.platform.startswith("linux") and hasattr(library, "renameat2"):
+            rename = library.renameat2
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(parent.descriptor, source, parent.descriptor, destination, 1)
+        elif sys.platform == "darwin" and hasattr(library, "renameatx_np"):
+            rename = library.renameatx_np
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(parent.descriptor, source, parent.descriptor, destination, 0x00000004)
+        else:
+            raise OwnedFilesystemError("owned_operation_failed")
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise OwnedFilesystemError("owned_destination_exists")
+        raise OSError(error, os.strerror(error))
 
     def _flush_file_windows(self, descriptor: int) -> None:
         import ctypes
@@ -1632,23 +1937,3 @@ class OwnedArtifactFilesystem:
 
     def _close_handle_windows(self, handle: int) -> None:
         self._kernel32.CloseHandle(handle)
-
-    def _quarantine_untrusted(self, parent: OwnedDirectoryAnchor, source_name: str) -> None:
-        quarantine = f".owned-untrusted-{secrets.token_hex(16)}"
-        try:
-            if self._platform == "posix":
-                os.rename(
-                    source_name,
-                    quarantine,
-                    src_dir_fd=parent.descriptor,
-                    dst_dir_fd=parent.descriptor,
-                )
-                os.fsync(parent.descriptor)
-            else:
-                self._move_file_ex_windows(
-                    parent.path / source_name,
-                    parent.path / quarantine,
-                    self.MOVEFILE_WRITE_THROUGH,
-                )
-        except OSError:
-            pass

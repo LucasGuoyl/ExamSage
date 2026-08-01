@@ -6,6 +6,7 @@ import struct
 import zipfile
 
 import exam_predictor.workspace.archive as archive_module
+import pytest
 from exam_predictor.workspace.archive import (
     ARCHIVE_ABSOLUTE_PATH,
     ARCHIVE_DEPTH_LIMIT,
@@ -233,4 +234,23 @@ def test_archive_member_metadata_is_immutable_and_preserves_parent_identity():
     assert members[0].item_kind == "folder"
     assert members[1].item_kind == "file"
     assert all(member.parent_entry_id == "archive-1" for member in members)
+    assert (members[1].member_index, members[1].crc32, members[1].compressed_bytes) == (
+        2,
+        0x1FA4288F,
+        4,
+    )
     assert isinstance(members, tuple)
+
+
+def test_archive_rejects_duplicate_normalized_paths_even_when_sizes_match():
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        content = _archive(("same.txt", b"safe"), ("same.txt", b"evil"))
+
+    members = ArchiveInspector().inspect(
+        io.BytesIO(content),
+        parent_entry_id="archive-1",
+    )
+
+    assert len(members) == 2
+    assert members[1].state is SourceState.FAILED
+    assert members[1].failure_code == "archive_path_collision"
