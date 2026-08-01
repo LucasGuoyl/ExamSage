@@ -36,6 +36,8 @@ from exam_predictor.runtime.models import (
 )
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.runtime.store import RuntimeStore
+from exam_predictor.providers import BaseProvider
+from exam_predictor.evidence.policy import EvidencePolicy
 from exam_predictor.workspace.browser_intake import (
     BrowserIntakeWriter,
     OwnedTreeRemover,
@@ -45,6 +47,8 @@ from exam_predictor.workspace.scanner import WorkspaceScanner
 from exam_predictor.workspace.service import WorkspaceService
 from exam_predictor.workspace.store import WorkspaceStore
 
+from .evidence_routes import EvidenceRouterDependencies, build_evidence_router
+from .evidence_runtime import build_evidence_service
 from .workspace_routes import WorkspaceRouterDependencies, build_workspace_router
 
 
@@ -120,16 +124,28 @@ def create_worker_app(
     runtime: RuntimeCoordinator | None = None,
     workspace_store: WorkspaceStore | None = None,
     workspace_service: WorkspaceService | None = None,
+    evidence_service: object | None = None,
+    provider_factory: Callable[[dict[str, object]], BaseProvider] | None = None,
+    credential_vault: object | None = None,
+    folder_picker: object | None = None,
 ) -> FastAPI:
+    owns_runtime = runtime is None
+    owned_evidence_resources: tuple[object, object] | None = None
     if workspace_store is None:
         workspace_store = WorkspaceStore(settings.data_dir / "workspace.sqlite3")
     if runtime is None:
         runtime_store = RuntimeStore(settings.data_dir / "agent-runtime.sqlite3")
-        sessions = ProviderSessionRegistry()
-        try:
-            vault = KeyringCredentialVault()
-        except VaultUnavailableError:
-            vault = None
+        sessions = (
+            ProviderSessionRegistry()
+            if provider_factory is None
+            else ProviderSessionRegistry(factory=provider_factory)
+        )
+        vault = credential_vault
+        if vault is None:
+            try:
+                vault = KeyringCredentialVault()
+            except VaultUnavailableError:
+                vault = None
         runtime = RuntimeCoordinator(
             store=runtime_store,
             provider_sessions=sessions,
@@ -137,14 +153,38 @@ def create_worker_app(
             vault=vault,
             workspace_repository=workspace_store,
         )
+    evidence_composable = all(
+        hasattr(runtime, name)
+        for name in ("store", "provider_sessions", "controls")
+    )
+    if evidence_service is None and owns_runtime and evidence_composable:
+        evidence_service, evidence_store, artifact_store = build_evidence_service(
+            data_dir=settings.data_dir,
+            workspace_store=workspace_store,
+            runtime_store=runtime.store,
+            provider_sessions=runtime.provider_sessions,
+            controls=runtime.controls,
+            run_guard=runtime,
+        )
+        runtime.evidence_service = evidence_service
+        owned_evidence_resources = (evidence_store, artifact_store)
     if workspace_service is None:
         workspace_service = WorkspaceService(
             store=workspace_store,
             scanner=WorkspaceScanner(),
-            picker=SubprocessFolderPicker(Path(sys.executable)),
+            picker=(
+                SubprocessFolderPicker(Path(sys.executable))
+                if folder_picker is None
+                else folder_picker
+            ),
             browser_intake=BrowserIntakeWriter(settings.data_dir / "workspaces"),
             run_guard=runtime,
             remove_owned_tree=OwnedTreeRemover(settings.data_dir),
+            evidence_cleanup=(
+                None
+                if evidence_service is None
+                else evidence_service.delete_workspace_evidence
+            ),
             close_store_on_shutdown=True,
         )
 
@@ -155,6 +195,22 @@ def create_worker_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if owned_evidence_resources is not None:
+            try:
+                runtime.start()
+                workspace_service.start()
+                yield
+            finally:
+                runtime.shutdown(
+                    timeout=EvidencePolicy().provider_timeout_seconds + 15.0
+                )
+                try:
+                    workspace_service.shutdown()
+                finally:
+                    evidence_store, artifact_store = owned_evidence_resources
+                    evidence_store.close()
+                    artifact_store.close()
+            return
         try:
             runtime.start()
             try:
@@ -176,6 +232,8 @@ def create_worker_app(
     app.state.runtime = runtime
     app.state.workspace_store = workspace_store
     app.state.workspace_service = workspace_service
+    app.state.evidence_service = evidence_service
+    app.state.evidence_resources = owned_evidence_resources
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(_request, _exc) -> JSONResponse:
@@ -409,5 +467,11 @@ def create_worker_app(
             )
         )
     )
+    if evidence_service is not None:
+        app.include_router(
+            build_evidence_router(
+                EvidenceRouterDependencies(evidence_service=evidence_service)
+            )
+        )
 
     return app

@@ -9,6 +9,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from exam_predictor.evidence.models import CoverageSummary, StudyMapSnapshot
 from .models import (
     AgentEvent,
     ConnectProviderRequest,
@@ -228,6 +229,26 @@ class WorkerClient:
             params=params,
         )
         return self._model(response, ManifestPage)
+
+    def get_evidence_coverage(self, workspace_id: str) -> CoverageSummary:
+        response = self._request(
+            "GET",
+            f"/v1/workspaces/{quote(workspace_id, safe='')}/evidence/coverage",
+        )
+        return self._model(response, CoverageSummary)
+
+    def get_current_evidence_snapshot(
+        self,
+        workspace_id: str,
+    ) -> StudyMapSnapshot:
+        response = self._request(
+            "GET",
+            (
+                f"/v1/workspaces/{quote(workspace_id, safe='')}"
+                "/evidence/snapshots/current"
+            ),
+        )
+        return self._model(response, StudyMapSnapshot)
 
     def select_folder(self, idempotency_key: str) -> WorkspaceJob | None:
         response = self._request(

@@ -82,6 +82,7 @@ class WorkspaceService:
         browser_intake: BrowserIntakeWriter,
         run_guard: WorkspaceRunGuard,
         remove_owned_tree: Callable[[OwnedTreeClaim], None] | None = None,
+        evidence_cleanup: Callable[[str], object] | None = None,
         close_store_on_shutdown: bool = False,
     ) -> None:
         self._store = store
@@ -92,6 +93,7 @@ class WorkspaceService:
         self._remove_owned_tree = (
             remove_owned_tree or self._secure_cleanup_unavailable
         )
+        self._evidence_cleanup = evidence_cleanup or (lambda _workspace_id: None)
         self._close_store_on_shutdown = close_store_on_shutdown
         self._jobs: queue.Queue[str | None] = queue.Queue()
         self._stop = threading.Event()
@@ -114,6 +116,7 @@ class WorkspaceService:
             self._discover_browser_orphans()
             self._store.interrupt_claimed_creations()
             self._recover_cleanup()
+            self._recover_deleting_workspaces()
             for job in self._store.recover_unfinished_jobs():
                 self._queue_existing(job)
             self._stop.clear()
@@ -425,14 +428,38 @@ class WorkspaceService:
     def delete_workspace(self, workspace_id: str) -> None:
         """Delete ExamSage-owned state only after the run guard settles."""
         with self._workspace_mutation(workspace_id):
-            if self._run_guard.has_unsettled_runs(workspace_id):
-                raise WorkspaceOperationError("workspace_has_unsettled_runs")
-            workspace = self._require_workspace(workspace_id)
+            unsettled = False
+
+            def has_unsettled_runs() -> bool:
+                nonlocal unsettled
+                unsettled = self._run_guard.has_unsettled_runs(workspace_id)
+                return unsettled
+
             try:
-                self._store.mark_deleting(workspace_id)
+                workspace = self._store.mark_deleting_if_settled(
+                    workspace_id,
+                    has_unsettled_runs,
+                )
             except ActiveWorkspaceOperationError:
+                if unsettled:
+                    raise WorkspaceOperationError(
+                        "workspace_has_unsettled_runs"
+                    ) from None
                 raise WorkspaceOperationError("workspace_operation_active") from None
             self._run_guard.delete_settled_workspace_runs(workspace_id)
+            try:
+                cleanup_result = self._evidence_cleanup(workspace_id)
+            except Exception as error:
+                code = getattr(error, "code", None)
+                safe_code = (
+                    code
+                    if code in {"evidence_delete_pending", "evidence_runs_active"}
+                    else "evidence_delete_pending"
+                )
+                raise WorkspaceOperationError(safe_code) from None
+            cleanup_state = getattr(cleanup_result, "value", cleanup_result)
+            if cleanup_state not in {None, "deleted"}:
+                raise WorkspaceOperationError("evidence_delete_pending")
             if workspace.source_mode is SourceMode.NATIVE_FOLDER:
                 self._store.delete_workspace_rows(workspace_id)
                 return
@@ -477,6 +504,15 @@ class WorkspaceService:
             if workspace.workspace_id not in conflict_set:
                 self.delete_workspace(workspace.workspace_id)
         return tuple(conflicts)
+
+    def _recover_deleting_workspaces(self) -> None:
+        for workspace in self._store.list_workspaces():
+            if workspace.state is not WorkspaceState.DELETING:
+                continue
+            try:
+                self.delete_workspace(workspace.workspace_id)
+            except WorkspaceOperationError:
+                continue
 
     def _enqueue(self, workspace_id: str, idempotency_key: str) -> WorkspaceJob:
         with self._lock:

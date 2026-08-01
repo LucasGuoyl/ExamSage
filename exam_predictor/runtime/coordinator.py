@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -101,7 +102,16 @@ class RuntimeCoordinator:
         message: str,
         workspace_id: str | None = None,
     ) -> RunSnapshot:
-        with self._lock:
+        authority = nullcontext()
+        if workspace_id is not None and self.workspace_repository is not None:
+            hold_authority = getattr(
+                self.workspace_repository,
+                "hold_workspace_authority",
+                None,
+            )
+            if callable(hold_authority):
+                authority = hold_authority(workspace_id)
+        with authority, self._lock:
             self._ensure_accepting_commands()
             self.provider_sessions.get_provider(provider_profile_id)
             if workspace_id is not None:

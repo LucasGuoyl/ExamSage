@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -31,7 +32,15 @@ from exam_predictor.runtime.models import (
 from exam_predictor.runtime.provider_sessions import ProviderSessionRegistry
 from exam_predictor.runtime.store import RuntimeStore
 from exam_predictor.tools.kernel import KernelPlanner, KernelToolRegistry
-from exam_predictor.workspace.models import WorkspaceState
+from exam_predictor.workspace.browser_intake import BrowserIntakeWriter
+from exam_predictor.workspace.models import (
+    SourceMode,
+    WorkspaceRecord,
+    WorkspaceState,
+)
+from exam_predictor.workspace.scanner import WorkspaceScanner
+from exam_predictor.workspace.service import WorkspaceService
+from exam_predictor.workspace.store import WorkspaceStore
 from exam_predictor.workspace.transmission import SourceAuthorizationError
 
 
@@ -1452,6 +1461,107 @@ def test_source_authorization_failure_pauses_safely_without_starting_queued_work
     finally:
         harness.release_first.set()
         runtime.shutdown()
+
+
+def test_workspace_delete_cutover_blocks_a_concurrent_run_creation(
+    tmp_path: Path,
+):
+    workspace_id = "8d6f8d1f9ed34b3f9228dcd3cb6290c4"
+    source_root = tmp_path / "course-delete-race"
+    source_root.mkdir()
+    source = source_root / "notes.txt"
+    source.write_bytes(b"native course bytes")
+    workspace_store = WorkspaceStore(tmp_path / "workspace.sqlite3")
+    now = datetime.now(UTC)
+    workspace_store.create_workspace(
+        WorkspaceRecord(
+            workspace_id=workspace_id,
+            display_name="Course",
+            source_mode=SourceMode.NATIVE_FOLDER,
+            canonical_root=source_root.resolve(),
+            root_device=str(source_root.stat().st_dev),
+            root_file_id=str(source_root.stat().st_ino),
+            state=WorkspaceState.READY,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    runtime = RuntimeCoordinator(
+        store=RuntimeStore(tmp_path / "runtime.sqlite3"),
+        provider_sessions=registry(),
+        checkpoints_path=tmp_path / "checkpoints.sqlite3",
+        workspace_repository=workspace_store,
+    )
+    guard_entered = Event()
+    release_guard = Event()
+
+    class BlockingRunGuard:
+        @staticmethod
+        def has_unsettled_runs(candidate: str) -> bool:
+            assert candidate == workspace_id
+            guard_entered.set()
+            assert release_guard.wait(timeout=2)
+            return runtime.has_unsettled_runs(candidate)
+
+        @staticmethod
+        def delete_settled_workspace_runs(candidate: str) -> None:
+            runtime.delete_settled_workspace_runs(candidate)
+
+    service = WorkspaceService(
+        store=workspace_store,
+        scanner=WorkspaceScanner(),
+        picker=SimpleNamespace(choose_folder=lambda: None),
+        browser_intake=BrowserIntakeWriter(tmp_path / "workspaces"),
+        run_guard=BlockingRunGuard(),
+    )
+    deletion_errors: list[BaseException] = []
+    submission_errors: list[BaseException] = []
+    submit_finished = Event()
+
+    def delete_workspace() -> None:
+        try:
+            service.delete_workspace(workspace_id)
+        except BaseException as error:
+            deletion_errors.append(error)
+
+    def submit_run() -> None:
+        try:
+            runtime.submit_message(
+                "client-thread",
+                "primary",
+                "Build my study map.",
+                workspace_id=workspace_id,
+            )
+        except BaseException as error:
+            submission_errors.append(error)
+        finally:
+            submit_finished.set()
+
+    deletion = Thread(target=delete_workspace)
+    submission = Thread(target=submit_run)
+    try:
+        deletion.start()
+        assert guard_entered.wait(timeout=2)
+        submission.start()
+        assert not submit_finished.wait(timeout=0.1)
+        release_guard.set()
+        deletion.join(timeout=2)
+        submission.join(timeout=2)
+
+        assert not deletion.is_alive()
+        assert not submission.is_alive()
+        assert deletion_errors == []
+        assert len(submission_errors) == 1
+        assert isinstance(submission_errors[0], (KeyError, ValueError))
+        assert runtime.store.list_by_status(set(RunStatus)) == []
+        assert workspace_store.get_workspace(workspace_id) is None
+        assert source.read_bytes() == b"native course bytes"
+    finally:
+        release_guard.set()
+        deletion.join(timeout=2)
+        submission.join(timeout=2)
+        runtime.shutdown()
+        workspace_store.close()
 
 
 def test_source_change_interrupt_uses_actionable_pause_and_can_resume(

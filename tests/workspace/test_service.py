@@ -73,6 +73,7 @@ def _service(
     *,
     scanner: WorkspaceScanner | None = None,
     remove_owned_tree=None,
+    evidence_cleanup=None,
 ) -> WorkspaceService:
     return WorkspaceService(
         store=store,
@@ -81,6 +82,7 @@ def _service(
         browser_intake=BrowserIntakeWriter(tmp_path / "workspaces"),
         run_guard=guard,
         remove_owned_tree=remove_owned_tree,
+        evidence_cleanup=evidence_cleanup,
     )
 
 
@@ -1096,6 +1098,99 @@ def test_native_deletion_removes_only_owned_rows_and_never_source_bytes(
         assert guard.deleted == [job.workspace_id]
     finally:
         service.shutdown()
+
+
+def test_workspace_deletion_cleans_derived_evidence_before_source_rows(
+    tmp_path: Path,
+    store: WorkspaceStore,
+):
+    native_root = tmp_path / "native-with-evidence"
+    native_root.mkdir()
+    (native_root / "notes.txt").write_bytes(b"native")
+    guard = FakeRunGuard()
+    cleanup_calls: list[str] = []
+
+    def cleanup_evidence(workspace_id: str) -> None:
+        workspace = store.get_workspace(workspace_id)
+        assert workspace is not None
+        assert workspace.state is WorkspaceState.DELETING
+        assert guard.deleted == [workspace_id]
+        cleanup_calls.append(workspace_id)
+
+    service = _service(
+        tmp_path,
+        store,
+        FakePicker([native_root]),
+        guard,
+        evidence_cleanup=cleanup_evidence,
+    )
+    service.start()
+    try:
+        job = service.select_folder("pick-evidence-cleanup")
+        assert job is not None
+        _wait_for_job(store, job.job_id)
+
+        service.delete_workspace(job.workspace_id)
+
+        assert cleanup_calls == [job.workspace_id]
+        assert store.get_workspace(job.workspace_id) is None
+        assert (native_root / "notes.txt").read_bytes() == b"native"
+    finally:
+        service.shutdown()
+
+
+def test_pending_evidence_cleanup_blocks_rows_and_recovers_on_start(
+    tmp_path: Path,
+    store: WorkspaceStore,
+):
+    native_root = tmp_path / "native-pending-evidence"
+    native_root.mkdir()
+    (native_root / "notes.txt").write_bytes(b"native")
+    guard = FakeRunGuard()
+
+    class CleanupResult:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+    first = _service(
+        tmp_path,
+        store,
+        FakePicker([native_root]),
+        guard,
+        evidence_cleanup=lambda _workspace_id: CleanupResult("cleanup_pending"),
+    )
+    first.start()
+    try:
+        job = first.select_folder("pick-pending-evidence")
+        assert job is not None
+        _wait_for_job(store, job.job_id)
+
+        with pytest.raises(WorkspaceOperationError) as caught:
+            first.delete_workspace(job.workspace_id)
+
+        assert caught.value.code == "evidence_delete_pending"
+        assert store.get_workspace(job.workspace_id).state is WorkspaceState.DELETING
+        assert (native_root / "notes.txt").read_bytes() == b"native"
+    finally:
+        first.shutdown()
+
+    recovered: list[str] = []
+    restarted = _service(
+        tmp_path,
+        store,
+        FakePicker([]),
+        guard,
+        evidence_cleanup=lambda workspace_id: (
+            recovered.append(workspace_id) or CleanupResult("deleted")
+        ),
+    )
+    restarted.start()
+    try:
+        assert recovered == [job.workspace_id]
+        assert store.get_workspace(job.workspace_id) is None
+        assert (native_root / "notes.txt").read_bytes() == b"native"
+    finally:
+        restarted.shutdown()
 
 
 def test_browser_approval_and_delete_all_remove_only_verified_owned_snapshots(

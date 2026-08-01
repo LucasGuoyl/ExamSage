@@ -2084,6 +2084,21 @@ class WorkspaceStore:
 
     @_serialize_workspace_authority
     def mark_deleting(self, workspace_id: str) -> WorkspaceRecord:
+        return self._mark_deleting(workspace_id)
+
+    @_serialize_workspace_authority
+    def mark_deleting_if_settled(
+        self,
+        workspace_id: str,
+        has_unsettled_runs: Callable[[], bool],
+    ) -> WorkspaceRecord:
+        if has_unsettled_runs():
+            raise ActiveWorkspaceOperationError(
+                f"Workspace '{workspace_id}' has unsettled Agent runs."
+            )
+        return self._mark_deleting(workspace_id)
+
+    def _mark_deleting(self, workspace_id: str) -> WorkspaceRecord:
         now = self._now()
         active = (WorkspaceJobStatus.QUEUED.value, WorkspaceJobStatus.RUNNING.value)
         with self._transaction() as connection:
