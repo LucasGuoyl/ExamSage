@@ -155,7 +155,7 @@ def run_application(
 ) -> LauncherResult:
     project_root = Path(__file__).resolve().parents[1]
     python = sys.executable
-    agent_mode = os.environ.get("EXAMSAGE_AGENT_V2", "0") == "1"
+    agent_mode = os.environ.get("EXAMSAGE_AGENT_V2", "1") == "1"
     commands: list[list[str]] = []
     worker_process: subprocess.Popen[bytes] | None = None
     streamlit_process: subprocess.Popen[bytes] | None = None

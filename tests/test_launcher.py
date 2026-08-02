@@ -308,6 +308,36 @@ def test_pause_request_uses_exact_token_on_authenticated_runtime_route(
     ]
 
 
+def test_default_mode_starts_agent_worker_before_streamlit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("EXAMSAGE_AGENT_V2", raising=False)
+    monkeypatch.setattr(launch_app, "allocate_loopback_port", lambda: 43123)
+    monkeypatch.setattr(launch_app.secrets, "token_urlsafe", lambda size: TOKEN)
+    actions: list[str] = []
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def popen(command: list[str], **kwargs: object) -> FakeProcess:
+        name = "worker" if "exam_predictor.worker.main" in command else "streamlit"
+        actions.append(f"start:{name}")
+        calls.append((command, kwargs))
+        return FakeProcess(name, actions)
+
+    result = run_application(
+        popen=popen,
+        readiness=lambda url, *, worker_poll: actions.append(f"ready:{url}"),
+        pause_request=lambda url, token: actions.append(f"pause:{url}:{token}"),
+    )
+
+    assert result.worker_started is True
+    assert result.streamlit_started is True
+    assert [call[0] for call in calls] == [
+        [sys.executable, "-m", "exam_predictor.worker.main", "--host", "127.0.0.1", "--port", "43123"],
+        [sys.executable, "-m", "streamlit", "run", "app.py"],
+    ]
+    assert calls[1][1]["env"]["EXAMSAGE_AGENT_V2"] == "1"
+
+
 def test_legacy_mode_starts_only_streamlit_with_inherited_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -333,7 +363,7 @@ def test_legacy_mode_starts_only_streamlit_with_inherited_environment(
 def test_legacy_keyboard_interrupt_terminates_streamlit_and_returns_130(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("EXAMSAGE_AGENT_V2", raising=False)
+    monkeypatch.setenv("EXAMSAGE_AGENT_V2", "0")
     actions: list[str] = []
 
     result = run_application(

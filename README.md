@@ -26,19 +26,18 @@ Install Python 3.11 or 3.12, download this repository, then run the Agent route:
 ### Windows PowerShell
 
 ```powershell
-$env:EXAMSAGE_AGENT_V2 = "1"
 .\launch_windows.bat
 ```
 
 ### macOS Terminal
 
 ```bash
-EXAMSAGE_AGENT_V2=1 ./launch_macos.command
+./launch_macos.command
 ```
 
 The launcher creates `.venv`, installs the pinned application dependencies, starts an authenticated Worker bound to `127.0.0.1`, and opens the local Streamlit interface. Choose OpenAI or Google Gemini and connect one key. The Agent Worker stores the key through Windows Credential Manager or macOS Keychain; if the OS vault is unavailable, connection fails without a plaintext fallback.
 
-The standard launch scripts without `EXAMSAGE_AGENT_V2=1` still open the compatibility route during this staged migration. That route is not the recommended evidence-engine evaluation path.
+The standard launch scripts open the Agent route by default. The fixed compatibility route remains available only as an explicit developer fallback by setting `EXAMSAGE_AGENT_V2=0` before launch.
 
 ## Evidence flow
 
@@ -135,7 +134,7 @@ Output is created exclusively and will not overwrite an existing report. The ben
 
 ## Legacy developer fallback
 
-The fixed legacy route remains only as a temporary compatibility and developer fallback. It uses the older all-or-nothing build path, has different key/storage behavior, and is not evidence-engine acceptance evidence. Start it by leaving `EXAMSAGE_AGENT_V2` unset or setting it to `0`. Existing saved reports remain readable, and abandoned upload copies are never imported as approved Agent evidence.
+The fixed legacy route remains only as a temporary compatibility and developer fallback. It uses the older all-or-nothing build path, has different key/storage behavior, and is not evidence-engine acceptance evidence. Start it only by explicitly setting `EXAMSAGE_AGENT_V2=0` before launching. Existing saved reports remain readable, and abandoned upload copies are never imported as approved Agent evidence.
 
 ## Development and verification
 

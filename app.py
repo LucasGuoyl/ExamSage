@@ -293,7 +293,7 @@ def render_report(report: PredictionReport, course_id: str | None) -> None:
 
 
 st.set_page_config(page_title="ExamSage", page_icon="🎓", layout="wide")
-if os.environ.get("EXAMSAGE_AGENT_V2", "0") == "1":
+if os.environ.get("EXAMSAGE_AGENT_V2", "1") == "1":
     from exam_predictor.ui.agent_view import render_agent_kernel
 
     render_agent_kernel()
