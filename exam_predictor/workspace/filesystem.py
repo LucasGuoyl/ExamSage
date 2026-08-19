@@ -1366,8 +1366,17 @@ class OwnedArtifactFilesystem:
             if child.identity != expected_child_identity or self.list_names(child):
                 raise OwnedFilesystemError("owned_identity_changed")
             self.before_mutation("remove_directory", parent, active_name)
-            if child.identity != expected_child_identity or self.list_names(child):
-                raise OwnedFilesystemError("owned_identity_changed")
+            try:
+                if child.identity != expected_child_identity or self.list_names(child):
+                    raise OwnedFilesystemError("owned_identity_changed")
+            except OwnedFilesystemError:
+                if self._platform == "posix":
+                    self._quarantine_changed_directory_name(
+                        parent,
+                        active_name,
+                        quarantine,
+                    )
+                raise OwnedFilesystemError("owned_identity_changed") from None
             self._quarantine_open_directory(parent, child, active_name, quarantine)
         finally:
             self._close_directory(child)
@@ -1430,6 +1439,19 @@ class OwnedArtifactFilesystem:
         try:
             self._assert_named_directory(parent, quarantine_name, child.identity)
         except OwnedFilesystemError:
+            raise OwnedFilesystemError("owned_identity_changed") from None
+
+    def _quarantine_changed_directory_name(
+        self,
+        parent: OwnedDirectoryAnchor,
+        active_name: str,
+        quarantine_name: str,
+    ) -> None:
+        """Isolate a POSIX name that stopped identifying the held directory."""
+        try:
+            self._rename_noreplace_posix(parent, active_name, quarantine_name)
+            os.fsync(parent.descriptor)
+        except (OSError, OwnedFilesystemError):
             raise OwnedFilesystemError("owned_identity_changed") from None
 
     def _quarantine_untrusted_name(

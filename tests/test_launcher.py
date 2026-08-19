@@ -637,7 +637,7 @@ def test_worker_creation_flag_is_windows_only_and_streamlit_stays_console_attach
         pause_request=lambda url, token: None,
     )
 
-    assert calls[0][1]["creationflags"] == subprocess.CREATE_NO_WINDOW
+    assert calls[0][1]["creationflags"] == launch_app.WINDOWS_CREATE_NO_WINDOW
     assert "creationflags" not in calls[1][1]
 
 

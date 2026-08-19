@@ -547,7 +547,7 @@ def test_windows_cleanup_does_not_adopt_a_replaced_directory_identity(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor lifecycle")
-def test_posix_session_closes_workspace_fd_if_temp_creation_fails(
+def test_posix_session_closes_open_fds_if_temp_creation_fails(
     tmp_path, monkeypatch
 ):
     workspace = tmp_path / "workspace-1"
@@ -569,7 +569,8 @@ def test_posix_session_closes_workspace_fd_if_temp_creation_fails(
     with pytest.raises(OSError, match="create failed"):
         _PosixSnapshotSession(workspace)
 
-    assert len(closed) == 1
+    assert len(closed) == 2
+    assert len(set(closed)) == 2
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle lifecycle")

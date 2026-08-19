@@ -318,7 +318,9 @@ def test_claimed_delete_quarantines_and_never_deletes_a_substitution(tmp_path):
                 expected_size=7,
             )
 
-    assert caught.value.code == "owned_identity_changed"
+    # POSIX filesystems may immediately reuse the deleted inode.  Either signal
+    # proves the stale claim was rejected without deleting the replacement.
+    assert caught.value.code in {"owned_identity_changed", "owned_content_changed"}
     assert claimed.read_bytes() == b"replacement"
 
 

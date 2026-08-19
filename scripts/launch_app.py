@@ -14,6 +14,9 @@ from typing import Callable, Protocol
 import httpx
 
 
+WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
 @dataclass
 class LauncherResult:
     worker_started: bool
@@ -195,7 +198,7 @@ def run_application(
         commands.append(worker)
         worker_options: dict[str, object] = {"cwd": project_root, "env": environment}
         if sys.platform == "win32":
-            worker_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            worker_options["creationflags"] = WINDOWS_CREATE_NO_WINDOW
         start_failed = False
         try:
             worker_process = popen(worker, **worker_options)
