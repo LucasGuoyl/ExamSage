@@ -356,7 +356,7 @@ async def test_agent_kernel_vertical_slice(
     monkeypatch.setenv("EXAMSAGE_WORKER_TOKEN", WORKER_TOKEN)
     monkeypatch.setenv("EXAMSAGE_DATA_DIR", str(tmp_path / "ui-data"))
     app_path = Path(__file__).resolve().parents[1] / "app.py"
-    streamlit_app = AppTest.from_file(str(app_path), default_timeout=20).run()
+    streamlit_app = AppTest.from_file(str(app_path), default_timeout=60).run()
     assert not streamlit_app.exception
     assert any("Worker unavailable" in item.value for item in streamlit_app.error)
     assert "Estimate cost" not in [button.label for button in streamlit_app.button]

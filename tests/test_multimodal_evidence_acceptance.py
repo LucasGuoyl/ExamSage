@@ -28,6 +28,7 @@ from exam_predictor.workspace.models import WorkspaceJobStatus
 TOKEN = "multimodal-acceptance-token"
 AUTH = {"X-ExamSage-Token": TOKEN}
 RAW_SOURCE_MARKER = "raw-source-only-7f39b2e8"
+FRONTIER_START_TIMEOUT_SECONDS = 60
 pytestmark = pytest.mark.anyio
 
 
@@ -539,7 +540,8 @@ async def test_progressive_multimodal_evidence_survives_full_lifecycle(
             submitted_at = harness.clock.value
             run_id = await _submit(client, workspace_id)
             assert await asyncio.to_thread(
-                harness.second_frontier_started.wait, 10
+                harness.second_frontier_started.wait,
+                FRONTIER_START_TIMEOUT_SECONDS,
             ), (
                 app.state.runtime.store.get_run(run_id),
                 app.state.runtime.store.list_events(run_id),

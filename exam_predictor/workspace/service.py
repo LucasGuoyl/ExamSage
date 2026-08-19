@@ -516,6 +516,7 @@ class WorkspaceService:
 
     def _enqueue(self, workspace_id: str, idempotency_key: str) -> WorkspaceJob:
         with self._lock:
+            self._release_terminal_job_locked(workspace_id)
             active_job = self._active_jobs.get(workspace_id)
             if active_job is not None:
                 active_key, active_job_id = active_job
@@ -607,11 +608,11 @@ class WorkspaceService:
                     except WorkspaceJobNotFoundError:
                         pass
                     else:
-                        self._active_workspaces.discard(job.workspace_id)
                         if self._active_jobs.get(job.workspace_id) == (
                             job.idempotency_key,
                             job.job_id,
                         ):
+                            self._active_workspaces.discard(job.workspace_id)
                             self._active_jobs.pop(job.workspace_id, None)
             if self._stop.is_set():
                 return
@@ -856,6 +857,7 @@ class WorkspaceService:
     @contextmanager
     def _workspace_mutation(self, workspace_id: str) -> Iterator[None]:
         with self._lock:
+            self._release_terminal_job_locked(workspace_id)
             if workspace_id in self._active_workspaces:
                 raise WorkspaceOperationError("workspace_operation_active")
             self._active_workspaces.add(workspace_id)
@@ -864,3 +866,21 @@ class WorkspaceService:
         finally:
             with self._lock:
                 self._active_workspaces.discard(workspace_id)
+
+    def _release_terminal_job_locked(self, workspace_id: str) -> None:
+        active_job = self._active_jobs.get(workspace_id)
+        if active_job is None:
+            return
+        _idempotency_key, job_id = active_job
+        try:
+            job = self._store.get_job(job_id)
+        except WorkspaceJobNotFoundError:
+            return
+        if job.status not in {
+            WorkspaceJobStatus.SUCCEEDED,
+            WorkspaceJobStatus.FAILED,
+            WorkspaceJobStatus.CANCELLED,
+        }:
+            return
+        self._active_workspaces.discard(workspace_id)
+        self._active_jobs.pop(workspace_id, None)

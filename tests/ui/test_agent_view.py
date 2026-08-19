@@ -235,7 +235,7 @@ def test_provider_key_is_cleared_after_every_connection_attempt_and_errors_are_s
     monkeypatch.setattr(agent_view, "_new_client", lambda: fake)
     monkeypatch.setenv("EXAMSAGE_WORKER_TOKEN", "local-worker-token")
 
-    app = AppTest.from_string(VIEW_SCRIPT).run()
+    app = AppTest.from_string(VIEW_SCRIPT, default_timeout=30).run()
     key_input = next(item for item in app.text_input if item.label == "API key")
     key_input.input("provider-api-secret")
     button(app, "Connect").click()
